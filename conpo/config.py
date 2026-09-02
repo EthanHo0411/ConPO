@@ -1,0 +1,216 @@
+"""ConPO constants. No logic here, only pinned values and their provenance.
+
+Section references are to ConPO.pdf (Counterfactual Contrastive Policy
+Optimisation for Verifiable Constraints in LLMs).
+"""
+
+import os
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
+POLICY_MODEL = "Qwen/Qwen3-4B"
+POLICY_CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
+
+# later ablations only; no script uses these now
+LATER_ABLATION_MODELS = {
+    "qwen3_8b": "Qwen/Qwen3-8B",
+    "tulu3_8b_sft": "allenai/Llama-3.1-Tulu-3-8B-SFT",
+    "olmo3_7b_sft": "allenai/Olmo-3-7B-Instruct-SFT",
+}
+
+JUDGE_MODEL = "Qwen/Qwen3-14B"
+
+# ---------------------------------------------------------------------------
+# LoRA (section 4.1: "rank 64, scaling factor 128, and dropout 0.05, applied
+# to attention and feed-forward projections")
+# ---------------------------------------------------------------------------
+
+LORA_R = 64
+LORA_ALPHA = 128
+LORA_DROPOUT = 0.05
+LORA_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+
+# ---------------------------------------------------------------------------
+# Sampling (section 4.1: "G = 8 responses per prompt with temperature 0.8,
+# top-p 0.95, and a maximum of 1,024 tokens")
+# ---------------------------------------------------------------------------
+
+NUM_GENERATIONS = 8
+TEMPERATURE = 0.8
+TOP_P = 0.95
+MAX_COMPLETION_TOKENS = 1024
+MAX_PROMPT_TOKENS = 2048
+# Explicit because Qwen3 declares a huge context and vLLM sizes the KV cache
+# for all of it; MAX_PROMPT_TOKENS + MAX_COMPLETION_TOKENS fits with margin.
+MAX_MODEL_LEN = 3584
+
+# ---------------------------------------------------------------------------
+# Optimiser (section 4.1: "AdamW with learning rate 1e-5, 3% warm-up, cosine
+# decay, gradient clipping at 1.0, and effective batch size 128")
+# ---------------------------------------------------------------------------
+
+LR = 1e-5
+WARMUP_RATIO = 0.03
+LR_SCHEDULER = "cosine"
+MAX_GRAD_NORM = 1.0
+# The LoRA-without-regret precondition is under 32; batch sensitivity check
+# pending.
+EFFECTIVE_BATCH = 128
+
+# ---------------------------------------------------------------------------
+# GRPO
+# ---------------------------------------------------------------------------
+
+# TRL 1.9.2 defaults to "dapo", so explicit.
+LOSS_TYPE = "grpo"
+# Section 2: standard GRPO clip ratio; not renamed or redefined in this
+# paper, so the conventional 0.2 is kept. DEV_SET.
+EPSILON = 0.2  # DEV_SET
+# beta in L_ConPO = L_resp + lambda_P L_prompt + lambda_G L_clean + beta L_KL
+# (section 2.7): "the explicit KL term L_KL(theta), computed against the
+# frozen initial policy, is the sole mechanism regularising absolute
+# likelihoods, and beta is ablated accordingly." No numeric default is given
+# in the main text (beta is one of the values "selected once on the internal
+# development set", section 4.1). DEV_SET.
+KL_BETA = 0.001  # DEV_SET
+
+# ---------------------------------------------------------------------------
+# Repair operator (section 4.1: "The repair operator proposes at most four
+# candidates for each of at most three repair steps.")
+# ---------------------------------------------------------------------------
+
+MAX_CANDIDATES = 4
+MAX_STEPS = 3
+
+# ---------------------------------------------------------------------------
+# Counterfactual-edge buffer (section 4.1: "The buffer holds at most 50,000
+# edges ... with a hard age cap of 500 optimiser updates")
+# ---------------------------------------------------------------------------
+
+BUFFER_SIZE = 50000
+BUFFER_AGE_CAP = 500
+
+# ---------------------------------------------------------------------------
+# ConPO loss / selection hyperparameters (section 2 defines the symbols,
+# section 4.1: "Loss weights, temperatures, delta, gamma, kappa, and the
+# probe-batch period S are selected once on the internal development set."
+# The paper gives no numeric defaults for these; every one marked DEV_SET
+# below is a sensible placeholder pending that tuning pass.
+# ---------------------------------------------------------------------------
+
+# delta (section 2.2/2.3): fidelity bound d_Y(y, y') <= delta gating both
+# repair-proposal admission and corruption admission; d_Y is token-level
+# edit distance normalised by response length (section 2.1), so delta lives
+# in [0, 1]. DEV_SET.
+DELTA = 0.3  # DEV_SET
+
+# tau (section 2.4): response-level contrastive temperature in
+# L_resp = -E[w(e) log sigma(Delta_theta(e) / tau)]. DEV_SET.
+TAU = 0.1  # DEV_SET
+
+# tau_p (section 2.5): prompt-side temperature in
+# L_prompt = -E[log sigma(m_theta(x^+A) / tau_p)] + lambda_0 E[m_theta(x^-A)^2].
+# DEV_SET.
+TAU_P = 0.1  # DEV_SET
+
+# gamma (section 2.4): per-update age decay in w(e) = gamma^age(e) * [...],
+# gamma in (0, 1]. DEV_SET.
+GAMMA = 0.99  # DEV_SET
+
+# kappa (section 2.4): saturation multiplier; w(e) retires an edge once
+# Delta_theta(e) > kappa * tau (Lemma 7). DEV_SET.
+KAPPA = 5.0  # DEV_SET
+
+# lambda_0 (section 2.5): coefficient on the indifference penalty
+# E[m_theta(x^-A)^2] in L_prompt. DEV_SET.
+LAMBDA_0 = 0.1  # DEV_SET
+
+# lambda_P, lambda_G (section 2.7): weights in
+# L_ConPO = L_resp + lambda_P L_prompt + lambda_G L_clean + beta L_KL. DEV_SET.
+LAMBDA_P = 1.0  # DEV_SET
+LAMBDA_G = 1.0  # DEV_SET
+
+# lambda_T, lambda_U, lambda_C (section 2.6): acquisition-score weights in
+# a_c = lambda_T T_c + lambda_U U_c + lambda_C C_c, "calibrated on the
+# development set jointly ... so that the three terms have comparable
+# dynamic ranges" -- started equal pending that calibration. DEV_SET.
+LAMBDA_T = 1.0  # DEV_SET
+LAMBDA_U = 1.0  # DEV_SET
+LAMBDA_C = 1.0  # DEV_SET
+
+# eta (section 2.6): softmax temperature in
+# mu(c | x) = (1 - eps_a) * exp(a_c / eta) / sum_k exp(a_k / eta) + eps_a / |C(x)|.
+# DEV_SET.
+ETA = 1.0  # DEV_SET
+
+# eps_a (section 2.6): exploration floor, "eps_a > 0 prevents permanent
+# starvation of a constraint family." DEV_SET.
+EPS_A = 0.1  # DEV_SET
+
+# Probe size (section 2.6: "small probe batches of at most 16 edges per
+# family"). Given explicitly in the paper.
+PROBE_SIZE = 16
+
+# Probe-batch period S (section 2.6: "refreshed every S", section 4.1: S is
+# one of the values selected on the development set). DEV_SET.
+PROBE_PERIOD_S = 50  # DEV_SET
+
+# EMA decay for T_c (section 2.6, "Cost and noise": "the exponential moving
+# average (decay 0.9) enters the acquisition score"). Given explicitly for
+# T_c; p_c's own EMA (section 2.6: "an exponential moving average of
+# v_c(x, y) over fresh on-policy samples") has no separately stated decay in
+# the paper text, so it is set to match T_c's 0.9 by convention.
+EMA_DECAY_P_C = 0.9
+EMA_DECAY_T_C = 0.9
+
+# alpha (section 2.4): length-normalisation exponent in
+# q_theta^(alpha)(x, y) = |y|^-alpha [log pi_theta(y|x) - log pi_ref(y|x)].
+# "we write q_theta = q_theta^(1) unless stated otherwise" -> default 1;
+# ablated over {0, 1}.
+ALPHA = 1
+ALPHA_ABLATION_VALUES = (0, 1)
+
+# ---------------------------------------------------------------------------
+# Datasets
+# ---------------------------------------------------------------------------
+
+POOL_DATASET = "allenai/IF_multi_constraints_upto5"
+IFEVAL_DATASET = "google/IFEval"
+IFBENCH_TEST_DATASET = "allenai/IFBench_test"
+
+# ---------------------------------------------------------------------------
+# Compute notes (section 4.1 / cluster allocation; not paper-derived)
+# ---------------------------------------------------------------------------
+
+# Two H200 3g.71gb MIG slices (69.8 GB usable each) plus one full H200.
+# Measured 4B LoRA co-locate footprint: 63-65 GB. Judge (Qwen3-14B) footprint:
+# 27.5 GB.
+
+# ---------------------------------------------------------------------------
+# RUN_* environment contract
+# ---------------------------------------------------------------------------
+
+
+def env(name: str, default: str) -> str:
+    """Read a RUN_* environment variable, falling back to `default`."""
+    return os.environ.get(name, default)
+
+
+# RUN_ARM: one of "full", "solve_only", "forward_only", "reverse_only".
+# RUN_SEED: integer seed for the run.
+# RUN_STEPS: integer optimiser-step budget.
+# RUN_TOKEN_BUDGET: integer generated-token budget (section 4.1: "The
+#   primary comparison matches total generated tokens").
+# RUN_USE_VLLM: "1" to sample through vLLM, "0" for HF generate.
+# RUN_JUDGE_ENDPOINT: URL of the judge model's inference endpoint.
+# RUN_OUT_DIR: directory to write run artefacts (checkpoints, logs, metrics).

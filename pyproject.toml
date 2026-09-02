@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conpo"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.11.0",
+    "transformers==5.14.1",
+    "trl==1.9.2",
+    "peft==0.20.0",
+    "datasets>=3.0",
+    "accelerate",
+    "huggingface_hub",
+    "rapidfuzz",
+    "nltk",
+    "langdetect",
+    "immutabledict",
+    "absl-py",
+    "emoji",
+    "syllapy>=0.8.0",
+]
+
+[project.optional-dependencies]
+cluster = ["vllm==0.26.0"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["conpo*"]
