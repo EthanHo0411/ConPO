@@ -23,11 +23,12 @@ from trl import GRPOConfig
 
 import conpo.operators  # noqa: F401  registers all 53 corruption operators
 from conpo import config
-from conpo.arms import resolve_arm
+from conpo.arms import ArmSpec, Overrides, resolve_arm
 from conpo.data import PoolRow, TokenMeter
 from conpo.distance import token_distance
 from conpo.edges import Edge, EdgeBuffer, FeasibleBuffer
 from conpo.engine import HFEngine
+from conpo.forward import RepairResult
 from conpo.judge import StaticJudge
 from conpo.operators import registry
 from conpo.operators.registry import FIXTURES
@@ -236,7 +237,8 @@ def test_full_arm_two_optimizer_steps(tmp_path: Path, monkeypatch: pytest.Monkey
         "reasons_by_direction",
         "mean_edit_distance",
         "degenerate_group_rate",
-        "edges_per_million_tokens",
+        "edges_per_million_tokens_step",
+        "edges_per_million_tokens_cumulative",
         "edge_buffer_size",
         "feasible_buffer_size",
         "family_stats",
@@ -313,6 +315,180 @@ def test_ifrlvr_arm_one_step_and_reward_additive(tmp_path: Path) -> None:
     # (NO_COMMA fails) -> 1 of 2 constraints satisfied -> 0.5.
     scores = trainer.reward_additive(completions=["hello, world"], key=[ROW_A.key])
     assert scores == [0.5]
+
+
+# ---------------------------------------------------------------------------
+# compute_loss under gradient accumulation: EDGE_PAIRS_PER_STEP is a
+# per-OPTIMIZER-step budget, not a per-compute_loss-call one, and the T_c
+# probe must fire once per optimizer step, not once per micro-batch.
+# ---------------------------------------------------------------------------
+
+
+def test_compute_loss_halves_edge_sample_and_runs_probe_once_per_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "EDGE_PAIRS_PER_STEP", 4)
+
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A, ROW_B]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=2,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    # forward/reverse off: isolate compute_loss's own sampling and probe
+    # cadence from the counterfactual-construction machinery.
+    arm = ArmSpec(reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=True)
+    edge_buffer = EdgeBuffer()
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=edge_buffer,
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=Overrides(),
+        peft_config=_lora_config(),
+    )
+
+    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+    with torch.no_grad(), unwrapped.disable_adapter():
+        for edge in _hand_built_edges():
+            logp_plus, len_plus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_plus)
+            logp_minus, len_minus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_minus)
+            edge_buffer.push(
+                dataclasses.replace(
+                    edge,
+                    logp_ref_plus=logp_plus.item(),
+                    logp_ref_minus=logp_minus.item(),
+                    len_plus=len_plus,
+                    len_minus=len_minus,
+                )
+            )
+
+    sample_calls: list[int] = []
+    original_sample = EdgeBuffer.sample
+
+    def spy_sample(self: EdgeBuffer, n: int, current_update: int, rng: random.Random, balanced: bool = True):
+        sample_calls.append(n)
+        return original_sample(self, n, current_update, rng, balanced=balanced)
+
+    monkeypatch.setattr(EdgeBuffer, "sample", spy_sample)
+
+    probe_calls: list[int] = []
+    trainer._run_probe = lambda model, clean, current_update: probe_calls.append(current_update)
+
+    trainer.train()
+
+    assert trainer.state.global_step == 1
+    # gradient_accumulation_steps=2 -> 2 compute_loss calls for the one
+    # optimizer step, each drawing ceil(EDGE_PAIRS_PER_STEP=4 / 2) == 2, not
+    # the full 4 (which 16x'd real-run memory/time before this fix).
+    assert sample_calls == [2, 2]
+    # Both compute_loss calls share global_step == 0 (it advances only after
+    # the optimizer step completes), so the probe must fire exactly once.
+    assert probe_calls == [0]
+
+
+# ---------------------------------------------------------------------------
+# _generate_and_score_completions must push every RepairResult.feasible_endpoint
+# from forward repair into feasible_buffer (review-1 major, re-verified here).
+# ---------------------------------------------------------------------------
+
+
+def test_forward_feasible_endpoints_reach_feasible_buffer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Force every generated response to fail every verifier so it is always
+    # routed into failed_responses, independent of what the tiny random
+    # model actually generates, and forward repair always runs.
+    monkeypatch.setattr("conpo.trainer.verifier_vector", lambda constraints, text: [False] * len(constraints))
+    sentinel = "SENTINEL_FEASIBLE_ENDPOINT"
+    monkeypatch.setattr(
+        "conpo.forward.repair_failed_group",
+        lambda *args, **kwargs: RepairResult(feasible_endpoints=[sentinel]),
+    )
+
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A, ROW_B]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=1,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    arm, overrides = resolve_arm("forward_only")
+    feasible_buffer = FeasibleBuffer()
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=EdgeBuffer(),
+        feasible_buffer=feasible_buffer,
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=overrides,
+        peft_config=_lora_config(),
+        probe_enabled=False,
+    )
+
+    trainer.train()
+
+    # per_device_train_batch_size == num_generations with
+    # gradient_accumulation_steps=1 means one optimizer step samples exactly
+    # one row's group, so only one of ROW_A/ROW_B's keys is populated -- but
+    # every group is all-failing (patched verifier_vector), so the only way
+    # feasible_buffer gets populated at all is via RepairResult.feasible_endpoints,
+    # confirming trainer.py wires it through.
+    assert feasible_buffer._by_prompt in ({ROW_A.key: [sentinel]}, {ROW_B.key: [sentinel]})
 
 
 # ---------------------------------------------------------------------------

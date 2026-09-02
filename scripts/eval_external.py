@@ -9,6 +9,7 @@ row of whichever dataset (IFEval / IFBench) has a matching key.
 
 import argparse
 import dataclasses
+import functools
 import json
 from collections.abc import Sequence
 from pathlib import Path
@@ -47,12 +48,24 @@ def _load_hf_engine(model_name: str, adapter: str | None) -> Any:
     return HFEngine(model, tokenizer, device=device)
 
 
+@functools.lru_cache(maxsize=None)
+def _build_vllm_engine(model_name: str, adapter: str | None) -> Any:
+    """UNTESTED: no vllm / GPU available in this environment. Memoised per
+    (model_name, adapter): vllm.LLM() reloads and shards the model on every
+    construction, so a process scoring both IFEval and IFBench (two
+    _generate_vllm calls, same model) must reuse one engine instead of
+    building it twice."""
+    from vllm import LLM
+
+    return LLM(model=model_name, enable_lora=adapter is not None)
+
+
 def _generate_vllm(model_name: str, adapter: str | None, prompts: Sequence[str], max_tokens: int) -> list[str]:
     """UNTESTED: no vllm / GPU available in this environment. Standalone
     offline vllm.LLM (not the trainer-colocated engine in conpo/engine.py),
     since eval_external runs outside any GRPOTrainer."""
     from transformers import AutoTokenizer
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
     from vllm.lora.request import LoRARequest
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -65,7 +78,7 @@ def _generate_vllm(model_name: str, adapter: str | None, prompts: Sequence[str],
         )
         for p in prompts
     ]
-    llm = LLM(model=model_name, enable_lora=adapter is not None)
+    llm = _build_vllm_engine(model_name, adapter)
     lora_request = LoRARequest("adapter", 1, adapter) if adapter is not None else None
     params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
     outputs = llm.generate(rendered, params, lora_request=lora_request)
@@ -108,6 +121,28 @@ def _merge(reference_row: dict[str, Any], response: str) -> dict[str, Any]:
         "instruction_id_list": list(reference_row["instruction_id_list"]),
         "kwargs": _clean_kwargs(reference_row["kwargs"]),
     }
+
+
+def join_by_prompt(canned: Sequence[dict[str, Any]], ifbench_rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join minimal {"prompt", "response"} canned records to IFBench_test by
+    exact prompt text, for canned files with no "key" (e.g. the vendored
+    ifbench/data/sample_output.jsonl, whose 300 rows carry only prompt and
+    response -- verified to match all 300 IFBench_test prompts).
+
+    Raises KeyError if a canned prompt matches no IFBench_test row.
+    """
+    ifbench_by_prompt = {row["prompt"]: row for row in ifbench_rows}
+    out: list[dict[str, Any]] = []
+    unmatched: list[str] = []
+    for record in canned:
+        ref = ifbench_by_prompt.get(record["prompt"])
+        if ref is None:
+            unmatched.append(record["prompt"])
+            continue
+        out.append(_merge(ref, record["response"]))
+    if unmatched:
+        raise KeyError(f"{len(unmatched)} canned record(s) matched no IFBench_test prompt: {unmatched}")
+    return out
 
 
 def route_canned(
@@ -154,7 +189,25 @@ def main() -> None:
     parser.add_argument("--adapter", default=None, help="LoRA adapter directory, or omit for the base model")
     parser.add_argument("--backend", choices=("hf", "vllm"), default="hf")
     parser.add_argument("--out", required=True, help="output JSON path")
-    parser.add_argument("--score-only", default=None, help="jsonl of canned responses; skips generation")
+    parser.add_argument(
+        "--score-only",
+        default=None,
+        help=(
+            "jsonl of canned responses; skips generation. A minimal record is "
+            '{"key": ..., "response": ...}, joined by exact key equality against the loaded '
+            "IFEval / IFBench_test row. Canned files with no key (e.g. the vendored "
+            "sample_output.jsonl) need --join-by-prompt instead."
+        ),
+    )
+    parser.add_argument(
+        "--join-by-prompt",
+        action="store_true",
+        help=(
+            "join --score-only records to IFBench_test by exact prompt text instead of key "
+            "(for canned files like the vendored sample_output.jsonl, which carry only prompt "
+            "and response, no key)"
+        ),
+    )
     parser.add_argument("--limit", type=int, default=None, help="cap rows per dataset, for smoke runs")
     parser.add_argument("--max-tokens", type=int, default=config.MAX_COMPLETION_TOKENS)
     args = parser.parse_args()
@@ -167,7 +220,11 @@ def main() -> None:
 
     if args.score_only is not None:
         canned = _load_canned(args.score_only)
-        ifeval_records, ifbench_records = route_canned(canned, ifeval_rows, ifbench_rows)
+        if args.join_by_prompt:
+            ifeval_records = []
+            ifbench_records = join_by_prompt(canned, ifbench_rows)
+        else:
+            ifeval_records, ifbench_records = route_canned(canned, ifeval_rows, ifbench_rows)
     else:
         if args.backend == "hf":
             engine = _load_hf_engine(args.model, args.adapter)

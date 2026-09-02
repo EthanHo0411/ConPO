@@ -15,7 +15,7 @@ age_cap retired before every draw. FeasibleBuffer implements B_F (sections
 import json
 import random
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -162,6 +162,34 @@ class EdgeBuffer:
         sampled = rng.sample(forward, take_forward) + rng.sample(reverse, take_reverse)
         rng.shuffle(sampled)
         return sampled
+
+    def sample_where(
+        self, predicate: Callable[[Edge], bool], n: int, current_update: int, rng: random.Random
+    ) -> list[Edge]:
+        """Draw at most `n` edges satisfying `predicate`, retiring stale ones first.
+
+        One pass over the buffer via reservoir sampling, instead of
+        materialising the whole buffer (`sample(len(buffer))`) and then
+        filtering it down -- callers that only want single-family edges or
+        one family's edges (compute_loss's L_prompt draw, the T_c probe's
+        per-family draw) no longer pay for a full-buffer copy each call.
+        Uniform-random without replacement over the matching edges, same as
+        sample()'s own guarantee.
+        """
+        self._retire(current_update)
+        reservoir: list[Edge] = []
+        seen = 0
+        for edge in self._edges:
+            if not predicate(edge):
+                continue
+            seen += 1
+            if len(reservoir) < n:
+                reservoir.append(edge)
+            else:
+                j = rng.randint(0, seen - 1)
+                if j < n:
+                    reservoir[j] = edge
+        return reservoir
 
     def counts_by_direction(self) -> dict[str, int]:
         counts: dict[str, int] = {}

@@ -111,6 +111,73 @@ def test_eval_external_score_only_ifeval_minimal_record_real_dataset_row(
     assert result["ifbench"] is None
 
 
+def test_route_canned_unmatched_key_raises_keyerror() -> None:
+    """A minimal {key, response} record whose key matches neither dataset
+    fails loudly instead of silently shrinking the scored set."""
+    ifeval_rows = [
+        {"key": 1, "prompt": "p1", "instruction_id_list": ["keywords:existence"], "kwargs": [{"keywords": ["a"]}]}
+    ]
+    ifbench_rows = [{"key": "0", "prompt": "p2", "instruction_id_list": ["length_constraints:number_words"], "kwargs": [{}]}]
+    canned = [{"key": "no-such-key", "response": "irrelevant"}]
+    with pytest.raises(KeyError):
+        eval_external.route_canned(canned, ifeval_rows, ifbench_rows)
+
+
+def test_eval_external_join_by_prompt_reproduces_ifbench_scoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The vendored sample_output.jsonl carries only prompt/response, no key
+    -- --join-by-prompt joins it to IFBench_test by exact prompt text."""
+    sample_rows = scoring.load_sample_output()
+    ifbench_rows = scoring.load_ifbench_test()
+    response_by_prompt = {row["prompt"]: row["response"] for row in sample_rows}
+
+    canned_path = tmp_path / "sample_output.jsonl"
+    with canned_path.open("w", encoding="utf-8") as f:
+        for row in sample_rows:
+            f.write(json.dumps({"prompt": row["prompt"], "response": row["response"]}) + "\n")
+
+    out_path = tmp_path / "out.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["eval_external.py", "--score-only", str(canned_path), "--join-by-prompt", "--out", str(out_path)],
+    )
+    eval_external.main()
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+
+    expected_records = [eval_external._merge(row, response_by_prompt[row["prompt"]]) for row in ifbench_rows]
+    expected = dataclasses.asdict(scoring.score_ifbench(expected_records))
+    assert result["ifbench"] == expected
+    assert result["ifeval"] is None
+
+
+@pytest.mark.parametrize("module", [eval_external, eval_internal])
+def test_build_vllm_engine_memoises_per_model_adapter(
+    module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_generate_vllm's engine construction is cached per (model, adapter)
+    within a process instead of rebuilt on every call."""
+    module._build_vllm_engine.cache_clear()
+    calls: list[tuple[str, bool]] = []
+
+    class FakeLLM:
+        def __init__(self, model: str, enable_lora: bool) -> None:
+            calls.append((model, enable_lora))
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = FakeLLM  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+
+    first = module._build_vllm_engine("model-a", None)
+    second = module._build_vllm_engine("model-a", None)  # same key -> cached, no new FakeLLM
+    third = module._build_vllm_engine("model-a", "adapter-dir")  # different key -> new FakeLLM
+
+    assert first is second
+    assert first is not third
+    assert calls == [("model-a", False), ("model-a", True)]
+
+
 def test_eval_external_score_only_ifeval_hand_written_records(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     records = [
         {

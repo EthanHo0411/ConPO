@@ -82,6 +82,7 @@ def worst_decile_family_accuracy(rows: Sequence[PoolRow], responses: Sequence[st
 
 def stratified_by_count(rows: Sequence[PoolRow], responses: Sequence[str]) -> dict[int, float]:
     """PAcc grouped by row.num_constraints."""
+    _check_lengths(rows, responses)
     groups: dict[int, list[int]] = {}
     for index, row in enumerate(rows):
         groups.setdefault(row.num_constraints, []).append(index)

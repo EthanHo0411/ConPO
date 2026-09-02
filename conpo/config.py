@@ -225,10 +225,15 @@ def env(name: str, default: str) -> str:
 # _generate_and_score_completions -> conpo/reverse.py:reverse_batch). DEV_SET.
 REVERSE_DRAWS_PER_STEP = 8  # DEV_SET
 
-# Edges sampled from the buffer for L_resp each optimiser step
-# (conpo/trainer.py's compute_loss -> conpo/edges.py:EdgeBuffer.sample). DEV_SET.
+# Edges sampled from the buffer for L_resp per OPTIMISER step, not per
+# compute_loss call: conpo/trainer.py's compute_loss divides this by
+# self.args.gradient_accumulation_steps (rounding up) so every micro-batch
+# draws its share and the per-optimiser-step total stays at
+# EDGE_PAIRS_PER_STEP regardless of accumulation
+# (conpo/edges.py:EdgeBuffer.sample). DEV_SET.
 EDGE_PAIRS_PER_STEP = 48  # DEV_SET
 
-# Single-family edges sampled from the buffer for L_prompt each optimiser
-# step (conpo/trainer.py's compute_loss). DEV_SET.
+# Single-family edges sampled from the buffer for L_prompt per OPTIMISER
+# step, divided across compute_loss calls the same way as
+# EDGE_PAIRS_PER_STEP above (conpo/trainer.py's compute_loss). DEV_SET.
 PROMPT_PAIRS_PER_STEP = 8  # DEV_SET

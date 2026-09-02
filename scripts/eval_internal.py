@@ -6,6 +6,7 @@ for the PoolRow JSON schema this reads (`_row_from_json` below is its inverse).
 """
 
 import argparse
+import functools
 import json
 from collections.abc import Sequence
 from pathlib import Path
@@ -47,10 +48,22 @@ def _load_hf_engine(model_name: str, adapter: str | None) -> Any:
     return HFEngine(model, tokenizer, device=device)
 
 
+@functools.lru_cache(maxsize=None)
+def _build_vllm_engine(model_name: str, adapter: str | None) -> Any:
+    """UNTESTED: no vllm / GPU available in this environment. Memoised per
+    (model_name, adapter): vllm.LLM() reloads and shards the model on every
+    construction, so a process scoring multiple splits (multiple
+    _generate_vllm calls, same model) must reuse one engine instead of
+    building it per split."""
+    from vllm import LLM
+
+    return LLM(model=model_name, enable_lora=adapter is not None)
+
+
 def _generate_vllm(model_name: str, adapter: str | None, prompts: Sequence[str], max_tokens: int) -> list[str]:
     """UNTESTED: no vllm / GPU available in this environment."""
     from transformers import AutoTokenizer
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
     from vllm.lora.request import LoRARequest
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -63,7 +76,7 @@ def _generate_vllm(model_name: str, adapter: str | None, prompts: Sequence[str],
         )
         for p in prompts
     ]
-    llm = LLM(model=model_name, enable_lora=adapter is not None)
+    llm = _build_vllm_engine(model_name, adapter)
     lora_request = LoRARequest("adapter", 1, adapter) if adapter is not None else None
     params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
     outputs = llm.generate(rendered, params, lora_request=lora_request)

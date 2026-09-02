@@ -8,7 +8,7 @@ disables, lambda_P override) on top of whichever arm is running.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from conpo import config
@@ -69,7 +69,10 @@ class Overrides:
     no_veto: bool = False
     no_exactness: bool = False
     no_distance: bool = False
-    lambda_p: float = config.LAMBDA_P
+    # default_factory, not `= config.LAMBDA_P`: a plain default binds
+    # config.LAMBDA_P once at import time, so a test's monkeypatch of
+    # config.LAMBDA_P after import would be silently ignored.
+    lambda_p: float = field(default_factory=lambda: config.LAMBDA_P)
 
 
 def resolve_arm(name: str) -> tuple[ArmSpec, Overrides]:

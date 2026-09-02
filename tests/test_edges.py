@@ -135,6 +135,32 @@ def test_save_load_round_trip(tmp_path) -> None:
     assert original_ids == loaded_ids
 
 
+def test_sample_where_filters_by_predicate_and_retires_stale() -> None:
+    buf = EdgeBuffer(capacity=1000, age_cap=5)
+    buf.push(_make_edge(direction="forward", created_update=0, prompt_id="stale", families=frozenset({"a"})))
+    buf.push(_make_edge(direction="forward", created_update=3, prompt_id="b", families=frozenset({"a"})))
+    buf.push(_make_edge(direction="reverse", created_update=4, prompt_id="c", families=frozenset({"other"})))
+    buf.push(_make_edge(direction="reverse", created_update=4, prompt_id="d", families=frozenset({"a"})))
+
+    result = buf.sample_where(lambda e: "a" in e.families, n=10, current_update=8, rng=random.Random(0))
+
+    # "stale" (age=8 > age_cap=5) is retired before the predicate ever sees
+    # it; "c" survives retirement but doesn't match the predicate.
+    assert {e.prompt_id for e in result} == {"b", "d"}
+    assert len(buf) == 3
+
+
+def test_sample_where_caps_at_n_with_no_duplicates() -> None:
+    buf = EdgeBuffer(capacity=1000, age_cap=1000)
+    for i in range(20):
+        buf.push(_make_edge(direction="forward", created_update=0, prompt_id=f"f{i}"))
+
+    result = buf.sample_where(lambda e: True, n=5, current_update=0, rng=random.Random(0))
+
+    assert len(result) == 5
+    assert len({e.prompt_id for e in result}) == 5
+
+
 def test_feasible_buffer_caps_per_prompt() -> None:
     buf = FeasibleBuffer(per_prompt_cap=3)
     for i in range(5):

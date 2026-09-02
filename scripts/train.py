@@ -8,6 +8,7 @@ import random
 from pathlib import Path
 
 import torch
+from accelerate import PartialState
 from datasets import Dataset
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
@@ -108,10 +109,35 @@ def main() -> None:
     max_completion_length = 16 if args.tiny else config.MAX_COMPLETION_TOKENS
     per_device_batch = 2 if args.tiny else num_generations
 
+    # TRL derives generation_batch_size = per_device_train_batch_size *
+    # num_processes * gradient_accumulation_steps (trl.GRPOConfig). With
+    # per_device_train_batch_size == num_generations (one prompt's completions
+    # per micro-batch), accumulation is the only lever left to reach
+    # config.EFFECTIVE_BATCH (128, paper section 4.1) prompts per optimiser
+    # update; left at the trainer default (1) this silently trained at 1
+    # prompt/update instead. --tiny only ever runs a smoke test on 1 device,
+    # so it stays at accumulation 1.
+    if args.tiny:
+        gradient_accumulation_steps = 1
+    else:
+        num_processes = PartialState().num_processes
+        gradient_accumulation_steps = config.EFFECTIVE_BATCH // (per_device_batch * num_processes)
+        assert per_device_batch * num_processes * gradient_accumulation_steps == config.EFFECTIVE_BATCH, (
+            f"config.EFFECTIVE_BATCH ({config.EFFECTIVE_BATCH}) must be an exact multiple of "
+            f"per_device_train_batch_size ({per_device_batch}) * num_processes ({num_processes})"
+        )
+        prompts_per_update = num_processes * gradient_accumulation_steps
+        print(
+            f"gradient_accumulation_steps={gradient_accumulation_steps} "
+            f"(num_processes={num_processes}, per_device_train_batch_size={per_device_batch}) "
+            f"-> {prompts_per_update} prompt(s) per optimizer update"
+        )
+
     grpo_config = GRPOConfig(
         output_dir=str(out_dir),
         num_generations=num_generations,
         per_device_train_batch_size=per_device_batch,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         temperature=config.TEMPERATURE,
         top_p=config.TOP_P,
         max_completion_length=max_completion_length,
@@ -132,6 +158,7 @@ def main() -> None:
         report_to=[],
         logging_steps=1,
         use_cpu=not torch.cuda.is_available(),
+        # UNTESTED: no GPU in this environment, see _real_model_and_tokenizer's dtype note above.
         bf16=torch.cuda.is_available(),
         fp16=False,
     )

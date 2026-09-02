@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import random
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -118,6 +119,13 @@ class ConPOTrainer(GRPOTrainer):
         self.rng = random.Random(seed)
         self.probe_enabled = probe_enabled
         self.last_loss_stats: dict[str, float] = {}
+        # Guards the T_c probe to once per optimiser step: self.state.global_step
+        # is constant across every micro-batch of one accumulation cycle, so a
+        # value change (including the first call, None != 0) marks a new step.
+        self._last_probe_step: int | None = None
+        # Lifetime count of edges admitted into edge_buffer, independent of the
+        # buffer's own FIFO/age-cap eviction, for the cumulative mechanism-log rate.
+        self.cumulative_admitted_edges = 0
 
         reward_func = self.reward_conjunctive if arm.reward == "conjunctive" else self.reward_additive
         super().__init__(
@@ -163,6 +171,7 @@ class ConPOTrainer(GRPOTrainer):
     def _generate_and_score_completions(self, inputs: list[dict[str, object]]) -> dict[str, object]:
         output = super()._generate_and_score_completions(inputs)
 
+        tokens_before_step = self.meter.total
         keys = [str(row["key"]) for row in inputs]
         completions_text = [
             strip_think(t)
@@ -256,6 +265,8 @@ class ConPOTrainer(GRPOTrainer):
                 admitted_by_direction[scored_edge.direction] += 1
                 distances.append(float(scored_edge.meta.get("distance", 0.0)))
 
+        self.cumulative_admitted_edges += len(new_edges)
+        tokens_this_step = self.meter.total - tokens_before_step
         record = {
             "step": current_update,
             "admitted_by_direction": dict(admitted_by_direction),
@@ -266,7 +277,16 @@ class ConPOTrainer(GRPOTrainer):
             "reasons_by_direction": {"forward": dict(forward_reasons), "reverse": dict(reverse_reasons)},
             "mean_edit_distance": (sum(distances) / len(distances)) if distances else 0.0,
             "degenerate_group_rate": (degenerate_groups / total_groups) if total_groups else 0.0,
-            "edges_per_million_tokens": (len(new_edges) / self.meter.total * 1e6) if self.meter.total else 0.0,
+            # Per-step: this step's new edges over this step's generated tokens.
+            # Cumulative: all edges ever admitted over the meter's lifetime
+            # total -- distinct from edge_buffer_size, which shrinks under
+            # FIFO/age-cap eviction and so undercounts the cumulative rate.
+            "edges_per_million_tokens_step": (
+                (len(new_edges) / tokens_this_step * 1e6) if tokens_this_step else 0.0
+            ),
+            "edges_per_million_tokens_cumulative": (
+                (self.cumulative_admitted_edges / self.meter.total * 1e6) if self.meter.total else 0.0
+            ),
             "edge_buffer_size": len(self.edge_buffer),
             "feasible_buffer_size": len(self.feasible_buffer),
             "family_stats": self.stats.snapshot(),
@@ -381,8 +401,9 @@ class ConPOTrainer(GRPOTrainer):
         family = selection.next_probe_family(self.stats, families, current_update)
         if family is None or not selection.probe_due(self.stats, family, current_update, config.PROBE_PERIOD_S):
             return
-        pool = self.edge_buffer.sample(len(self.edge_buffer), current_update, self.rng, balanced=False)
-        probe_edges = [e for e in pool if family in e.families][: config.PROBE_SIZE]
+        probe_edges = self.edge_buffer.sample_where(
+            lambda e: family in e.families, config.PROBE_SIZE, current_update, self.rng
+        )
         if not probe_edges:
             return
         lora_params = [p for name, p in model.named_parameters() if "lora_" in name and p.requires_grad]
@@ -413,8 +434,17 @@ class ConPOTrainer(GRPOTrainer):
         current_update = self.state.global_step
         stats: dict[str, float] = {"clean_loss": clean.item()}
 
+        # config.EDGE_PAIRS_PER_STEP / PROMPT_PAIRS_PER_STEP are per-OPTIMISER-step
+        # budgets (config.py), but compute_loss runs once per micro-batch under
+        # gradient accumulation; split the budget so the per-optimiser-step total
+        # sampled from edge_buffer stays at the configured value regardless of
+        # accumulation, rather than being drawn in full on every micro-batch.
+        grad_accum = self.args.gradient_accumulation_steps
+        edge_n = math.ceil(config.EDGE_PAIRS_PER_STEP / grad_accum)
+        prompt_n = math.ceil(config.PROMPT_PAIRS_PER_STEP / grad_accum)
+
         if self.arm.resp_loss and len(self.edge_buffer) > 0:
-            resp_edges = self.edge_buffer.sample(config.EDGE_PAIRS_PER_STEP, current_update, self.rng, balanced=True)
+            resp_edges = self.edge_buffer.sample(edge_n, current_update, self.rng, balanced=True)
             if resp_edges:
                 delta, ages = self._score_edge_pairs(model, resp_edges)
                 loss_resp, resp_stats = losses.resp_loss(
@@ -433,8 +463,9 @@ class ConPOTrainer(GRPOTrainer):
                     stats[f"resp_margin_{direction}_{family}"] = sum(values) / len(values)
 
         if self.arm.prompt_loss and self.overrides.lambda_p > 0 and len(self.edge_buffer) > 0:
-            pool = self.edge_buffer.sample(len(self.edge_buffer), current_update, self.rng, balanced=False)
-            prompt_edges = [e for e in pool if len(e.families) == 1][: config.PROMPT_PAIRS_PER_STEP]
+            prompt_edges = self.edge_buffer.sample_where(
+                lambda e: len(e.families) == 1, prompt_n, current_update, self.rng
+            )
             if prompt_edges:
                 m_plus, m_minus = self._prompt_margins(model, prompt_edges)
                 loss_prompt, prompt_stats = losses.prompt_loss(
@@ -444,8 +475,9 @@ class ConPOTrainer(GRPOTrainer):
                 stats["prompt_loss"] = loss_prompt.item()
                 stats.update({f"prompt_{k}": v for k, v in prompt_stats.items()})
 
-        if self.probe_enabled and len(self.edge_buffer) > 0:
+        if self.probe_enabled and len(self.edge_buffer) > 0 and current_update != self._last_probe_step:
             self._run_probe(model, clean, current_update)
+            self._last_probe_step = current_update
 
         self.last_loss_stats = stats
         mode = "train" if model.training else "eval"

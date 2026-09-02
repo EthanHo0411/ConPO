@@ -7,6 +7,8 @@ so the hand-computed PAcc/IAcc/macro/worst-decile values that the rest of
 this file checks are traceable to that assertion rather than assumed.
 """
 
+import pytest
+
 from conpo import metrics
 from conpo.data import PoolRow
 from conpo.verifiers import Constraint, check
@@ -85,6 +87,11 @@ def test_stratified_by_count() -> None:
     assert strat == {1: 1.0, 2: 0.0, 3: 0.0}
 
 
+def test_stratified_by_count_length_mismatch_raises() -> None:
+    with pytest.raises(ValueError):
+        metrics.stratified_by_count(ROWS, RESPONSES[:-1])
+
+
 def test_repetition_rate_on_repeated_sentence() -> None:
     # "a b c d" repeated 3 times: 12 words -> 9 overlapping 4-grams, but only
     # 4 distinct ones (abcd, bcda, cdab, dabc) since the window slides by 1
@@ -107,6 +114,18 @@ def test_mean_length_whitespace() -> None:
 
 def test_mean_length_empty() -> None:
     assert metrics.mean_length([]) == 0.0
+
+
+class _FakeTokenizer:
+    """Stub matching the _Tokenizer Protocol: tokens = 2x word count."""
+
+    def __call__(self, text: str, add_special_tokens: bool) -> dict[str, list[int]]:
+        return {"input_ids": list(range(2 * len(text.split())))}
+
+
+def test_mean_length_with_tokenizer() -> None:
+    texts = ["one two three", "four five"]
+    assert metrics.mean_length(texts, tokenizer=_FakeTokenizer()) == (6 + 4) / 2
 
 
 def test_summarise_has_every_metric_key() -> None:
