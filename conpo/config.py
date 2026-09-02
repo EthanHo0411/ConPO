@@ -214,3 +214,21 @@ def env(name: str, default: str) -> str:
 # RUN_USE_VLLM: "1" to sample through vLLM, "0" for HF generate.
 # RUN_JUDGE_ENDPOINT: URL of the judge model's inference endpoint.
 # RUN_OUT_DIR: directory to write run artefacts (checkpoints, logs, metrics).
+
+# ---------------------------------------------------------------------------
+# Trainer step sizes (section 2.4-2.6: sampled once per optimiser step from
+# the counterfactual-edge buffer / feasible buffer; not paper-numbered, no
+# default given). DEV_SET.
+# ---------------------------------------------------------------------------
+
+# Reverse-construction draws attempted per optimiser step (conpo/trainer.py's
+# _generate_and_score_completions -> conpo/reverse.py:reverse_batch). DEV_SET.
+REVERSE_DRAWS_PER_STEP = 8  # DEV_SET
+
+# Edges sampled from the buffer for L_resp each optimiser step
+# (conpo/trainer.py's compute_loss -> conpo/edges.py:EdgeBuffer.sample). DEV_SET.
+EDGE_PAIRS_PER_STEP = 48  # DEV_SET
+
+# Single-family edges sampled from the buffer for L_prompt each optimiser
+# step (conpo/trainer.py's compute_loss). DEV_SET.
+PROMPT_PAIRS_PER_STEP = 8  # DEV_SET
