@@ -249,7 +249,10 @@ def _trim_letter_to(body: str, letter: str, target: int) -> str:
 
     Character-level, applied only while building a fixture (never on the
     corrupted side), so the boundary is exact and the later operator edit
-    (add/remove one occurrence) stays a single-character change.
+    (add/remove one occurrence) stays a single-character change. Deleting a
+    whole one-letter word (e.g. the standalone "a") leaves its two flanking
+    spaces adjacent; collapsing runs of spaces afterward keeps the fixture's
+    word boundaries regular, since `body` is single-spaced filler to start with.
     """
     count = Counter(body.lower())[letter]
     to_drop = max(0, count - target)
@@ -262,7 +265,7 @@ def _trim_letter_to(body: str, letter: str, target: int) -> str:
             dropped += 1
             continue
         out_chars.append(ch)
-    return "".join(out_chars)
+    return re.sub(r" {2,}", " ", "".join(out_chars))
 
 
 def _fixture_letter_frequency(c: Constraint, rng: random.Random) -> str:
@@ -335,40 +338,46 @@ def _fixture_number_sentences(c: Constraint, rng: random.Random) -> str:
     return " ".join(pool[i % len(pool)] for i in range(n))
 
 
-def _merge_sentence_boundary(left: str, right: str) -> str:
-    """Join two sentences into one: drop `left`'s terminal punctuation, join with
-    a comma, lowercase `right`'s first letter. Keeps every word, so the sentence
-    tokenizer sees one sentence where it saw two, at the cost of two characters.
+def _sentence_core_end(text: str, start: int, end: int) -> int:
+    """Offset in `text` where sentence-final punctuation begins within [start, end)."""
+    m = re.search(r"[.!?]+$", text[start:end])
+    return start + m.start() if m else end
+
+
+def _merge_boundaries(text: str, spans: list[tuple[int, int]], boundary_indices: range) -> str:
+    """Splice `text`, merging each boundary i (between spans[i] and spans[i+1]) in
+    place: drop the left sentence's terminal punctuation, join with a comma,
+    lowercase the right sentence's first letter. Edits are applied right to left
+    so earlier offsets stay valid; every other byte of `text`, including
+    whatever separator sits at an untouched boundary, is left exactly as it was.
     """
-    core = re.sub(r"[.!?]+\s*$", "", left.rstrip())
-    return core + ", " + right[:1].lower() + right[1:]
+    out = text
+    for i in sorted(boundary_indices, reverse=True):
+        left_start, left_end = spans[i]
+        right_start, _ = spans[i + 1]
+        core_end = _sentence_core_end(out, left_start, left_end)
+        out = out[:core_end] + ", " + out[right_start].lower() + out[right_start + 1 :]
+    return out
 
 
 def _op_number_sentences(text: str, constraint: Constraint, rng: random.Random) -> Iterator[str]:
     inst = build(constraint)
     threshold, relation = inst._num_sentences_threshold, inst._comparison_relation
-    sentences = [s for s in _sentence_tokenizer().tokenize(text) if s.strip()]
+    spans = [(s, e) for s, e in _sentence_tokenizer().span_tokenize(text) if text[s:e].strip()]
     if relation == "at least":
         # merge sentence boundaries (word-preserving) instead of truncating:
         # dropping whole sentences removes their words wholesale, blowing past
         # the edit-distance budget when the fixture has any slack above threshold.
-        need = len(sentences) - threshold + 1
-        if need < 1 or need >= len(sentences):
+        need = len(spans) - threshold + 1
+        if need < 1 or need >= len(spans):
             return
-        # candidate 1: merge the last `need` boundaries
-        merged = list(sentences)
-        for _ in range(need):
-            last = merged.pop()
-            merged[-1] = _merge_sentence_boundary(merged[-1], last)
-        yield " ".join(merged)
-        # candidate 2: merge the first `need` boundaries instead
-        merged2 = list(sentences)
-        for _ in range(need):
-            first = merged2.pop(0)
-            merged2[0] = _merge_sentence_boundary(first, merged2[0])
-        yield " ".join(merged2)
+        # candidate 1: merge the first `need` boundaries, leaving every
+        # boundary from there to the end of the response untouched
+        yield _merge_boundaries(text, spans, range(need))
+        # candidate 2: merge the last `need` boundaries instead
+        yield _merge_boundaries(text, spans, range(len(spans) - 1 - need, len(spans) - 1))
     else:
-        need = threshold - len(sentences)
+        need = threshold - len(spans)
         if need < 1 or need > 50:
             return
         filler = "It goes on."
@@ -560,9 +569,13 @@ def _op_postscript(text: str, constraint: Constraint, rng: random.Random) -> Ite
     inst = build(constraint)
     marker = inst._postscript_marker
     pattern = _postscript_pattern(marker)
-    # candidate 1: rename just the marker token, keep the trailing sentence (most minimal)
-    if marker in text:
-        yield text.replace(marker, "Note:", 1)
+    # candidate 1: rename just the marker token, keeping its own trailing
+    # punctuation (e.g. "P.S."'s final ".") exactly where it was, so whatever
+    # comes right after the marker (a sentence, or a paragraph divider) is
+    # untouched: only the marker's letters are the target span here.
+    core = marker.rstrip(".")
+    if core and core in text:
+        yield text.replace(core, "Note", 1)
     # candidate 2: strip the whole postscript line (fallback, larger edit)
     out = re.sub(pattern, "", text, flags=re.MULTILINE | re.IGNORECASE)
     if out != text:

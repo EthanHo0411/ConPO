@@ -19,7 +19,7 @@ keywords:word_count_different_numbers  | add or remove exactly one occurrence at
 keywords:exclude_word_harder           | insert the banned word as a standalone token -> can trip length_constraints:number_words or land inside another format's markers.
 paragraphs:paragraphs                  | remove the `***` divider (merge) or insert a second one (split into three) -> breaks length_constraints:number_paragraphs, which uses the same divider convention.
 paragraphs:paragraphs2                 | remove a blank-line divider (merge) or insert an extra one (split into three) -> breaks length_constraints:nth_paragraph_first_word or paragraphs:paragraphs if `***` is also present.
-first_word:first_word_sent             | replace or drop the first word of the final sentence -> breaks last_word:last_word_sent if that sentence is a single word.
+first_word:first_word_sent             | replace or drop the first word of the FIRST sentence (never the last, so the edit can never land on a paragraph/divider boundary, which only ever sits between two sentences) -> breaks last_word:last_word_sent only if the response is one sentence long.
 first_word:first_word_answer           | replace, drop, or push back the response's very first word -> breaks first_word:first_word_sent (same opening token).
 last_word:last_word_sent               | replace or drop the last word of the final sentence -> breaks last_word:last_word_answer (same trailing token).
 last_word:last_word_answer             | replace, drop, or append after the final word -> breaks last_word:last_word_sent and any trailing-anchor family.
@@ -72,13 +72,13 @@ def _op_repeat_phrase(response: str, c: Constraint, rng: random.Random) -> Itera
     if not matches:
         return
     last = matches[-1]
-    span_words = last.group().split()
+    span_words = list(re.finditer(r"\S+", last.group()))
     if len(span_words) == len(words):
         for i, (a, b) in enumerate(zip(span_words, words)):
-            if a == b and i not in (0, len(words) - 1):
-                mutated = span_words.copy()
-                mutated[i] = "then" if mutated[i] != "then" else "now"
-                yield response[: last.start()] + " ".join(mutated) + response[last.end() :]
+            if a.group() == b and i not in (0, len(words) - 1):
+                repl = "then" if a.group() != "then" else "now"
+                abs_start, abs_end = last.start() + a.start(), last.start() + a.end()
+                yield response[:abs_start] + repl + response[abs_end:]
                 break
     start, end = last.start(), last.end()
     yield response[:end] + " " + last.group() + response[end:]  # duplicate the span
@@ -106,12 +106,14 @@ def _fixture_copy_span_idx(c: Constraint, rng: random.Random) -> str:
 
 
 def _op_exact_text(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
-    words = response.split()
-    if not words:
+    matches = list(re.finditer(r"\S+", response))
+    if not matches:
         return
-    if len(words) > 1:
-        yield " ".join(words[:-1])
-    yield response.rstrip() + " " + words[-1]
+    if len(matches) > 1:
+        # drop the last word and the separator right before it; everything before that untouched
+        prev_end, last_end = matches[-2].end(), matches[-1].end()
+        yield response[:prev_end] + response[last_end:]
+    yield response[: matches[-1].end()] + " " + matches[-1].group() + response[matches[-1].end() :]
     yield response.rstrip() + " indeed"
 
 
@@ -417,18 +419,24 @@ def _fixture_first_word_answer(c: Constraint, rng: random.Random) -> str:
 
 
 def _op_first_word_sent(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
+    # Target the FIRST sentence, not the last: a paragraph/divider boundary
+    # (when present) always sits between two sentences, never before the
+    # very first one, so this span can never collide with one.
     sentences = [s for s in instructions_util.split_into_sentences(response) if s.strip()]
     if not sentences:
         return
-    target = sentences[-1]
-    idx = response.rfind(target)
+    target = sentences[0]
+    idx = response.find(target)
     if idx == -1:
         return
-    words = target.split()
+    words = list(re.finditer(r"\S+", target))
     if not words:
         return
-    yield response[:idx] + " ".join(["Meanwhile", *words[1:]]) + response[idx + len(target) :]
-    yield response[:idx] + " ".join(words[1:]) + response[idx + len(target) :]
+    first = words[0]
+    word_start, word_end = idx + first.start(), idx + first.end()
+    drop_end = idx + (words[1].start() if len(words) > 1 else first.end())
+    yield response[:word_start] + "Meanwhile" + response[word_end:]
+    yield response[:word_start] + response[drop_end:]
 
 
 def _op_first_word_answer(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
@@ -471,16 +479,11 @@ def _fixture_last_word_answer(c: Constraint, rng: random.Random) -> str:
     )
 
 
-def _last_token_split(sentence: str) -> tuple[list[str], str]:
-    """Split a sentence into (words, trailing-punctuation-of-last-word)."""
-    words = sentence.split()
-    if not words:
-        return words, ""
-    last = words[-1]
-    core = re.sub(r"[^\w\s]", "", last)
-    suffix = last[len(core) :] if last.startswith(core) else ""
-    words[-1] = core
-    return words, suffix
+def _split_trailing_punctuation(token: str) -> tuple[str, str]:
+    """Split one whitespace token into (word core, trailing-punctuation suffix)."""
+    core = re.sub(r"[^\w\s]", "", token)
+    suffix = token[len(core) :] if token.startswith(core) else ""
+    return core, suffix
 
 
 def _op_last_word_sent(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
@@ -491,11 +494,15 @@ def _op_last_word_sent(response: str, c: Constraint, rng: random.Random) -> Iter
     idx = response.rfind(target)
     if idx == -1:
         return
-    words, suffix = _last_token_split(target)
+    words = list(re.finditer(r"\S+", target))
     if not words:
         return
-    yield response[:idx] + " ".join([*words[:-1], "yesterday"]) + suffix + response[idx + len(target) :]
-    yield response[:idx] + " ".join(words[:-1]) + suffix + response[idx + len(target) :]
+    last = words[-1]
+    _, suffix = _split_trailing_punctuation(last.group())
+    token_start, token_end = idx + last.start(), idx + last.end()
+    drop_start = idx + (words[-2].end() if len(words) > 1 else 0)
+    yield response[:token_start] + "yesterday" + suffix + response[token_end:]
+    yield response[:drop_start] + suffix + response[token_end:]
 
 
 def _op_last_word_answer(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:

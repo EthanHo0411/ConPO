@@ -3,6 +3,7 @@
 import difflib
 import json
 import random
+import re
 from pathlib import Path
 
 import pytest
@@ -161,18 +162,108 @@ def test_forbidden_words_fixture_avoids_filler_collisions() -> None:
 
 
 def test_postscript_minimal_candidate_first() -> None:
-    """The marker-rename edit ('P.S.' -> 'Note:') is smaller than stripping the
-    whole postscript line, so it must be yielded first: registry.corrupt returns
-    the first candidate that passes exact()."""
+    """The marker-rename edit ('P.S' -> 'Note', keeping the marker's own
+    trailing period in place) is smaller than stripping the whole postscript
+    line, so it must be yielded first: registry.corrupt returns the first
+    candidate that passes exact()."""
     c = Constraint("detectable_content:postscript", {"postscript_marker": "P.S."})
     text = registry.FIXTURES["detectable_content:postscript"](c, random.Random(0))
     assert check(c, text) is True
 
     first = next(registry.candidates(text, c, random.Random(0)))
-    expected = text.replace("P.S.", "Note:", 1)
+    expected = text.replace("P.S", "Note", 1)
     assert first == expected, f"expected the minimal marker-rename candidate first, got: {first!r}"
     assert check(c, first) is False
 
     corrupted, reason = registry.corrupt((c,), 0, text, random.Random(0))
     assert reason == registry.EXACT
     assert corrupted == expected
+
+
+# ---------------------------------------------------------------------------
+# locality regressions: an operator may touch only the span its own family
+# needs, never unrelated whitespace elsewhere in the response. Each test below
+# injects a double space and a blank-line divider that sit outside the
+# operator's own target span and asserts both survive verbatim.
+# ---------------------------------------------------------------------------
+
+
+def _inject_locality_markers(text: str) -> tuple[str, str, str]:
+    """Insert a double space after the 3rd word and a blank-line divider
+    before the word following the LAST '. Uppercase' boundary. Returns
+    (variant, double-space marker, divider marker); both markers are expected
+    to survive a locality-preserving corruption untouched."""
+    words = list(re.finditer(r"\S+", text))
+    ds_pos = words[2].end()
+    ds_marker = text[words[2].start() : words[2].end()] + "  " + text[words[3].start() : words[3].end()]
+
+    div_matches = list(re.finditer(r"\. ([A-Z]\w*)", text))
+    dm = div_matches[-1]
+    div_start = dm.start() + 1
+    div_marker = ".\n\n" + dm.group(1)
+
+    edits = sorted([(ds_pos, ds_pos, " "), (div_start, div_start + 1, "\n\n")], key=lambda e: e[0], reverse=True)
+    variant = text
+    for start, end, repl in edits:
+        variant = variant[:start] + repl + variant[end:]
+    return variant, ds_marker, div_marker
+
+
+def test_number_sentences_preserves_irregular_whitespace() -> None:
+    """Regression: the 'at least' branch used to rebuild the whole response
+    with ' '.join(merged sentences), normalising every sentence boundary's
+    whitespace, not just the one boundary it merged."""
+    iid = "length_constraints:number_sentences"
+    c = Constraint.from_ground_truth(iid, KWARGS[iid])
+    text = registry.FIXTURES[iid](c, random.Random(0))
+    assert check(c, text) is True
+
+    variant, ds_marker, div_marker = _inject_locality_markers(text)
+    assert check(c, variant) is True
+
+    corrupted, reason = registry.corrupt((c,), 0, variant, random.Random(1))
+    assert corrupted is not None, f"produced no corruption ({reason})"
+    assert reason == registry.EXACT
+    assert check(c, corrupted) is False
+    assert ds_marker in corrupted, f"double space destroyed: {corrupted!r}"
+    assert div_marker in corrupted, f"paragraph divider destroyed: {corrupted!r}"
+
+
+def test_postscript_preserves_irregular_whitespace() -> None:
+    """Regression: renaming the whole 'P.S.' marker, trailing period
+    included, used to eat a paragraph divider that happened to sit right
+    after it."""
+    iid = "detectable_content:postscript"
+    c = Constraint.from_ground_truth(iid, KWARGS[iid])
+    text = registry.FIXTURES[iid](c, random.Random(0))
+    assert check(c, text) is True
+
+    variant, ds_marker, div_marker = _inject_locality_markers(text)
+    assert check(c, variant) is True
+
+    corrupted, reason = registry.corrupt((c,), 0, variant, random.Random(0))
+    assert corrupted is not None, f"produced no corruption ({reason})"
+    assert reason == registry.EXACT
+    assert check(c, corrupted) is False
+    assert ds_marker in corrupted, f"double space destroyed: {corrupted!r}"
+    assert div_marker in corrupted, f"paragraph divider destroyed: {corrupted!r}"
+
+
+def test_letter_frequency_preserves_irregular_whitespace() -> None:
+    """Regression: trimming the target letter used to leave a double space
+    behind wherever a whole one-letter word (the standalone 'a') was
+    deleted, colliding with an unrelated marker elsewhere in the text."""
+    iid = "keywords:letter_frequency"
+    c = Constraint.from_ground_truth(iid, KWARGS[iid])
+    text = registry.FIXTURES[iid](c, random.Random(0))
+    assert check(c, text) is True
+
+    variant, ds_marker, div_marker = _inject_locality_markers(text)
+    assert check(c, variant) is True
+
+    corrupted, reason = registry.corrupt((c,), 0, variant, random.Random(1))
+    assert corrupted is not None, f"produced no corruption ({reason})"
+    assert reason == registry.EXACT
+    assert check(c, corrupted) is False
+    assert ds_marker in corrupted, f"double space destroyed: {corrupted!r}"
+    assert div_marker in corrupted, f"paragraph divider destroyed: {corrupted!r}"

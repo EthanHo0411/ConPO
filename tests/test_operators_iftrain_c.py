@@ -276,3 +276,69 @@ def test_word_count_different_deletion_preserves_unrelated_double_space() -> Non
     for candidate in candidates:
         assert not check(c, candidate)
         assert "Quiet  mornings" in candidate, "double space unrelated to the deletion must survive"
+
+
+# ---------------------------------------------------------------------------
+# (f) regression: one test per operator changed to stop rebuilding a whole
+# span via " ".join(...); each injects a divider and a double space away
+# from the edit and asserts both survive verbatim.
+# ---------------------------------------------------------------------------
+
+
+def test_exact_text_drop_preserves_unrelated_whitespace() -> None:
+    c = Constraint("copy:copy", {"prompt_to_repeat": "irrelevant here, the operator ignores it"})
+    response = "First  section stays put.\n\nSecond section ends here"
+
+    candidates = list(iftrain_c._op_exact_text(response, c, random.Random(0)))
+    drop_candidate = candidates[0]
+
+    assert drop_candidate == "First  section stays put.\n\nSecond section ends"
+    assert "First  section" in drop_candidate, "double space far from the dropped word must survive"
+    assert "\n\nSecond" in drop_candidate, "paragraph divider far from the dropped word must survive"
+
+
+def test_repeat_phrase_mutation_preserves_unrelated_whitespace() -> None:
+    c = Constraint("copy:repeat_phrase", {"phrase": "Time flies when having fun", "small_n": 2})
+    base = iftrain_c._fixture_repeat_phrase(c, random.Random(1))
+    text = base.replace("day. Time flies before", "day.\n\nTime flies before", 1)
+    text = text.replace("before having fun", "before  having fun", 1)
+    assert check(c, text)
+
+    candidates = list(iftrain_c._op_repeat_phrase(text, c, random.Random(0)))
+    mutate_candidate = candidates[0]
+
+    assert not check(c, mutate_candidate)
+    assert "\n\nTime" in mutate_candidate, "paragraph divider before the mutated repetition must survive"
+    assert "before  having" in mutate_candidate, "double space inside the mutated repetition must survive"
+
+
+def test_first_word_sent_targets_first_sentence_preserves_divider() -> None:
+    c = Constraint("first_word:first_word_sent", {"first_word": "however"})
+    base = iftrain_c._fixture_first_word_sent(c, random.Random(1))
+    text = base.replace("crew managed", "crew  managed", 1)
+    text = text.replace(". However calm", ".\n\nHowever calm", 1)
+    assert check(c, text)
+
+    candidates = list(iftrain_c._op_first_word_sent(text, c, random.Random(0)))
+    mutate_candidate = candidates[0]
+
+    assert not check(c, mutate_candidate)
+    assert mutate_candidate.startswith("Meanwhile the storm")
+    assert "crew  managed" in mutate_candidate, "double space in a later sentence must survive"
+    assert ".\n\nHowever calm" in mutate_candidate, "divider before the untouched last sentence must survive"
+
+
+def test_last_word_sent_preserves_divider_and_double_space_in_target_sentence() -> None:
+    c = Constraint("last_word:last_word_sent", {"last_word": "today"})
+    base = iftrain_c._fixture_last_word_sent(c, random.Random(1))
+    text = base.replace(". Residents", ".\n\nResidents", 1)
+    text = text.replace("city waited", "city  waited", 1)
+    assert check(c, text)
+
+    candidates = list(iftrain_c._op_last_word_sent(text, c, random.Random(0)))
+    mutate_candidate = candidates[0]
+
+    assert not check(c, mutate_candidate)
+    assert mutate_candidate.endswith("hear the news yesterday.")
+    assert "city  waited" in mutate_candidate, "double space earlier in the target sentence must survive"
+    assert ".\n\nResidents" in mutate_candidate, "divider before the target sentence must survive"

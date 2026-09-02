@@ -57,18 +57,17 @@ def _fixture_bigram_wrapping(c: Constraint, rng: random.Random) -> str:
 
 
 def _op_bigram_wrapping(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
-    words = response.split()
+    matches = list(re.finditer(r"\S+", response))
+    words = [m.group() for m in matches]
     wrapped = [i for i in range(0, len(words) - 1, 2) if words[i].startswith("<<") and words[i + 1].endswith(">>")]
     if not wrapped:
         return
     for i in (wrapped[0], wrapped[len(wrapped) // 2], wrapped[-1]):
-        mutated = words.copy()
-        mutated[i] = mutated[i][2:]
-        yield " ".join(mutated)
+        start, end = matches[i].start(), matches[i].end()
+        yield response[:start] + words[i][2:] + response[end:]
     i = wrapped[0]
-    mutated2 = words.copy()
-    mutated2[i + 1] = mutated2[i + 1][:-2]
-    yield " ".join(mutated2)
+    start, end = matches[i + 1].start(), matches[i + 1].end()
+    yield response[:start] + words[i + 1][:-2] + response[end:]
 
 
 register("detectable_format:bigram_wrapping", _op_bigram_wrapping, _fixture_bigram_wrapping)
@@ -86,12 +85,16 @@ def _fixture_copying_simple(c: Constraint, rng: random.Random) -> str:
 
 
 def _op_copying_simple(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
-    words = response.split()
-    if not words:
+    matches = list(re.finditer(r"\S+", response))
+    if not matches:
         return
-    if len(words) > 1:
-        yield " ".join(words[:-1])
-    yield response.rstrip() + " " + words[-1]
+    if len(matches) > 1:
+        last = matches[-1]
+        start = last.start()
+        if start > 0 and response[start - 1] == " ":
+            start -= 1
+        yield response[:start] + response[last.end() :]
+    yield response.rstrip() + " " + matches[-1].group()
     yield response.rstrip() + " please"
 
 
@@ -104,16 +107,19 @@ def _fixture_copying_multiple(c: Constraint, rng: random.Random) -> str:
 
 
 def _op_copying_multiple(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
-    parts = response.split("******")
-    if not parts:
-        return
-    last_words = parts[-1].split()
+    last_sep = response.rfind("******")
+    last_start = last_sep + 6 if last_sep != -1 else 0
+    last_words = list(re.finditer(r"\S+", response[last_start:]))
     if len(last_words) > 1:
-        yield "******".join([*parts[:-1], " ".join(last_words[:-1])])
+        w = last_words[-1]
+        start, end = last_start + w.start(), last_start + w.end()
+        if start > last_start and response[start - 1] == " ":
+            start -= 1
+        yield response[:start] + response[end:]
     idx = response.find("******")
     if idx != -1:
         yield response[:idx] + "*****" + response[idx + 6 :]
-    yield response + "******" + parts[-1]
+    yield response + "******" + response[last_start:]
 
 
 register("copy:copying_multiple", _op_copying_multiple, _fixture_copying_multiple)
@@ -136,12 +142,12 @@ def _fixture_punctuation_dot(c: Constraint, rng: random.Random) -> str:
 
 
 def _op_punctuation_dot(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
-    words = response.split()
-    if not words:
+    matches = list(re.finditer(r"\S+", response))
+    if not matches:
         return
     yield response.rstrip() + "."
-    mid = len(words) // 2
-    yield " ".join([*words[:mid], words[mid] + ".", *words[mid + 1 :]])
+    mid_end = matches[len(matches) // 2].end()
+    yield response[:mid_end] + "." + response[mid_end:]
     yield "." + response
 
 
@@ -154,12 +160,12 @@ def _fixture_punctuation_exclamation(c: Constraint, rng: random.Random) -> str:
 
 
 def _op_punctuation_exclamation(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
-    words = response.split()
-    if not words:
+    matches = list(re.finditer(r"\S+", response))
+    if not matches:
         return
     yield response.rstrip() + "!"
-    mid = len(words) // 2
-    yield " ".join([*words[:mid], words[mid] + "!", *words[mid + 1 :]])
+    mid_end = matches[len(matches) // 2].end()
+    yield response[:mid_end] + "!" + response[mid_end:]
     yield "!" + response
 
 
@@ -172,9 +178,7 @@ register("punctuation:punctuation_exclamation", _op_punctuation_exclamation, _fi
 
 _LOWERCASE_COUNTING_WORDS: tuple[str, ...] = (
     "mountain", "river", "forest", "harbor", "meadow", "canyon", "valley", "island", "desert", "garden",
-    "orchard", "village", "bridge", "tower", "market", "library", "museum", "theater", "station", "chapel",
-    "quarry", "vineyard", "pasture", "coastline", "wetland", "plateau", "glacier", "reef", "lagoon", "delta",
-    "prairie", "savanna", "tundra", "highland", "lowland", "estuary", "peninsula", "archipelago", "basin", "ridge",
+    "orchard", "village",
 )
 
 
@@ -189,14 +193,15 @@ def _fixture_lowercase_counting(c: Constraint, rng: random.Random) -> str:
 
 
 def _op_lowercase_counting(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
-    words = response.split()
+    matches = list(re.finditer(r"\S+", response))
+    words = [m.group() for m in matches]
     idxs = [i for i, w in enumerate(words) if w[:1].isupper()]
     if not idxs:
         return
     for idx in (idxs[0], idxs[len(idxs) // 2], idxs[-1]):
-        mutated = words.copy()
-        mutated[idx] = mutated[idx][0].lower() + mutated[idx][1:]
-        yield " ".join(mutated)
+        start, end = matches[idx].start(), matches[idx].end()
+        lowered = words[idx][0].lower() + words[idx][1:]
+        yield response[:start] + lowered + response[end:]
 
 
 register("count:lowercase_counting", _op_lowercase_counting, _fixture_lowercase_counting)
@@ -410,13 +415,14 @@ def _fixture_count_unique(c: Constraint, rng: random.Random) -> str:
 
 
 def _op_count_unique(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
-    words = response.split()
+    matches = list(re.finditer(r"\S+", response))
+    words = [m.group() for m in matches]
     if len(words) < 2:
         return
-    yield " ".join([*words, words[0]])
-    mid = len(words) // 2
-    yield " ".join([*words[: mid + 1], words[mid], *words[mid + 1 :]])
-    yield " ".join([words[-1], *words])
+    yield response + " " + words[0]
+    mid_end = matches[len(matches) // 2].end()
+    yield response[:mid_end] + " " + words[len(matches) // 2] + response[mid_end:]
+    yield words[-1] + " " + response
 
 
 register("count:count_unique", _op_count_unique, _fixture_count_unique)
@@ -483,19 +489,18 @@ def _fixture_palindrome(c: Constraint, rng: random.Random) -> str:
 
 
 def _op_palindrome(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
-    words = response.split()
+    matches = list(re.finditer(r"\S+", response))
+    words = [m.group() for m in matches]
     idx = next((i for i, w in enumerate(words) if len(w) > 1 and w == w[::-1]), None)
     if idx is None:
         return
-    mutated = words.copy()
-    mutated[idx] = "steady"
-    yield " ".join(mutated)
-    mutated2 = words.copy()
-    del mutated2[idx]
-    yield " ".join(mutated2)
-    mutated3 = words.copy()
-    mutated3[idx] = mutated3[idx] + ","
-    yield " ".join(mutated3)
+    start, end = matches[idx].start(), matches[idx].end()
+    yield response[:start] + "steady" + response[end:]
+    del_end = end
+    if start > 0 and end < len(response) and response[start - 1] == " " and response[end] == " ":
+        del_end += 1  # eat the trailing separator only, leaving one space at start-1
+    yield response[:start] + response[del_end:]
+    yield response[:end] + "," + response[end:]
 
 
 register("keywords:palindrome", _op_palindrome, _fixture_palindrome)
@@ -591,11 +596,12 @@ def _fixture_start_end(c: Constraint, rng: random.Random) -> str:
 
 
 def _op_start_end(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
-    words = response.split()
-    if len(words) < 2:
+    matches = list(re.finditer(r"\S+", response))
+    if len(matches) < 2:
         return
-    yield " ".join([*words[:-1], "evening"])
-    yield " ".join(["Evening", *words[1:]])
+    first, last = matches[0], matches[-1]
+    yield response[: last.start()] + "evening" + response[last.end() :]
+    yield response[: first.start()] + "Evening" + response[first.end() :]
     yield response.rstrip() + "."
 
 

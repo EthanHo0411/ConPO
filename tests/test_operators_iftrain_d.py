@@ -3,6 +3,7 @@
 import difflib
 import json
 import random
+import re
 from pathlib import Path
 
 import pytest
@@ -274,3 +275,65 @@ def test_keyword_specific_position_targets_correct_occurrence() -> None:
     assert corrupted is not None, f"no exact corruption found ({reason})"
     assert reason == registry.EXACT
     assert not check(c, corrupted)
+
+
+# ---------------------------------------------------------------------------
+# regression: whole-response " ".join(...) rebuilds removed 2026-09-02
+# (locality contract, tests/test_operators_locality.py). Every operator
+# touched by that fix must leave irregular whitespace it did not target for
+# its own edit exactly as it found it, anywhere else in the response.
+# ---------------------------------------------------------------------------
+
+CHANGED_LOCALITY_FAMILIES: tuple[str, ...] = (
+    "detectable_format:bigram_wrapping",
+    "copy:copying_simple",
+    "copy:copying_multiple",
+    "punctuation:punctuation_dot",
+    "punctuation:punctuation_exclamation",
+    "count:lowercase_counting",
+    "count:count_unique",
+    "keywords:palindrome",
+    "keywords:start_end",
+)
+
+
+def _inject_locality_markers(text: str) -> tuple[str, list[str]]:
+    """Irregular-whitespace variant of `text`: a double space after the 3rd
+    word, plus (when the text has a later sentence boundary) a blank-line
+    divider before that sentence's first word. Returns the variant and the
+    marker substrings that must survive verbatim in any candidate."""
+    words = list(re.finditer(r"\S+", text))
+    assert len(words) >= 4, "fixture too short to inject a double space"
+    third, fourth = words[2], words[3]
+    ds_marker = text[third.start() : third.end()] + "  " + text[fourth.start() : fourth.end()]
+    edits: list[tuple[int, int, str]] = [(third.end(), third.end(), " ")]
+
+    markers = [ds_marker]
+    sentence_boundaries = list(re.finditer(r"\. ([A-Z]\w*)", text))
+    if sentence_boundaries:
+        m = sentence_boundaries[-1]
+        markers.append(".\n\n" + m.group(1))
+        edits.append((m.start() + 1, m.start() + 2, "\n\n"))
+
+    variant = text
+    for start, end, repl in sorted(edits, key=lambda e: e[0], reverse=True):
+        variant = variant[:start] + repl + variant[end:]
+    return variant, markers
+
+
+@pytest.mark.parametrize("iid", CHANGED_LOCALITY_FAMILIES)
+def test_operator_preserves_untargeted_whitespace(iid: str) -> None:
+    """Every candidate an operator yields must keep a double space and a
+    blank-line divider it did not itself target for its own edit."""
+    c = _constraint(iid)
+    fixture_text = registry.FIXTURES[iid](c, random.Random(1))
+    variant, markers = _inject_locality_markers(fixture_text)
+
+    candidates = list(registry.OPERATORS[iid](variant, c, random.Random(3)))
+    assert candidates, f"{iid}: operator produced no candidates on the whitespace-injected fixture"
+    for candidate in candidates:
+        for marker in markers:
+            assert marker in candidate, (
+                f"{iid}: candidate lost injected marker {marker!r}\n"
+                f"variant:   {variant!r}\ncandidate: {candidate!r}"
+            )
