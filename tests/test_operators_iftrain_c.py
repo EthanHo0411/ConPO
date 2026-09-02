@@ -178,3 +178,101 @@ def test_all_families_registered() -> None:
     for iid in FAMILIES:
         assert iid in registry.OPERATORS, f"{iid} missing from registry.OPERATORS"
         assert iid in registry.FIXTURES, f"{iid} missing from registry.FIXTURES"
+
+
+# ---------------------------------------------------------------------------
+# (e) span-local regression: an operator must splice its target span only,
+# never rebuild the whole response via response.split()/" ".join(...), which
+# would silently collapse a paragraph divider or an unrelated double space
+# living elsewhere in the response.
+# ---------------------------------------------------------------------------
+
+
+def test_no_adjacent_consecutive_corrupts_exact_with_paragraph_divider() -> None:
+    c_target = Constraint("keywords:no_adjacent_consecutive", {})
+    c_par = Constraint("paragraphs:paragraphs2", {})
+    base = iftrain_c._fixture_no_adjacent_consecutive(c_target, random.Random(1))
+    text = base.replace(" Farmers work steadily", "\n\nFarmers work steadily", 1)
+    assert text.count("\n\n") == 1
+    assert check(c_target, text)
+    assert check(c_par, text)
+
+    corrupted, reason = registry.corrupt((c_target, c_par), 0, text, random.Random(0))
+
+    assert reason == registry.EXACT
+    assert corrupted is not None
+    assert not check(c_target, corrupted)
+    divider = text.index("\n\n")
+    assert corrupted[corrupted.index("\n\n") :] == text[divider:], (
+        "divider and second paragraph must survive byte-identical"
+    )
+
+
+def test_square_brackets_corrupts_exact_with_paragraph_divider() -> None:
+    c_target = Constraint("detectable_format:square_brackets", {})
+    c_par = Constraint("paragraphs:paragraphs2", {})
+    base = iftrain_c._fixture_square_brackets(c_target, random.Random(1))
+    text = base.replace(" [nearby]", "\n\n[nearby]", 1)
+    assert text.count("\n\n") == 1
+    assert check(c_target, text)
+    assert check(c_par, text)
+
+    corrupted, reason = registry.corrupt((c_target, c_par), 0, text, random.Random(0))
+
+    assert reason == registry.EXACT
+    assert corrupted is not None
+    assert not check(c_target, corrupted)
+    divider = text.index("\n\n")
+    assert corrupted[corrupted.index("\n\n") :] == text[divider:], (
+        "divider and second paragraph must survive byte-identical"
+    )
+
+
+def test_exclude_word_harder_corrupts_exact_with_paragraph_divider() -> None:
+    c_target = Constraint("keywords:exclude_word_harder", {"keyword": "banana"})
+    c_par = Constraint("paragraphs:paragraphs2", {})
+    base = iftrain_c._fixture_exclude_word_harder(c_target, random.Random(1))
+    text = base + "\n\n" + "A final short note follows."
+    assert text.count("\n\n") == 1
+    assert check(c_target, text)
+    assert check(c_par, text)
+
+    corrupted, reason = registry.corrupt((c_target, c_par), 0, text, random.Random(0))
+
+    assert reason == registry.EXACT
+    assert corrupted is not None
+    assert not check(c_target, corrupted)
+    divider = text.index("\n\n")
+    assert corrupted[corrupted.index("\n\n") :] == text[divider:], (
+        "divider and second paragraph must survive byte-identical"
+    )
+
+
+def test_word_once_deletion_preserves_unrelated_double_space() -> None:
+    c = Constraint("keywords:word_once", {"keyword": "banana"})
+    response = "Quiet  mornings feel calm here. banana is the topic of today's quiet story for everyone."
+    assert check(c, response)
+
+    candidates = list(iftrain_c._op_word_once(response, c, random.Random(0)))
+    deletion_candidate = candidates[1]
+
+    assert not check(c, deletion_candidate)
+    assert "Quiet  mornings" in deletion_candidate, "double space unrelated to the deletion must survive"
+    assert "here.  is" not in deletion_candidate, "double space created at the deletion junction must collapse"
+    assert "here. is" in deletion_candidate
+
+
+def test_word_count_different_deletion_preserves_unrelated_double_space() -> None:
+    c = Constraint(
+        "keywords:word_count_different_numbers",
+        {"keyword": "banana", "frequency": 2, "relation": "at least"},
+    )
+    response = "Quiet  mornings arrive gently. The orchard grew rows of banana trees near the banana stand today."
+    assert check(c, response)
+
+    candidates = list(iftrain_c._op_word_count_different(response, c, random.Random(0)))
+
+    assert len(candidates) == 2
+    for candidate in candidates:
+        assert not check(c, candidate)
+        assert "Quiet  mornings" in candidate, "double space unrelated to the deletion must survive"

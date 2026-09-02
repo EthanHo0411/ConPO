@@ -33,6 +33,7 @@ from collections.abc import Iterator
 
 from conpo.operators.registry import register
 from conpo.verifiers import Constraint, build
+from conpo.vendor.ifevalg import instructions_util
 
 # ---------------------------------------------------------------------------
 # detectable_format:bigram_wrapping
@@ -347,14 +348,15 @@ _COMPOSITION_POOL: tuple[str, ...] = (
 def _fixture_counting_composition(c: Constraint, rng: random.Random) -> str:
     inst = build(c)
     n_sent, n_words = inst._n_sent, inst._n_words
-    content_words = max(n_words - 1, 1)
+    content_words = max(n_words - 1, 0)
     pool = itertools.cycle(_COMPOSITION_POOL)
     paragraphs = []
     for _ in range(3):
         sentences = []
         for _ in range(n_sent):
             chunk = [next(pool) for _ in range(content_words)]
-            chunk[0] = chunk[0].capitalize()
+            if chunk:
+                chunk[0] = chunk[0].capitalize()
             sentences.append(" ".join(chunk) + ".")
         paragraphs.append(" ".join(sentences))
     return "\n\n***\n\n".join(paragraphs)
@@ -523,16 +525,52 @@ def _fixture_keyword_specific_position(c: Constraint, rng: random.Random) -> str
     return " ".join([*lead_sentences, target_sentence])
 
 
+def _keyword_specific_position_span(response: str, n: int, m: int) -> tuple[int, int] | None:
+    """Locate word m-1 of sentence n-1's character span in `response`, mirroring
+    KeywordSpecificPositionChecker's own split_into_sentences + word_tokenize walk
+    exactly, so the span found is the one the checker actually reads."""
+    sentences = instructions_util.split_into_sentences(response)
+    if len(sentences) < n:
+        return None
+    cursor = 0
+    sent_start = -1
+    sentence_text = ""
+    for i in range(n):
+        idx = response.find(sentences[i], cursor)
+        if idx == -1:
+            return None
+        sent_start, sentence_text = idx, sentences[i]
+        cursor = idx + len(sentence_text)
+    words = instructions_util.nltk.word_tokenize(sentence_text)
+    if len(words) < m:
+        return None
+    word_cursor = 0
+    for j, word in enumerate(words):
+        local_idx = sentence_text.find(word, word_cursor)
+        if local_idx == -1:
+            return None
+        if j == m - 1:
+            return sent_start + local_idx, sent_start + local_idx + len(word)
+        word_cursor = local_idx + len(word)
+    return None
+
+
 def _op_keyword_specific_position(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
     inst = build(c)
-    keyword = inst._keyword
-    idx = response.find(keyword)
-    if idx == -1:
-        return
-    end = idx + len(keyword)
-    yield response[:idx] + "neutral" + response[end:]
-    yield (response[:idx] + response[end:]).replace("  ", " ")
-    yield response[:idx] + "extra " + response[idx:]
+    keyword, n, m = inst._keyword, inst._n, inst._m
+    span = _keyword_specific_position_span(response, n, m)
+    if span is None:
+        idx = response.find(keyword)
+        if idx == -1:
+            return
+        span = (idx, idx + len(keyword))
+    start, end = span
+    yield response[:start] + "neutral" + response[end:]
+    del_end = end
+    if start > 0 and end < len(response) and response[start - 1] == " " and response[end] == " ":
+        del_end += 1  # eat the trailing separator only, leaving one space at start-1
+    yield response[:start] + response[del_end:]
+    yield response[:start] + "extra " + response[start:]
 
 
 register("keywords:keyword_specific_position", _op_keyword_specific_position, _fixture_keyword_specific_position)

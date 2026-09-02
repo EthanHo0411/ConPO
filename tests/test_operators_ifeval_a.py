@@ -129,3 +129,50 @@ def test_two_constraint_prompts_corrupt_exactly(first: Constraint, second: Const
 
 def test_at_least_four_pairs_covered() -> None:
     assert len(TWO_CONSTRAINT_CASES) >= 4
+
+
+# ---------------------------------------------------------------------------
+# regression tests for previously-open review findings
+# ---------------------------------------------------------------------------
+
+
+def test_keyword_frequency_less_than_the_terminates() -> None:
+    """keyword='the' with relation='less than' used to hang forever: the fixture's
+    hardcoded 'the topic' replacement reintroduces 'the' on every substitution, so
+    the occurrence count never dropped below the threshold."""
+    c = Constraint("keywords:frequency", {"keyword": "the", "frequency": 1, "relation": "less than"})
+    text = registry.FIXTURES["keywords:frequency"](c, random.Random(0))
+    assert check(c, text) is True, f"fixture violates its own constraint: {text!r}"
+
+    corrupted, reason = registry.corrupt((c,), 0, text, random.Random(0))
+    assert corrupted is not None, f"produced no corruption ({reason})"
+    assert reason == registry.EXACT
+    assert check(c, corrupted) is False
+
+
+def test_forbidden_words_fixture_avoids_filler_collisions() -> None:
+    """The fixture used to ignore the Constraint entirely and return raw filler
+    text, which contains everyday words (e.g. 'garden', 'morning') that can
+    themselves be the forbidden words."""
+    c = Constraint("keywords:forbidden_words", {"forbidden_words": ["garden", "morning"]})
+    for seed in (0, 1):
+        text = registry.FIXTURES["keywords:forbidden_words"](c, random.Random(seed))
+        assert check(c, text) is True, f"fixture contains a forbidden word: {text!r}"
+
+
+def test_postscript_minimal_candidate_first() -> None:
+    """The marker-rename edit ('P.S.' -> 'Note:') is smaller than stripping the
+    whole postscript line, so it must be yielded first: registry.corrupt returns
+    the first candidate that passes exact()."""
+    c = Constraint("detectable_content:postscript", {"postscript_marker": "P.S."})
+    text = registry.FIXTURES["detectable_content:postscript"](c, random.Random(0))
+    assert check(c, text) is True
+
+    first = next(registry.candidates(text, c, random.Random(0)))
+    expected = text.replace("P.S.", "Note:", 1)
+    assert first == expected, f"expected the minimal marker-rename candidate first, got: {first!r}"
+    assert check(c, first) is False
+
+    corrupted, reason = registry.corrupt((c,), 0, text, random.Random(0))
+    assert reason == registry.EXACT
+    assert corrupted == expected

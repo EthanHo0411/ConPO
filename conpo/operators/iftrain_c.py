@@ -168,25 +168,25 @@ def _fixture_no_adjacent_consecutive(c: Constraint, rng: random.Random) -> str:
 
 
 def _op_no_adjacent_consecutive(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
-    words = response.split()
-    if not words:
+    matches = list(re.finditer(r"\S+", response))
+    if not matches:
         return
-    first = words[0][0].lower()
+    first = matches[0].group()[0].lower()
     if first.isalpha() and first < "z":
         insert = _LETTER_WORD[chr(ord(first) + 1)]
-        yield " ".join([words[0], insert, *words[1:]])
-    if len(words) >= 2:
-        before_last = words[-2][0].lower()
+        pos = matches[0].end()
+        yield response[:pos] + " " + insert + response[pos:]
+    if len(matches) >= 2:
+        before_last = matches[-2].group()[0].lower()
         if before_last.isalpha() and before_last < "z":
             insert = _LETTER_WORD[chr(ord(before_last) + 1)]
-            yield " ".join([*words[:-1], insert, words[-1]])
-    for i in range(1, len(words) - 2):
-        a, b = words[i], words[i + 1]
-        fa, fb = a[0].lower(), b[0].lower()
+            pos = matches[-1].start()
+            yield response[:pos] + insert + " " + response[pos:]
+    for i in range(1, len(matches) - 2):
+        a, b = matches[i], matches[i + 1]
+        fa, fb = a.group()[0].lower(), b.group()[0].lower()
         if fa.isalpha() and fb.isalpha() and ord(fa) - ord(fb) == 1:
-            swapped = words.copy()
-            swapped[i], swapped[i + 1] = b, a
-            yield " ".join(swapped)
+            yield response[: a.start()] + b.group() + response[a.end() : b.start()] + a.group() + response[b.end() :]
             break
 
 
@@ -207,24 +207,23 @@ def _fixture_square_brackets(c: Constraint, rng: random.Random) -> str:
     )
 
 
-def _unwrap(words: list[str], index: int) -> str:
-    token = words[index]
+def _unwrap(response: str, matches: list[re.Match[str]], index: int) -> str:
+    token = matches[index].group()
     if token.startswith("["):
         token = token[1:]
     if token.endswith("]"):
         token = token[:-1]
-    mutated = words.copy()
-    mutated[index] = token
-    return " ".join(mutated)
+    start, end = matches[index].start(), matches[index].end()
+    return response[:start] + token + response[end:]
 
 
 def _op_square_brackets(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
-    words = response.split()
-    if not words:
+    matches = list(re.finditer(r"\S+", response))
+    if not matches:
         return
-    yield _unwrap(words, len(words) // 2)
-    yield _unwrap(words, 0)
-    yield _unwrap(words, len(words) - 1)
+    yield _unwrap(response, matches, len(matches) // 2)
+    yield _unwrap(response, matches, 0)
+    yield _unwrap(response, matches, len(matches) - 1)
 
 
 register("detectable_format:square_brackets", _op_square_brackets, _fixture_square_brackets)
@@ -247,13 +246,23 @@ def _fixture_word_once(c: Constraint, rng: random.Random) -> str:
     )
 
 
+def _collapse_junction_space(text: str, pos: int) -> str:
+    """After deleting a span, collapse a double space at exactly `pos` (the
+    deletion junction) to one -- never a global replace that could touch an
+    unrelated double space elsewhere in the response."""
+    if 0 < pos < len(text) and text[pos - 1 : pos + 1] == "  ":
+        return text[: pos - 1] + text[pos:]
+    return text
+
+
 def _op_word_once(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
     inst = build(c)
     match = re.search(inst._keyword, response, flags=re.IGNORECASE)
     if match is None:
         return
     yield response[: match.end()] + " " + match.group() + response[match.end() :]
-    yield (response[: match.start()] + response[match.end() :]).replace("  ", " ")
+    deleted = response[: match.start()] + response[match.end() :]
+    yield _collapse_junction_space(deleted, match.start())
 
 
 register("keywords:word_once", _op_word_once, _fixture_word_once)
@@ -285,10 +294,12 @@ def _op_word_count_different(response: str, c: Constraint, rng: random.Random) -
         if not matches:
             return
         first = matches[0]
-        yield (response[: first.start()] + response[first.end() :]).replace("  ", " ")
+        deleted = response[: first.start()] + response[first.end() :]
+        yield _collapse_junction_space(deleted, first.start())
         if len(matches) > 1:
             last = matches[-1]
-            yield (response[: last.start()] + response[last.end() :]).replace("  ", " ")
+            deleted = response[: last.start()] + response[last.end() :]
+            yield _collapse_junction_space(deleted, last.start())
     else:
         if matches:
             last = matches[-1]
@@ -317,12 +328,15 @@ def _fixture_exclude_word_harder(c: Constraint, rng: random.Random) -> str:
 
 def _op_exclude_word_harder(response: str, c: Constraint, rng: random.Random) -> Iterator[str]:
     inst = build(c)
-    words = response.split()
-    if not words:
+    # A space with a non-space char on each side, i.e. a genuine single-space
+    # word boundary, never a paragraph divider ("\n\n") or a double space.
+    spaces = [m.start() for m in re.finditer(r"(?<=\S) (?=\S)", response)]
+    if not spaces:
         return
-    mid = len(words) // 2
-    yield " ".join([*words[:mid], inst._keyword, *words[mid:]])
-    yield " ".join([words[0], inst._keyword, *words[1:]])
+    mid = spaces[len(spaces) // 2]
+    yield response[:mid] + " " + inst._keyword + response[mid:]
+    first = spaces[0]
+    yield response[:first] + " " + inst._keyword + response[first:]
 
 
 register("keywords:exclude_word_harder", _op_exclude_word_harder, _fixture_exclude_word_harder)

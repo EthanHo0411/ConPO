@@ -163,8 +163,15 @@ def _fixture_keyword_frequency(c: Constraint, rng: random.Random) -> str:
         if need:
             body += " " + _adapt_case(" ".join([keyword] * need) + ".", body)
     else:
-        while len(re.findall(keyword, body, flags=re.IGNORECASE)) >= freq:
-            body = re.sub(keyword, "the topic", body, count=1, flags=re.IGNORECASE)
+        # a literal replacement can itself contain the keyword (e.g. keyword="the"
+        # inside "the topic"), reintroducing a match on every substitution and
+        # looping forever; _neutral_for guarantees the replacement does not match
+        # the keyword pattern, and the iteration cap is a hard backstop regardless.
+        repl = _neutral_for(keyword) or _NEUTRAL_WORDS[0]
+        remaining = 200
+        while remaining and len(re.findall(keyword, body, flags=re.IGNORECASE)) >= freq:
+            body = re.sub(keyword, repl, body, count=1, flags=re.IGNORECASE)
+            remaining -= 1
     return body
 
 
@@ -208,7 +215,13 @@ register("keywords:frequency", _op_keyword_frequency, _fixture_keyword_frequency
 
 
 def _fixture_forbidden_words(c: Constraint, rng: random.Random) -> str:
-    return _filler_text(rng)
+    inst = build(c)
+    banned = [re.compile(r"\b" + word + r"\b", flags=re.IGNORECASE) for word in inst._forbidden_words]
+    pool = [s for s in _FILLER_SENTENCES if not any(b.search(s) for b in banned)]
+    if not pool:
+        pool = list(_NEUTRAL_WORDS)
+    rng.shuffle(pool)
+    return " ".join(pool[: min(5, len(pool))])
 
 
 def _op_forbidden_words(text: str, constraint: Constraint, rng: random.Random) -> Iterator[str]:
@@ -547,13 +560,13 @@ def _op_postscript(text: str, constraint: Constraint, rng: random.Random) -> Ite
     inst = build(constraint)
     marker = inst._postscript_marker
     pattern = _postscript_pattern(marker)
-    # candidate 1: strip the whole postscript line
+    # candidate 1: rename just the marker token, keep the trailing sentence (most minimal)
+    if marker in text:
+        yield text.replace(marker, "Note:", 1)
+    # candidate 2: strip the whole postscript line (fallback, larger edit)
     out = re.sub(pattern, "", text, flags=re.MULTILINE | re.IGNORECASE)
     if out != text:
         yield out
-    # candidate 2: rename just the marker token, keep the trailing sentence
-    if marker in text:
-        yield text.replace(marker, "Note:", 1)
 
 
 register("detectable_content:postscript", _op_postscript, _fixture_postscript)

@@ -240,3 +240,37 @@ def test_letter_counting2_second_candidate_survives_multi_delete() -> None:
     assert len(candidates) == 2
     for cand in candidates:
         assert not check(c, cand)
+
+
+# ---------------------------------------------------------------------------
+# regression: two more review-flagged bugs, fixed 2026-09-02
+# ---------------------------------------------------------------------------
+
+
+def test_counting_composition_fixture_at_n_words_equals_one() -> None:
+    """n_words=1 must yield a single-token sentence ('.'), not a 2-token one;
+    the old max(n_words - 1, 1) floor forced an extra content word in."""
+    c = Constraint("count:counting_composition", {"n_sent": 1, "n_words": 1})
+    fixture = registry.FIXTURES["count:counting_composition"]
+    assert check(c, fixture(c, random.Random(1)))
+    assert check(c, fixture(c, random.Random(2)))
+
+    fixture_text = fixture(c, random.Random(1))
+    corrupted, reason = registry.corrupt((c,), 0, fixture_text, random.Random(3))
+    assert reason == registry.EXACT
+    assert corrupted is not None
+    assert not check(c, corrupted)
+
+
+def test_keyword_specific_position_targets_correct_occurrence() -> None:
+    """The keyword must also appear earlier in the response, before its
+    required sentence/position; the operator must edit the checker-read
+    occurrence (sentence n-1, word m-1), not the first substring match."""
+    c = Constraint("keywords:keyword_specific_position", {"keyword": "river", "n": 2, "m": 3})
+    response = "I once visited a beautiful river near my home. Gentle wind river moved slowly today."
+    assert check(c, response)
+
+    corrupted, reason = registry.corrupt((c,), 0, response, random.Random(3))
+    assert corrupted is not None, f"no exact corruption found ({reason})"
+    assert reason == registry.EXACT
+    assert not check(c, corrupted)
