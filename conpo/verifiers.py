@@ -22,6 +22,11 @@ import nltk
 from conpo.vendor.ifevalg import instructions_registry, instructions_util
 from conpo.vendor.ifevalg.instructions import Instruction
 
+# The vendored language checkers call langdetect, whose PRNG is unseeded by
+# default and makes change_case:* and language:* verdicts flaky. Pin it once
+# here, the single import every verifier call goes through.
+langdetect.DetectorFactory.seed = 0
+
 # ---------------------------------------------------------------------------
 # Family registry: 54 = 25 IFEval + 29 IFBench-Train, in registry order.
 # ---------------------------------------------------------------------------
