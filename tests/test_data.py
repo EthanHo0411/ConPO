@@ -90,6 +90,36 @@ def test_filter_report_ifeval25_and_unmapped(pool_sample: tuple[list[PoolRow], F
     assert report.dropped_unmapped == 0
 
 
+# (c2) load_pool dedupes duplicate keys (keep-first) -------------------------
+
+
+def _synthetic_raw_row(key: str) -> dict:
+    sentence = "Do not use any commas."
+    return {
+        "key": key,
+        "messages": [{"role": "user", "content": f"Explain the topic. {sentence}"}],
+        "ground_truth": repr([{"instruction_id": ["punctuation:no_comma"], "kwargs": [None]}]),
+        "constraint": sentence,
+    }
+
+
+def test_load_pool_dedupes_duplicate_keys_keep_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The upstream pool dataset carries a handful of duplicate keys (e.g.
+    hard_coded_5 x3); load_pool must keep only the first occurrence and
+    report the rest via FilterReport.duplicate_keys (the review fix)."""
+    ds = datasets.Dataset.from_list(
+        [_synthetic_raw_row("dup"), _synthetic_raw_row("dup"), _synthetic_raw_row("b")]
+    )
+    monkeypatch.setattr(datasets, "load_dataset", lambda *args, **kwargs: ds)
+
+    rows, report = load_pool(limit=None)
+
+    assert report.total == 3
+    assert report.duplicate_keys == 1
+    assert report.kept == 2
+    assert sorted(r.key for r in rows) == ["b", "dup"]
+
+
 # (d) splits disjoint; eval_ii carries no train pair leakage -----------------
 
 

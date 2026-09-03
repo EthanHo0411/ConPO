@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import random
@@ -20,7 +19,7 @@ from trl import GRPOConfig
 import conpo.operators  # noqa: F401  registers all corruption operators
 from conpo import config
 from conpo.arms import resolve_arm
-from conpo.data import PoolRow, TokenMeter, load_subset
+from conpo.data import PoolRow, TokenMeter, keys_digest, load_subset
 from conpo.edges import EdgeBuffer, FeasibleBuffer
 from conpo.engine import HFEngine, VLLMColocateEngine
 from conpo.judge import HttpJudge, StaticJudge, resolve_endpoint
@@ -54,22 +53,40 @@ def _load_rows(path: Path, limit: int | None) -> list[PoolRow]:
     return rows
 
 
-def _assert_subset_divides_prompts_per_update(dataset_size: int, prompts_per_update: int) -> None:
-    """A RUN_SUBSET run pins TRL's RepeatSampler to shuffle_dataset=False with
-    batch_size == prompts_per_update; RepeatSampler drops any trailing chunk
-    shorter than a full batch on every epoch (trl/trainer/utils.py), which
-    would silently exclude the tail of the committed subset's key order from
-    every arm if dataset_size were not an exact multiple. Fail loud instead:
-    scripts/draw_subset.py rounds --size to a multiple of prompts_per_update
-    by default, so a mismatch here means a subset was drawn some other way or
-    hand-edited.
+def _load_training_rows(data_path: Path, subset_path: str, tiny: bool) -> list[PoolRow]:
+    """Rows for one training run.
+
+    RUN_SUBSET (`subset_path` non-empty): the full pool is read first and
+    reordered to the subset's key order, THEN `tiny` truncates to the first
+    4 keys of that order -- truncating the raw pool file first (the old
+    behaviour) would almost always miss every subset key and load_subset
+    would raise KeyError. No RUN_SUBSET: a plain read of `data_path`, capped
+    at 4 rows for `tiny`.
     """
-    assert dataset_size % prompts_per_update == 0, (
-        f"RUN_SUBSET dataset_size ({dataset_size}) is not a multiple of prompts_per_update "
-        f"({prompts_per_update}); TRL's RepeatSampler would silently drop the trailing "
-        f"{dataset_size % prompts_per_update} row(s) every epoch. Regenerate the subset with "
-        f"scripts/draw_subset.py (its --round-to default fixes this)."
-    )
+    if subset_path:
+        rows = load_subset(_load_rows(data_path, limit=None), subset_path)
+        return rows[:4] if tiny else rows
+    return _load_rows(data_path, limit=4 if tiny else None)
+
+
+def _report_subset_prompts_per_update(dataset_size: int, prompts_per_update: int) -> None:
+    """Prints a note when a RUN_SUBSET's dataset_size is not an exact
+    multiple of prompts_per_update: a RUN_SUBSET run pins TRL's
+    RepeatSampler to shuffle_dataset=False with batch_size ==
+    prompts_per_update, and RepeatSampler drops any trailing chunk shorter
+    than a full batch on every epoch (trl/trainer/utils.py). scripts/
+    draw_subset.py draws exactly --size keys with no rounding, so a
+    remainder here is expected whenever --size isn't a multiple of
+    prompts_per_update, not a sign of a hand-edited or corrupted subset --
+    see its module docstring for why the dropped tail is negligible.
+    """
+    remainder = dataset_size % prompts_per_update
+    if remainder:
+        print(
+            f"note: RUN_SUBSET dataset_size ({dataset_size}) is not a multiple of "
+            f"prompts_per_update ({prompts_per_update}); TRL's RepeatSampler will drop the "
+            f"trailing {remainder} row(s) every epoch (negligible)."
+        )
 
 
 def _tiny_model_and_tokenizer() -> tuple[torch.nn.Module, AutoTokenizer]:
@@ -148,10 +165,8 @@ def main() -> None:
     arm, overrides = resolve_arm(arm_name)
 
     subset_path = config.env("RUN_SUBSET", "")
-    rows = _load_rows(DATA_DIR / "train.jsonl", limit=4 if args.tiny else None)
-    if subset_path:
-        rows = load_subset(rows, subset_path)
-    subset_sha256 = hashlib.sha256(Path(subset_path).read_bytes()).hexdigest() if subset_path else None
+    rows = _load_training_rows(DATA_DIR / "train.jsonl", subset_path, args.tiny)
+    subset_sha256 = keys_digest(subset_path) if subset_path else None
     rows_by_key = {r.key: r for r in rows}
     dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
 
@@ -192,7 +207,7 @@ def main() -> None:
         )
     prompts_per_update = num_processes * gradient_accumulation_steps
     if subset_path:
-        _assert_subset_divides_prompts_per_update(len(rows), prompts_per_update)
+        _report_subset_prompts_per_update(len(rows), prompts_per_update)
     if not args.tiny:
         print(
             f"gradient_accumulation_steps={gradient_accumulation_steps} "

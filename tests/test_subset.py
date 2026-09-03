@@ -9,7 +9,6 @@ already uses for eval_external/eval_internal.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -22,7 +21,7 @@ from trl import GRPOConfig
 
 from conpo import config
 from conpo.arms import resolve_arm
-from conpo.data import PoolRow, TokenMeter, load_subset
+from conpo.data import PoolRow, TokenMeter, keys_digest, load_subset
 from conpo.edges import EdgeBuffer, FeasibleBuffer
 from conpo.engine import HFEngine
 from conpo.judge import StaticJudge
@@ -30,7 +29,8 @@ from conpo.selection import FamilyStats
 from conpo.trainer import ConPOTrainer
 from conpo.verifiers import Constraint
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
@@ -54,9 +54,10 @@ def test_draw_subset_exact_stratified_sizes(tmp_path: Path) -> None:
     source = tmp_path / "train.jsonl"
     _write_synthetic_train(source, per_count)
 
-    keys, sizes, total = draw_subset.draw_subset(source, size=200, seed=42)
+    keys, sizes, total, duplicate_keys = draw_subset.draw_subset(source, size=200, seed=42)
 
     assert total == 500
+    assert duplicate_keys == 0
     assert len(keys) == 200
     assert len(set(keys)) == 200  # no duplicates
     assert sum(sizes.values()) == 200
@@ -70,9 +71,10 @@ def test_draw_subset_largest_remainder_rounding_sums_exactly(tmp_path: Path) -> 
     source = tmp_path / "train.jsonl"
     _write_synthetic_train(source, per_count)
 
-    _, sizes, total = draw_subset.draw_subset(source, size=6, seed=0)
+    _, sizes, total, duplicate_keys = draw_subset.draw_subset(source, size=6, seed=0)
 
     assert total == 10
+    assert duplicate_keys == 0
     assert sum(sizes.values()) == 6
     # exact shares: 1 -> 4.2, 2 -> 1.8; floors 4+1=5, leftover 1 goes to the
     # larger fractional remainder (2's 0.8 > 1's 0.2).
@@ -84,12 +86,57 @@ def test_draw_subset_deterministic_for_seed_different_for_another(tmp_path: Path
     source = tmp_path / "train.jsonl"
     _write_synthetic_train(source, per_count)
 
-    keys_a, _, _ = draw_subset.draw_subset(source, size=200, seed=42)
-    keys_a_again, _, _ = draw_subset.draw_subset(source, size=200, seed=42)
-    keys_b, _, _ = draw_subset.draw_subset(source, size=200, seed=7)
+    keys_a, _, _, _ = draw_subset.draw_subset(source, size=200, seed=42)
+    keys_a_again, _, _, _ = draw_subset.draw_subset(source, size=200, seed=42)
+    keys_b, _, _, _ = draw_subset.draw_subset(source, size=200, seed=7)
 
     assert keys_a == keys_a_again
     assert keys_a != keys_b
+
+
+# ---------------------------------------------------------------------------
+# scripts/draw_subset.py: duplicate-key dedup (the review fix -- pool keys
+# duplicated upstream, e.g. hard_coded_5 x3, were leaking into the drawn key
+# list; see conpo/data.py's load_pool for the source-side dedup)
+# ---------------------------------------------------------------------------
+
+
+def test_num_constraints_histogram_dedupes_by_key_keep_first(tmp_path: Path) -> None:
+    source = tmp_path / "train.jsonl"
+    # "dup" appears 3x; the first occurrence's num_constraints (2) must be
+    # the one kept, and the later repeats (num_constraints=4) must not
+    # double-count into the histogram.
+    rows = [
+        {"key": "dup", "num_constraints": 2},
+        {"key": "a", "num_constraints": 2},
+        {"key": "dup", "num_constraints": 4},
+        {"key": "dup", "num_constraints": 4},
+        {"key": "b", "num_constraints": 3},
+    ]
+    source.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    by_count, total, duplicate_keys = draw_subset._num_constraints_histogram(source)
+
+    assert total == 5
+    assert duplicate_keys == 2
+    assert by_count == {2: ["dup", "a"], 3: ["b"]}
+
+
+def test_draw_subset_drops_duplicate_keys_before_sampling(tmp_path: Path) -> None:
+    source = tmp_path / "train.jsonl"
+    rows = [{"key": "dup", "num_constraints": 1}] * 3 + [
+        {"key": f"row-{i}", "num_constraints": 1} for i in range(9)
+    ]
+    source.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    keys, sizes, total, duplicate_keys = draw_subset.draw_subset(source, size=5, seed=0)
+
+    assert total == 12
+    assert duplicate_keys == 2  # "dup" kept once, its 2 repeats skipped
+    assert sum(sizes.values()) == 5
+    assert len(keys) == 5
+    assert len(set(keys)) == 5  # no duplicates leaked into the drawn keys
+    assert keys.count("dup") <= 1
 
 
 def test_draw_subset_cli_writes_keys_and_manifest(tmp_path: Path, monkeypatch) -> None:
@@ -97,24 +144,10 @@ def test_draw_subset_cli_writes_keys_and_manifest(tmp_path: Path, monkeypatch) -
     _write_synthetic_train(source, {1: 20, 2: 30})
     out_path = tmp_path / "subsets" / "train_25_seed3.keys"
 
-    # --round-to 1 opts out of the divisibility rounding (tested separately
-    # below) so this test can assert the plumbing against the literal --size.
     monkeypatch.setattr(
         sys,
         "argv",
-        [
-            "draw_subset.py",
-            "--size",
-            "25",
-            "--seed",
-            "3",
-            "--source",
-            str(source),
-            "--out",
-            str(out_path),
-            "--round-to",
-            "1",
-        ],
+        ["draw_subset.py", "--size", "25", "--seed", "3", "--source", str(source), "--out", str(out_path)],
     )
     draw_subset.main()
 
@@ -124,30 +157,24 @@ def test_draw_subset_cli_writes_keys_and_manifest(tmp_path: Path, monkeypatch) -
 
     manifest = json.loads((tmp_path / "subsets" / "train_25_seed3.manifest.json").read_text(encoding="utf-8"))
     assert manifest["size"] == 25
-    assert manifest["requested_size"] == 25
-    assert manifest["round_to"] == 1
     assert manifest["seed"] == 3
+    assert manifest["duplicate_keys"] == 0
     assert sum(manifest["per_count_sizes"].values()) == 25
-    assert manifest["keys_sha256"] == hashlib.sha256(out_path.read_bytes()).hexdigest()
+    assert manifest["prompts_per_update"] == draw_subset.PROMPTS_PER_UPDATE
+    assert manifest["dropped_trailing_prompts"] == 25 % draw_subset.PROMPTS_PER_UPDATE
+    assert manifest["keys_sha256"] == keys_digest(out_path)
     assert manifest["source_manifest_split_sizes"] is None  # no data/manifest.json next to this synthetic source
 
 
 # ---------------------------------------------------------------------------
-# scripts/draw_subset.py: --round-to (RepeatSampler divisibility, the review
-# fix -- 15000 % PROMPTS_PER_UPDATE != 0 was silently unreachable, see
-# scripts/train.py's _assert_subset_divides_prompts_per_update)
+# scripts/draw_subset.py: exact --size, no rounding (the review fix -- the
+# module used to round --size up to a multiple of PROMPTS_PER_UPDATE and
+# called it a "locked decision" that was never made; 15000 was silently
+# rounded to 15008)
 # ---------------------------------------------------------------------------
 
 
-def test_round_to_multiple_rounds_ties_up_and_floors_at_multiple() -> None:
-    assert draw_subset._round_to_multiple(15000, 16) == 15008  # 937.5 -> 938
-    assert draw_subset._round_to_multiple(20000, 16) == 20000  # already exact
-    assert draw_subset._round_to_multiple(100, 16) == 96  # 6.25 -> 6, no tie
-    assert draw_subset._round_to_multiple(3, 16) == 16  # floored, never 0
-    assert draw_subset._round_to_multiple(25, 1) == 25  # disabled
-
-
-def test_draw_subset_cli_default_round_to_names_file_by_rounded_size(tmp_path: Path, monkeypatch) -> None:
+def test_draw_subset_cli_draws_exact_size_no_rounding(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "train.jsonl"
     _write_synthetic_train(source, {1: 40, 2: 60})  # 100 rows, plenty for size=25 stratified
     out_dir = tmp_path / "subsets"
@@ -156,17 +183,20 @@ def test_draw_subset_cli_default_round_to_names_file_by_rounded_size(tmp_path: P
     monkeypatch.setattr(draw_subset, "REPO_ROOT", tmp_path)
     draw_subset.main()
 
-    rounded = draw_subset._round_to_multiple(25, draw_subset.PROMPTS_PER_UPDATE)
-    out_path = out_dir / f"train_{rounded}_seed3.keys"
+    # 25 is not a multiple of PROMPTS_PER_UPDATE (16): the old default
+    # rounded this up to 32 and named the file accordingly. The fix draws
+    # and names the file by the literal --size.
+    out_path = out_dir / "train_25_seed3.keys"
     assert out_path.exists()
     lines = out_path.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == rounded
-    assert rounded % draw_subset.PROMPTS_PER_UPDATE == 0
+    assert len(lines) == 25
+    assert len(set(lines)) == 25
 
-    manifest = json.loads((out_dir / f"train_{rounded}_seed3.manifest.json").read_text(encoding="utf-8"))
-    assert manifest["size"] == rounded
-    assert manifest["requested_size"] == 25
-    assert manifest["round_to"] == draw_subset.PROMPTS_PER_UPDATE
+    manifest = json.loads((out_dir / "train_25_seed3.manifest.json").read_text(encoding="utf-8"))
+    assert manifest["size"] == 25
+    assert "requested_size" not in manifest  # retired along with the rounding it explained
+    assert "round_to" not in manifest
+    assert manifest["dropped_trailing_prompts"] == 25 % draw_subset.PROMPTS_PER_UPDATE
 
 
 # ---------------------------------------------------------------------------
@@ -205,17 +235,41 @@ def test_load_subset_raises_on_missing_key(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# scripts/train.py: _assert_subset_divides_prompts_per_update
+# conpo/data.py: keys_digest (line-ending independence -- Windows write_text
+# emits CRLF, git checks the same file out as LF on the Linux cluster)
 # ---------------------------------------------------------------------------
 
 
-def test_assert_subset_divides_prompts_per_update_passes_when_exact() -> None:
-    train_script._assert_subset_divides_prompts_per_update(32, 16)  # no raise
+def test_keys_digest_matches_across_line_endings(tmp_path: Path) -> None:
+    keys = ["a", "b", "c"]
+    lf_path = tmp_path / "lf.keys"
+    crlf_path = tmp_path / "crlf.keys"
+    lf_path.write_bytes(("\n".join(keys) + "\n").encode("utf-8"))
+    crlf_path.write_bytes(("\r\n".join(keys) + "\r\n").encode("utf-8"))
+
+    assert keys_digest(lf_path) == keys_digest(crlf_path)
 
 
-def test_assert_subset_divides_prompts_per_update_raises_when_not_exact() -> None:
-    with pytest.raises(AssertionError, match="15000"):
-        train_script._assert_subset_divides_prompts_per_update(15000, 16)
+# ---------------------------------------------------------------------------
+# scripts/train.py: _report_subset_prompts_per_update
+#
+# draw_subset.py no longer rounds --size up to a multiple of
+# prompts_per_update (see the exact-size tests above), so a RUN_SUBSET whose
+# size doesn't divide evenly -- e.g. the committed 15000-key subset at
+# prompts_per_update=16 -- is now the expected, negligible case (TRL's
+# RepeatSampler drops the trailing remainder every epoch) rather than a sign
+# of a hand-edited or corrupted subset; this must not raise.
+# ---------------------------------------------------------------------------
+
+
+def test_report_subset_prompts_per_update_silent_when_exact(capsys: pytest.CaptureFixture[str]) -> None:
+    train_script._report_subset_prompts_per_update(32, 16)  # no raise
+    assert capsys.readouterr().out == ""
+
+
+def test_report_subset_prompts_per_update_prints_note_when_not_exact(capsys: pytest.CaptureFixture[str]) -> None:
+    train_script._report_subset_prompts_per_update(15000, 16)  # no raise
+    assert "15000" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -322,3 +376,68 @@ def test_pass1_callback_fires_once_at_pass_boundary(tmp_path: Path) -> None:
     assert pass1_meta["global_step"] == 4  # fired at the pass boundary, not at step 5
     assert pass1_meta["tokens_so_far"] >= 0
     assert pass1_meta["wall_time_seconds"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# scripts/train.py: _load_training_rows (the review fix -- --tiny used to
+# truncate to the pool file's first 4 rows BEFORE a RUN_SUBSET was applied,
+# so any real subset whose keys weren't among those first 4 rows crashed
+# load_subset with KeyError)
+# ---------------------------------------------------------------------------
+
+
+def _write_pool_jsonl(path: Path, rows: list[PoolRow]) -> None:
+    """Inverse of scripts/train.py's `_row_from_json` -- same shape as
+    scripts/build_corpus.py's `_row_to_json`."""
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            payload = {
+                "key": row.key,
+                "base_prompt": row.base_prompt,
+                "prompt": row.prompt,
+                "sentences": list(row.sentences),
+                "constraints": [{"iid": c.iid, "kwargs": dict(c.kwargs)} for c in row.constraints],
+                "english": row.english,
+                "num_constraints": row.num_constraints,
+            }
+            f.write(json.dumps(payload) + "\n")
+
+
+def test_load_training_rows_tiny_with_subset_truncates_after_subset_order(tmp_path: Path) -> None:
+    pool_rows = [_pass1_row(f"row-{i}", f"Explain topic {i}.") for i in range(30)]
+    pool_path = tmp_path / "train.jsonl"
+    _write_pool_jsonl(pool_path, pool_rows)
+
+    # 20 keys, deliberately excluding the pool's first 4 rows and in a
+    # shuffled (descending) order, so truncating the pool file to 4 rows
+    # before applying the subset would miss every subset key.
+    subset_keys = [f"row-{i}" for i in range(29, 9, -1)]
+    assert len(subset_keys) == 20
+    subset_path = tmp_path / "subset.keys"
+    subset_path.write_text("\n".join(subset_keys) + "\n", encoding="utf-8")
+
+    rows = train_script._load_training_rows(pool_path, str(subset_path), tiny=True)
+
+    assert [r.key for r in rows] == subset_keys[:4]
+
+
+def test_load_training_rows_tiny_with_real_15000_subset_does_not_raise() -> None:
+    """RUN_SUBSET pointing at the committed 15000-key subset with --tiny must
+    not KeyError (regression for the truncate-before-subset bug)."""
+    subset_path = REPO_ROOT / "subsets" / "train_15000_seed42.keys"
+
+    rows = train_script._load_training_rows(train_script.DATA_DIR / "train.jsonl", str(subset_path), tiny=True)
+
+    assert len(rows) == 4
+    subset_order = subset_path.read_text(encoding="utf-8").splitlines()
+    assert [r.key for r in rows] == subset_order[:4]
+
+
+def test_load_training_rows_tiny_without_subset_unchanged(tmp_path: Path) -> None:
+    pool_rows = [_pass1_row(f"row-{i}", f"Explain topic {i}.") for i in range(10)]
+    pool_path = tmp_path / "train.jsonl"
+    _write_pool_jsonl(pool_path, pool_rows)
+
+    rows = train_script._load_training_rows(pool_path, "", tiny=True)
+
+    assert [r.key for r in rows] == [f"row-{i}" for i in range(4)]

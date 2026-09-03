@@ -116,6 +116,7 @@ def _bad_nth_kwargs(constraints: tuple[Constraint, ...]) -> bool:
 class FilterReport:
     total: int
     kept: int
+    duplicate_keys: int
     dropped_unmapped: int
     dropped_bad_kwargs: int
     dropped_unparseable_constraint_text: int
@@ -128,6 +129,15 @@ class FilterReport:
 def load_pool(limit: int | None = None) -> tuple[list[PoolRow], FilterReport]:
     """Load and filter the pool dataset.
 
+    Rows are deduplicated by `key` first (keep the first occurrence, count
+    the rest as `duplicate_keys`): the upstream pool dataset
+    (allenai/IF_multi_constraints_upto5) carries a handful of duplicate keys
+    (observed: hard_coded_1, hard_coded_5 x3, hard_coded_17, hard_coded_18),
+    and this is the single place the pipeline dedupes -- downstream readers
+    (scripts/draw_subset.py included) should not need to dedupe again, though
+    draw_subset.py does so defensively too since data/train.jsonl was built
+    before this fix and still carries the duplicates.
+
     Keeps rows whose constraint ids are all in FAMILIES (54) and none in
     HELDOUT_TEST_FAMILIES, then drops bad_nth_kwargs rows and rows whose
     constraint text cannot be split verbatim from the message content.
@@ -139,6 +149,8 @@ def load_pool(limit: int | None = None) -> tuple[list[PoolRow], FilterReport]:
         ds = ds.select(range(min(limit, len(ds))))
 
     total = len(ds)
+    duplicate_keys = 0
+    seen_keys: set[str] = set()
     dropped_unmapped = 0
     dropped_bad_kwargs = 0
     dropped_unparseable_constraint_text = 0
@@ -149,6 +161,12 @@ def load_pool(limit: int | None = None) -> tuple[list[PoolRow], FilterReport]:
     rows: list[PoolRow] = []
 
     for raw in ds:
+        key: str = raw["key"]
+        if key in seen_keys:
+            duplicate_keys += 1
+            continue
+        seen_keys.add(key)
+
         constraints = parse_ground_truth(raw["ground_truth"])
         ids = tuple(c.iid for c in constraints)
         if any(iid not in _FAMILIES_SET for iid in ids) or any(iid in _HELDOUT_SET for iid in ids):
@@ -167,7 +185,7 @@ def load_pool(limit: int | None = None) -> tuple[list[PoolRow], FilterReport]:
 
         rows.append(
             PoolRow(
-                key=raw["key"],
+                key=key,
                 base_prompt=base_prompt,
                 prompt=prompt,
                 sentences=sentences,
@@ -188,6 +206,7 @@ def load_pool(limit: int | None = None) -> tuple[list[PoolRow], FilterReport]:
     report = FilterReport(
         total=total,
         kept=kept,
+        duplicate_keys=duplicate_keys,
         dropped_unmapped=dropped_unmapped,
         dropped_bad_kwargs=dropped_bad_kwargs,
         dropped_unparseable_constraint_text=dropped_unparseable_constraint_text,
@@ -275,6 +294,19 @@ class TokenMeter:
 
     def exhausted(self) -> bool:
         return self.budget > 0 and self.total >= self.budget
+
+
+def keys_digest(path: Path | str) -> str:
+    """sha256 over the newline-joined, non-empty stripped lines of a keys
+    file, independent of line-ending style.
+
+    Windows' Path.write_text emits CRLF; git checks the file back out as LF
+    on the Linux cluster. A raw-byte sha256 of the file would then differ
+    between the two, even though the key list is identical -- this hashes
+    the parsed key list instead, so the digest is stable across platforms.
+    """
+    keys = [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    return hashlib.sha256(("\n".join(keys) + "\n").encode("utf-8")).hexdigest()
 
 
 def load_subset(rows: list[PoolRow], keys_path: str | Path) -> list[PoolRow]:

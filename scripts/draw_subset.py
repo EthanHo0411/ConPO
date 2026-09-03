@@ -1,70 +1,77 @@
 """Draw ONE fixed, seeded subset of the train split for every ConPO arm to
-share (locked decision, 2026-09-02): stratified by num_constraints
+share (design choice, 2026-09-02; the user fixed the subset, the stratification is ours): stratified by num_constraints
 proportionally to the train split's own histogram, largest-remainder
 rounding so per-stratum sizes sum exactly to --size, then shuffled once
-with --seed.
+with --seed. Keys are deduplicated (keep the first occurrence) before
+drawing: the upstream pool dataset carries a handful of duplicate keys (see
+conpo/data.py's load_pool, which dedupes the same way at the source);
+data/train.jsonl was built before that fix, so the duplicates are still
+baked into the file this script reads, and are counted rather than drawn
+twice.
 
---size is rounded to the nearest multiple of --round-to (default:
-PROMPTS_PER_UPDATE, config.EFFECTIVE_BATCH // config.NUM_GENERATIONS) before
-drawing: scripts/train.py's ConPOTrainer runs on TRL's RepeatSampler with
-batch_size == prompts_per_update and shuffle_dataset=False for a RUN_SUBSET
-run, which silently drops any trailing chunk shorter than a full batch on
-every epoch -- an unrounded size would make the tail of the committed key
-order permanently unreachable by every arm. Pass --round-to 1 to disable.
+Draws exactly --size keys -- no rounding. scripts/train.py's ConPOTrainer
+runs on TRL's RepeatSampler with batch_size == prompts_per_update and
+shuffle_dataset=False for a RUN_SUBSET run, which silently drops any
+trailing chunk shorter than a full batch every epoch; when --size isn't a
+multiple of prompts_per_update (config.EFFECTIVE_BATCH // NUM_GENERATIONS)
+a handful of trailing prompts in the committed key order are never trained
+on (e.g. 8 of 15000 prompts at 16 per update) -- negligible, and recorded in
+the manifest below rather than avoided by padding --size up.
 
 Writes subsets/train_<size>_seed<seed>.keys (one key per line, final
-shuffled order, <size> being the rounded size actually drawn) plus a sidecar
-subsets/train_<size>_seed<seed>.manifest.json (size, requested_size, round_to,
-seed, per-count sizes, sha256 of the keys file, source manifest.json split
-sizes for provenance). subsets/ is committed to the repo; data/ is gitignored.
+shuffled order) plus a sidecar subsets/train_<size>_seed<seed>.manifest.json
+(size, seed, per-count sizes, duplicate_keys found in the source,
+prompts_per_update and dropped_trailing_prompts, sha256 of the keys file,
+source manifest.json split sizes for provenance). subsets/ is committed to
+the repo; data/ is gitignored.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import random
 from pathlib import Path
 
 from conpo import config
+from conpo.data import keys_digest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # The real (non-tiny) training run always consumes exactly this many
 # prompts per optimiser update -- config.EFFECTIVE_BATCH // NUM_GENERATIONS,
 # independent of num_processes (see scripts/train.py's prompts_per_update
-# derivation and its RUN_SUBSET divisibility assert).
+# derivation). Recorded in the manifest so a reader can see how many
+# trailing prompts, if any, TRL's RepeatSampler drops every epoch.
 PROMPTS_PER_UPDATE = config.EFFECTIVE_BATCH // config.NUM_GENERATIONS
 
 
-def _round_to_multiple(size: int, multiple: int) -> int:
-    """Nearest multiple of `multiple` to `size` (ties round up), floored at
-    `multiple` itself so a tiny --size never rounds down to zero. `multiple`
-    <= 1 disables rounding."""
-    if multiple <= 1:
-        return size
-    steps = (size + multiple // 2) // multiple
-    return max(multiple, steps * multiple)
-
-
-def _num_constraints_histogram(source: Path) -> tuple[dict[int, list[str]], int]:
-    """{num_constraints: [key, ...]} in file order, plus the total row count.
+def _num_constraints_histogram(source: Path) -> tuple[dict[int, list[str]], int, int]:
+    """{num_constraints: [key, ...]} in file order (deduplicated by key,
+    first occurrence kept), the total row count read, and how many rows
+    were skipped as duplicate keys.
 
     Reads only the two fields draw_subset needs (`key`, `num_constraints`),
     not a full PoolRow -- scripts/build_corpus.py writes both verbatim.
     """
     by_count: dict[int, list[str]] = {}
+    seen_keys: set[str] = set()
     total = 0
+    duplicate_keys = 0
     with source.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             row = json.loads(line)
-            by_count.setdefault(row["num_constraints"], []).append(row["key"])
             total += 1
-    return by_count, total
+            key = row["key"]
+            if key in seen_keys:
+                duplicate_keys += 1
+                continue
+            seen_keys.add(key)
+            by_count.setdefault(row["num_constraints"], []).append(key)
+    return by_count, total, duplicate_keys
 
 
 def _largest_remainder_sizes(counts: dict[int, int], target_size: int) -> dict[int, int]:
@@ -82,15 +89,15 @@ def _largest_remainder_sizes(counts: dict[int, int], target_size: int) -> dict[i
     return sizes
 
 
-def draw_subset(source: Path, size: int, seed: int) -> tuple[list[str], dict[int, int], int]:
-    """(shuffled keys, per-count sizes, source row count).
+def draw_subset(source: Path, size: int, seed: int) -> tuple[list[str], dict[int, int], int, int]:
+    """(shuffled keys, per-count sizes, source row count, duplicate key count).
 
     One `random.Random(seed)` instance draws every per-stratum sample (in
     ascending num_constraints order, for a fixed operation order regardless
     of the source file's own row order) and then shuffles the combined list
     once, so the whole draw is deterministic in `seed` alone.
     """
-    by_count, total = _num_constraints_histogram(source)
+    by_count, total, duplicate_keys = _num_constraints_histogram(source)
     counts = {c: len(keys) for c, keys in by_count.items()}
     target_sizes = _largest_remainder_sizes(counts, size)
 
@@ -99,7 +106,7 @@ def draw_subset(source: Path, size: int, seed: int) -> tuple[list[str], dict[int
     for c in sorted(by_count):
         drawn.extend(rng.sample(by_count[c], target_sizes[c]))
     rng.shuffle(drawn)
-    return drawn, target_sizes, total
+    return drawn, target_sizes, total, duplicate_keys
 
 
 def main() -> None:
@@ -108,30 +115,20 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--source", type=Path, default=REPO_ROOT / "data" / "train.jsonl")
     parser.add_argument("--out", type=Path, default=None, help="default: subsets/train_<size>_seed<seed>.keys")
-    parser.add_argument(
-        "--round-to",
-        type=int,
-        default=PROMPTS_PER_UPDATE,
-        help=(
-            "round --size to the nearest multiple of this before drawing, so the committed "
-            "subset divides evenly and TRL's RepeatSampler never drops a trailing batch "
-            f"(default: prompts_per_update = {PROMPTS_PER_UPDATE}); pass 1 to disable"
-        ),
-    )
     args = parser.parse_args()
 
-    target_size = _round_to_multiple(args.size, args.round_to)
     out_path = (
-        args.out if args.out is not None else REPO_ROOT / "subsets" / f"train_{target_size}_seed{args.seed}.keys"
+        args.out if args.out is not None else REPO_ROOT / "subsets" / f"train_{args.size}_seed{args.seed}.keys"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    keys, per_count_sizes, source_total = draw_subset(args.source, target_size, args.seed)
-    if len(keys) != target_size:
-        raise ValueError(f"drew {len(keys)} keys, expected {target_size} (requested --size {args.size})")
+    keys, per_count_sizes, source_total, duplicate_keys = draw_subset(args.source, args.size, args.seed)
+    if len(keys) != args.size:
+        raise ValueError(f"drew {len(keys)} keys, expected --size {args.size}")
+    assert len(set(keys)) == len(keys), f"drew {len(keys)} keys but only {len(set(keys))} are unique"
 
     out_path.write_text("\n".join(keys) + "\n", encoding="utf-8")
-    keys_sha256 = hashlib.sha256(out_path.read_bytes()).hexdigest()
+    keys_sha256 = keys_digest(out_path)
 
     source_manifest_path = args.source.parent / "manifest.json"
     source_manifest_split_sizes = None
@@ -139,13 +136,14 @@ def main() -> None:
         source_manifest_split_sizes = json.loads(source_manifest_path.read_text(encoding="utf-8")).get("split_sizes")
 
     manifest = {
-        "size": target_size,
-        "requested_size": args.size,
-        "round_to": args.round_to,
+        "size": args.size,
         "seed": args.seed,
         "source": str(args.source),
         "source_total_rows": source_total,
+        "duplicate_keys": duplicate_keys,
         "per_count_sizes": {str(c): n for c, n in sorted(per_count_sizes.items())},
+        "prompts_per_update": PROMPTS_PER_UPDATE,
+        "dropped_trailing_prompts": args.size % PROMPTS_PER_UPDATE,
         "keys_sha256": keys_sha256,
         "source_manifest_split_sizes": source_manifest_split_sizes,
     }
