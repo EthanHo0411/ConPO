@@ -35,12 +35,16 @@
 #     sbatch --export=ALL,RUN_ARM,RUN_NO_VETO slurm/train.sbatch
 #
 # Two-GPU variant (comment only -- the live directive below stays one
-# H100). Use for the LoRA-vs-full-FT point-check (~85 GB needed with fp32
-# AdamW, over one 80 GB card; optimizer state sharded across both) and for
-# the 7B/8B model-ablation replications (Qwen3-8B, Olmo-3-7B-Instruct-SFT)
-# if their LoRA footprint does not fit one card. scripts/train.py derives
-# gradient accumulation from the process count, so launch it under
-# accelerate/torchrun with 2 processes:
+# H100). Intended for the LoRA-vs-full-FT point-check (~85 GB needed with
+# fp32 AdamW, over one 80 GB card; optimizer state sharded across both) and
+# for the 7B/8B model-ablation replications (Qwen3-8B,
+# Olmo-3-7B-Instruct-SFT) if their LoRA footprint does not fit one card.
+# TODO before the full-FT point-check: this script is single-process today
+# (the body below runs a plain "python -u scripts/train.py"; PartialState()
+# .num_processes is 1). The accelerate/torchrun multi-process launch that
+# would shard the optimizer state across --gres=gpu:h100:2 is not yet
+# implemented, so the example command below does not shard -- it just runs
+# the same single-process job with a second idle GPU allocated:
 #
 #   sbatch --gres=gpu:h100:2 --export=ALL,RUN_ARM,RUN_SEED slurm/train.sbatch
 #
