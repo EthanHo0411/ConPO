@@ -35,14 +35,14 @@ Design choices not fixed by the card contract (dated 2026-09-03):
   a number and ignores ``pending`` ones; if none parse, the total reads
   "pending" rather than 0, since 0 would misreport an all-pending set as
   a completed zero-cost run.
-* Hypothesis ids with no ``HYPOTHESES`` entry (today only H6, deferred until
-  the phi-coefficient compositor exists): ``HYPOTHESES`` has no row to
-  compute a treatment/control delta from, so the dashboard synthesizes one
-  row per such H-number directly from the run card that names it (``block``
-  equal to the H-number, or the H-number listed in the card's comma-separated
-  ``hypotheses`` field). ``DEFERRED_HYPOTHESES`` supplies the row's claim and
-  metric text; its Delta and Verdict cells are always "pending" and
-  "deferred".
+* Hypothesis ids with no ``HYPOTHESES`` entry (today only H6, being built:
+  compositor part A in progress, arm switch part B next): ``HYPOTHESES`` has
+  no row to compute a treatment/control delta from, so the dashboard
+  synthesizes one row per such H-number directly from the run card that
+  names it (``block`` equal to the H-number, or the H-number listed in the
+  card's comma-separated ``hypotheses`` field). ``DEFERRED_HYPOTHESES``
+  supplies the row's claim and metric text; its Delta and Verdict cells are
+  always "pending".
 """
 
 from __future__ import annotations
@@ -119,8 +119,8 @@ CLAIMS: dict[str, str] = {
 # "Hypothesis ids with no HYPOTHESES entry" note above.
 DEFERRED_HYPOTHESES: dict[str, tuple[str, str]] = {
     "H6": (
-        "Multi-constraint compositional generalisation (deferred: "
-        "phi-coefficient compositor not built)",
+        "Multi-constraint compositional generalisation (being built: "
+        "compositor part A in progress, arm switch part B next)",
         "PAcc eval_iii",
     ),
 }
@@ -296,7 +296,7 @@ def build_deferred_hypothesis_rows(train_cards: list[dict[str, str]]) -> list[st
         if card is None:
             continue
         claim, metric = DEFERRED_HYPOTHESES[h_number]
-        rows.append(f"| {h_number} | {claim} | {card['run_id']} | {metric} | pending | deferred |")
+        rows.append(f"| {h_number} | {claim} | {card['run_id']} | {metric} | pending | pending |")
     return rows
 
 

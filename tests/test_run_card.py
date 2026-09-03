@@ -317,10 +317,10 @@ def test_status_planned_when_run_dir_has_no_metadata(tmp_path: Path) -> None:
     assert "status: planned" in text
 
 
-def test_status_deferred_for_h6_multi_with_no_run_dir() -> None:
+def test_status_planned_for_h6_multi_with_no_run_dir() -> None:
     plan = run_card.resolve_plan_for_run(Path("runs") / "h6_multi_s42")
     text = run_card.render_card(plan, None, None, None, AS_OF)
-    assert "status: deferred" in text
+    assert "status: planned" in text
 
 
 def test_status_running_when_metadata_present_and_no_eval(tmp_path: Path) -> None:
@@ -401,11 +401,13 @@ def test_planned_estimates_sum_to_documented_totals(tmp_path: Path) -> None:
     assert eval_total == 27.0
 
 
-def test_planned_h6_multi_is_deferred(tmp_path: Path) -> None:
+def test_planned_h6_multi_is_planned(tmp_path: Path) -> None:
     out_dir = tmp_path / "cards"
     run_card.main(["--planned", "--out", str(out_dir), "--as-of", AS_OF])
     text = (out_dir / "h6_multi_s42.md").read_text(encoding="utf-8")
-    assert "status: deferred" in text
+    assert "status: planned" in text
+    assert "RUN_MULTI=1" in text
+    assert "RUN_MULTI lands with H6 part B" in text
 
 
 def test_planned_out_defaults_to_hackmd_runs_next_to_repo() -> None:

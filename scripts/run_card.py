@@ -106,7 +106,7 @@ class CardPlan:
     hypotheses: tuple[str, ...]
     model: str
     seed: str
-    status: str  # "planned" | "deferred"
+    status: str  # "planned"
     est_h100h: float | None
     detail: str = ""
     launch: str = ""  # non-empty overrides the derived sbatch launch line
@@ -115,7 +115,6 @@ class CardPlan:
 POLICY_MODEL = cfg.POLICY_MODEL
 
 _NOT_IMPLEMENTED_FULLFT = "not yet implemented: scripts/train.py has no full fine-tune switch (LoRA only)"
-_DEFERRED_H6 = "deferred: phi-coefficient compositor not built, no h6_multi arm implementation yet"
 
 PLANNED_RUNS: tuple[CardPlan, ...] = (
     CardPlan("full_s42", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "42", "planned", 18.0),
@@ -149,8 +148,8 @@ PLANNED_RUNS: tuple[CardPlan, ...] = (
         "planned", 18.0,
     ),
     CardPlan(
-        "h6_multi_s42", "train", "h6_multi", {}, "H6", ("H6",), POLICY_MODEL, "42", "deferred", 18.0,
-        launch=_DEFERRED_H6,
+        "h6_multi_s42", "train", "full", {"RUN_MULTI": "1"}, "H6", ("H6",), POLICY_MODEL, "42", "planned", 18.0,
+        detail="RUN_MULTI lands with H6 part B",
     ),
     CardPlan(
         "edge_dpo_s42", "train", "edge_dpo", {}, "objective control", ("objective_isolation_edge_dpo",),
@@ -266,8 +265,8 @@ def extract_external(external: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def derive_status(has_run_metadata: bool, has_external: bool, planned_status: str) -> str:
-    """run dir absent -> planned_status (planned, or deferred for h6_multi);
-    run_metadata.json present, no external.json -> running; external.json
+    """run dir absent -> planned_status (planned); run_metadata.json present,
+    no external.json -> running; external.json
     present -> done. Callers apply an explicit --status override before this."""
     if not has_run_metadata:
         return planned_status

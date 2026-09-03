@@ -303,7 +303,7 @@ def test_totals_section_present(cards_dir: Path) -> None:
     assert "Grand total" in out
 
 
-def test_h6_deferred_row_synthesized_h1_to_h5_unchanged(cards_dir: Path) -> None:
+def test_h6_row_synthesized_h1_to_h5_unchanged(cards_dir: Path) -> None:
     """h6_multi_s42 (block H6, no HYPOTHESES entry) gets a synthesized row;
     every HYPOTHESES id (H1-H5, plus H2/objective-isolation) keeps its own
     unaltered row."""
@@ -314,11 +314,12 @@ def test_h6_deferred_row_synthesized_h1_to_h5_unchanged(cards_dir: Path) -> None
     assert len(h6_lines) == 1
     h6_row = h6_lines[0]
     assert "Multi-constraint compositional generalisation" in h6_row
-    assert "phi-coefficient compositor not built" in h6_row
+    assert "being built" in h6_row
+    assert "compositor part A in progress, arm switch part B next" in h6_row
     assert "h6_multi_s42" in h6_row
     assert "PAcc eval_iii" in h6_row
-    assert h6_row.count("pending") == 1
-    assert "deferred" in h6_row
+    assert h6_row.count("pending") == 2
+    assert "deferred" not in h6_row
 
     for h in dashboard.HYPOTHESES:
         rows = [line for line in out.splitlines() if line.startswith(f"| {h.id} |")]
