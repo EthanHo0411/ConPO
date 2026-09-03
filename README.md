@@ -80,9 +80,10 @@ As of 2026-09-02: 536 passed, 14 skipped, 0 failed.
 
 Runs on the mlp SLURM cluster, conda env `vllm`
 (`torch 2.11.0+cu130`, `transformers 5.14.1`, `trl 1.9.2`, `peft 0.20.0`,
-`vllm 0.26.0`). H200 MIG slices: `--gres=gpu:h200_3g.71gb:1` (69.8 GB
-usable) for the trainer and the judge; `--gres=gpu:h200:1` for the
-full-FT point-check and, if needed, the 7B/8B model ablations.
+`vllm 0.26.0`). Two H100 80 GB GPUs: `--gres=gpu:h100:1` per LoRA run (one
+run per card, two runs concurrently) and for the judge server;
+`--gres=gpu:h100:2` for the full-FT point-check. The gres strings are
+unverified on the cluster.
 
 1. **Stage the HF cache** (once, from a node with network access,
    `HF_HUB_OFFLINE` unset):
@@ -101,14 +102,15 @@ full-FT point-check and, if needed, the 7B/8B model ablations.
    Writes `data/{train,dev,eval_i,eval_ii,eval_iii}.jsonl` and
    `data/manifest.json`.
 
-3. **Start the judge server** (slice B):
+3. **Start the judge server** (second H100; needed until the batched veto lands):
    ```bash
    sbatch slurm/judge_server.sbatch
    ```
    Wait for `runs/serve/judge.endpoint` to appear (the job also polls its
    own `/health` before writing it).
 
-4. **Launch a training run** (slice A):
+4. **Launch a training run** (one H100; `RUN_SUBSET` defaults to
+   `subsets/train_15000_seed42.keys` in the launcher):
    ```bash
    RUN_ARM=full RUN_SEED=42 \
      sbatch --export=ALL,RUN_ARM,RUN_SEED slurm/train.sbatch
@@ -133,10 +135,10 @@ group is not installed), so every GPU-dependent path below has never run,
 even though the surrounding Python modules now exist and are CPU-tested:
 
 - `slurm/judge_server.sbatch` -- never submitted; the vLLM OpenAI-server
-  invocation, the `--gres=gpu:h200_3g.71gb:1` line, and the health-poll
+  invocation, the `--gres=gpu:h100:1` line, and the health-poll
   timing are unverified.
 - `slurm/train.sbatch` -- never submitted; the judge-endpoint wait loop,
-  the `RUN_OUT_DIR` layout, and the full-H200 comment variant are
+  the `RUN_OUT_DIR` layout, and the two-GPU full-FT comment variant are
   unverified.
 - `slurm/eval.sbatch` -- never submitted; the `--out` file paths it builds
   are checked against `scripts/eval_external.py`/`scripts/eval_internal.py`'s
@@ -159,8 +161,7 @@ even though the surrounding Python modules now exist and are CPU-tested:
   colocated vLLM generation. Only `HFEngine` and `FakeEngine` are
   exercised by tests.
 - Any `RUN_USE_VLLM=1` code path end to end, and TRL's own
-  `vllm_mode="colocate"` integration on a MIG slice (no NCCL P2P there,
-  per `ConPO-Build-Plan.md` section 1).
+  `vllm_mode="colocate"` integration on a real GPU.
 - `RUN_ARM=full` and `RUN_ARM=ifrlvr` are exercised end to end at
   `RUN_STEPS<=2` on a tiny random model (`tests/test_trainer_tiny.py`);
   neither has run on the real `Qwen/Qwen3-4B` checkpoint or a real GPU.

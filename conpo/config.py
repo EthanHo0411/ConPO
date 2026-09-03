@@ -192,9 +192,9 @@ IFBENCH_TEST_DATASET = "allenai/IFBench_test"
 # Compute notes (section 4.1 / cluster allocation; not paper-derived)
 # ---------------------------------------------------------------------------
 
-# Two H200 3g.71gb MIG slices (69.8 GB usable each) plus one full H200.
-# Measured 4B LoRA co-locate footprint: 63-65 GB. Judge (Qwen3-14B) footprint:
-# 27.5 GB.
+# Two H100 80 GB GPUs, one training run per card (user decision 2026-09-03);
+# the full-FT point-check takes both. Measured 4B LoRA co-locate footprint:
+# 63-65 GB. Judge (Qwen3-14B) footprint: 27.5 GB.
 
 # ---------------------------------------------------------------------------
 # RUN_* environment contract

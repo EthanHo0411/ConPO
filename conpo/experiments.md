@@ -90,5 +90,5 @@ against `full`, not a confidence interval.
 | Hypothesis graph | 16 | 11 arms (above) at the seed schedule = 15 trained runs, plus the untrained base model evaluated once (no training, the H1 floor) |
 | Baselines outside the graph | 2 | (1) inference-time verify-and-repair: the initial policy plus the same repair operator and judge loop applied at test time only, a system-level reference with a different inference budget (`ConPO.pdf` section 4.1); (2) IF-RLVR run with its own paper's literal settings (16 samples/prompt, 2048 tokens, lr 5e-7, full fine-tune) rather than token-matched to ConPO, a labelled replication (`ConPO-Build-Plan.md` section 7) |
 | Model ablations | 2 | `Qwen/Qwen3-8B` and `allenai/Olmo-3-7B-Instruct-SFT`, each `RUN_ARM=full` only, 1 seed; `config.LATER_ABLATION_MODELS` also names `allenai/Llama-3.1-Tulu-3-8B-SFT` but it is not part of this run count |
-| Full fine-tune point-check | 1 | `Qwen/Qwen3-4B`, `RUN_ARM=full`, full fine-tune instead of LoRA, on the full H200 slice (`--gres=gpu:h200:1`), 1 seed |
+| Full fine-tune point-check | 1 | `Qwen/Qwen3-4B`, `RUN_ARM=full`, full fine-tune instead of LoRA, on both H100s (`--gres=gpu:h100:2`), 1 seed |
 | **Total** | **21** | |

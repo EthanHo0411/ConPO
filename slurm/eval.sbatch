@@ -8,7 +8,7 @@
 # --out paths on the mlp cluster before trusting it.
 #
 # Runs both eval scripts against one adapter directory, vLLM backend, on one
-# H200 3g.71gb MIG slice: scripts/eval_external.py (IFEval + IFBench,
+# H100 (whichever card is free): scripts/eval_external.py (IFEval + IFBench,
 # vendored official scorers) and scripts/eval_internal.py (PAcc/IAcc over the
 # four internal splits, conpo/metrics.py). No judge server is needed;
 # neither script calls HttpJudge (conpo/metrics.py's task_relevance hook is
@@ -24,7 +24,7 @@
 #   EVAL_LIMIT    cap rows per dataset/split, for a smoke run (unset = full)
 #
 #SBATCH --job-name=conpo_eval
-#SBATCH --gres=gpu:h200_3g.71gb:1
+#SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00

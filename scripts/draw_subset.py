@@ -111,7 +111,7 @@ def draw_subset(source: Path, size: int, seed: int) -> tuple[list[str], dict[int
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--size", type=int, default=20000)
+    parser.add_argument("--size", type=int, default=15000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--source", type=Path, default=REPO_ROOT / "data" / "train.jsonl")
     parser.add_argument("--out", type=Path, default=None, help="default: subsets/train_<size>_seed<seed>.keys")

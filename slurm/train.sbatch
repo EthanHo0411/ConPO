@@ -7,9 +7,9 @@
 # opposed to its --tiny CPU smoke path) has never run. Verify the gres
 # line and the conda env name on the mlp cluster before trusting it.
 #
-# Trains one ConPO run on one H200 3g.71gb MIG slice: policy + LoRA +
-# colocated vLLM generation (MIG has no NCCL P2P, so vllm_mode must stay
-# "colocate" -- ConPO-Build-Plan.md section 1). Waits for the judge server's
+# Trains one ConPO run on one H100 80 GB GPU: policy + LoRA + colocated vLLM
+# generation (vllm_mode "colocate" -- ConPO-Build-Plan.md section 1). Two
+# such runs share the two-card estate. Waits for the judge server's
 # endpoint file, then launches scripts/train.py entirely through the RUN_*
 # environment contract documented in conpo/config.py, conpo/arms.py and
 # README.md; nothing here reads config.py, since scripts/train.py imports
@@ -34,21 +34,25 @@
 #   RUN_ARM=full RUN_NO_VETO=1 \
 #     sbatch --export=ALL,RUN_ARM,RUN_NO_VETO slurm/train.sbatch
 #
-# Full H200 variant (comment only -- the live directive below stays the
-# 3g.71gb slice). Use for the LoRA-vs-full-FT point-check (~85 GB needed; a
-# 3g.71gb slice has 69.8 GB usable) and for the 7B/8B model-ablation
-# replications (Qwen3-8B, Olmo-3-7B-Instruct-SFT) if their LoRA footprint
-# does not fit a 3g.71gb slice:
+# Two-GPU variant (comment only -- the live directive below stays one
+# H100). Use for the LoRA-vs-full-FT point-check (~85 GB needed with fp32
+# AdamW, over one 80 GB card; optimizer state sharded across both) and for
+# the 7B/8B model-ablation replications (Qwen3-8B, Olmo-3-7B-Instruct-SFT)
+# if their LoRA footprint does not fit one card. scripts/train.py derives
+# gradient accumulation from the process count, so launch it under
+# accelerate/torchrun with 2 processes:
 #
-#   sbatch --gres=gpu:h200:1 --export=ALL,RUN_ARM,RUN_SEED slurm/train.sbatch
+#   sbatch --gres=gpu:h100:2 --export=ALL,RUN_ARM,RUN_SEED slurm/train.sbatch
 #
 # Env:
 #   TRAIN_SKIP_JUDGE  "1" to skip waiting on the judge endpoint (default "0")
 #   TRAIN_JUDGE_WAIT  seconds to wait for the endpoint file (default 3600)
 #   TRAIN_JUDGE_ENDPOINT  endpoint file (default runs/serve/judge.endpoint)
+#   RUN_SUBSET        key list every arm trains on (default
+#                     subsets/train_15000_seed42.keys, the fixed 15k subset)
 #
 #SBATCH --job-name=conpo_train
-#SBATCH --gres=gpu:h200_3g.71gb:1
+#SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=96G
 #SBATCH --time=12:00:00
@@ -87,10 +91,11 @@ export RUN_SEED="${RUN_SEED:-42}"
 export RUN_STEPS="${RUN_STEPS:-500}"
 export RUN_TOKEN_BUDGET="${RUN_TOKEN_BUDGET:-0}"
 export RUN_USE_VLLM=1
+export RUN_SUBSET="${RUN_SUBSET:-${PROJECT}/subsets/train_15000_seed42.keys}"
 export RUN_OUT_DIR="${PROJECT}/runs/${RUN_ARM}_s${RUN_SEED}"
 mkdir -p "${RUN_OUT_DIR}"
 
-echo "arm=${RUN_ARM} seed=${RUN_SEED} steps=${RUN_STEPS} token_budget=${RUN_TOKEN_BUDGET} out=${RUN_OUT_DIR}"
+echo "arm=${RUN_ARM} seed=${RUN_SEED} steps=${RUN_STEPS} token_budget=${RUN_TOKEN_BUDGET} subset=${RUN_SUBSET} out=${RUN_OUT_DIR}"
 
 # Wait for the judge server's endpoint file and turn it into RUN_JUDGE_ENDPOINT
 # (conpo/judge.py:read_endpoint format: "hostname port jobid"). Ported from

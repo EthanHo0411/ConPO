@@ -5,9 +5,11 @@
 # on the mlp cluster before trusting it.
 #
 # Serves config.JUDGE_MODEL (Qwen/Qwen3-14B) as a long-lived OpenAI-compatible
-# vLLM server on one H200 3g.71gb MIG slice, for conpo/judge.py's HttpJudge
-# (the quality veto of ConPO.pdf section 2.3). Measured footprint for this
-# judge on a 3g.71gb slice: 27.5 GB (config.py "Compute notes").
+# vLLM server on the second H100, for conpo/judge.py's HttpJudge (the
+# quality veto of ConPO.pdf section 2.3). Fallback placement until the
+# batched veto lands: while this server holds a card, every training run
+# serializes on the other one. Measured footprint for this judge: 27.5 GB
+# (config.py "Compute notes").
 #
 # Endpoint-file handshake, ported from the pattern in
 # stackelberg-if/slurm/corruptor_server.sbatch: this job writes
@@ -26,7 +28,7 @@
 #   JS_ENDPOINT   endpoint file     (default runs/serve/judge.endpoint)
 #
 #SBATCH --job-name=judge_server
-#SBATCH --gres=gpu:h200_3g.71gb:1
+#SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=96G
 #SBATCH --time=04:00:00
@@ -86,8 +88,8 @@ echo "endpoint file=${ENDPOINT}"
 # responses plus a fixed instruction (conpo/judge.py:build_veto_prompt), well
 # under the policy's own 3584-token budget, so 4096 leaves margin without
 # sizing the KV cache for Qwen3's declared 262k context. enforce-eager
-# because MIG has no NCCL P2P and CUDA graphs buy little on a slice
-# (ConPO-Build-Plan.md section 1).
+# matches the trainer's proven vLLM settings (ConPO-Build-Plan.md section 1);
+# drop it once M0 shows CUDA graphs help on the H100.
 python -m vllm.entrypoints.openai.api_server \
     --model "${MODEL}" \
     --served-model-name judge \
