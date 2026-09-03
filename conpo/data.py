@@ -14,6 +14,7 @@ import re
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import datasets
 from langdetect import DetectorFactory, LangDetectException, detect
@@ -274,3 +275,21 @@ class TokenMeter:
 
     def exhausted(self) -> bool:
         return self.budget > 0 and self.total >= self.budget
+
+
+def load_subset(rows: list[PoolRow], keys_path: str | Path) -> list[PoolRow]:
+    """`rows` reordered (and filtered) to the order of the keys file at
+    `keys_path` (one key per line, as written by scripts/draw_subset.py).
+
+    Every key in the file must have a matching row in `rows`; raises
+    KeyError naming the missing keys otherwise (fail loud rather than
+    silently training on a shrunk subset).
+    """
+    by_key = {r.key: r for r in rows}
+    keys = [line.strip() for line in Path(keys_path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    missing = [k for k in keys if k not in by_key]
+    if missing:
+        shown = missing[:5]
+        suffix = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+        raise KeyError(f"subset key(s) not found in rows: {shown}{suffix}")
+    return [by_key[k] for k in keys]

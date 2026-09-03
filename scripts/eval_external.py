@@ -5,6 +5,12 @@ A canned record is either a full scoring record (already carrying
 `instruction_id_list` and `kwargs`, e.g. hand-written for a test) or a
 minimal {"key", "response"} pair joined by key against the loaded reference
 row of whichever dataset (IFEval / IFBench) has a matching key.
+
+Alongside `--out`'s JSON, `<out>.verdicts.jsonl` carries one line per
+scored prompt (key, benchmark, prompt_strict, prompt_loose, per-instruction
+strict/loose lists) -- the per-prompt paired bootstrap in conpo.stats and
+scripts/analyze.py need per-prompt verdicts, not just conpo.scoring's
+aggregate ScoreReport.
 """
 
 import argparse
@@ -18,6 +24,8 @@ from typing import Any
 import datasets
 
 from conpo import config, scoring
+from conpo.vendor.ifbench import evaluation_lib as _ifbench_lib
+from conpo.vendor.ifeval import evaluation_lib as _ifeval_lib
 from conpo.verifiers import IFEVAL_FAMILIES
 
 _IFEVAL_SET = set(IFEVAL_FAMILIES)
@@ -183,6 +191,49 @@ def route_canned(
     return ifeval_out, ifbench_out
 
 
+def record_verdicts(records: Sequence[dict[str, Any]], benchmark: str) -> list[dict[str, Any]]:
+    """One verdict dict per record: key, benchmark, prompt_strict, prompt_loose,
+    instruction_id_list, instruction_strict, instruction_loose.
+
+    Mirrors conpo.scoring._score's per-record InputExample/OutputExample
+    construction (that function only returns the aggregate ScoreReport, not
+    per-record verdicts) using the same vendored evaluation_lib it calls.
+    """
+    lib = _ifeval_lib if benchmark == "ifeval" else _ifbench_lib
+    out = []
+    for index, record in enumerate(records):
+        inp = lib.InputExample(
+            key=record.get("key", index),
+            instruction_id_list=list(record["instruction_id_list"]),
+            prompt=str(record["prompt"]),
+            kwargs=[dict(kw) for kw in record["kwargs"]],
+        )
+        prompt_to_response = {str(record["prompt"]): str(record["response"])}
+        strict_out = lib.test_instruction_following_strict(inp, prompt_to_response)
+        loose_out = lib.test_instruction_following_loose(inp, prompt_to_response)
+        out.append(
+            {
+                "key": inp.key,
+                "benchmark": benchmark,
+                "prompt_strict": bool(strict_out.follow_all_instructions),
+                "prompt_loose": bool(loose_out.follow_all_instructions),
+                "instruction_id_list": list(inp.instruction_id_list),
+                "instruction_strict": [bool(x) for x in strict_out.follow_instruction_list],
+                "instruction_loose": [bool(x) for x in loose_out.follow_instruction_list],
+            }
+        )
+    return out
+
+
+def write_verdicts(out_path: str, verdicts: Sequence[dict[str, Any]]) -> str:
+    """Write `verdicts` to `<out_path>.verdicts.jsonl`, one JSON object per line."""
+    verdicts_path = f"{out_path}.verdicts.jsonl"
+    with open(verdicts_path, "w", encoding="utf-8") as f:
+        for v in verdicts:
+            f.write(json.dumps(v) + "\n")
+    return verdicts_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="External IFEval / IFBench eval for the ConPO policy.")
     parser.add_argument("--model", default=config.POLICY_MODEL)
@@ -252,6 +303,10 @@ def main() -> None:
     }
     Path(args.out).write_text(json.dumps(out, indent=2), encoding="utf-8")
     print(f"wrote {args.out}")
+
+    verdicts = record_verdicts(ifeval_records, "ifeval") + record_verdicts(ifbench_records, "ifbench")
+    verdicts_path = write_verdicts(args.out, verdicts)
+    print(f"wrote {verdicts_path}")
 
 
 if __name__ == "__main__":

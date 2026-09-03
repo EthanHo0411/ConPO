@@ -22,7 +22,15 @@ class ArmSpec:
     "additive" (open-instruct's IFEvalVerifier mean-per-constraint reward,
     the IF-RLVR baseline). forward/reverse: whether that counterfactual
     direction runs at all. prompt_loss/resp_loss: whether L_prompt/L_resp
-    are added to the training objective.
+    are added to the training objective. trainer: "grpo" (conpo.trainer.
+    ConPOTrainer, scripts/train.py) or "dpo" (trl.DPOTrainer on
+    conpo.pairs-built pairs, scripts/train_dpo.py) -- which script and
+    trainer class the arm actually runs through. For "dpo" arms,
+    reward/forward/reverse/prompt_loss/resp_loss describe no mechanism
+    scripts/train_dpo.py reads (that script trains on a fixed pairs file
+    instead); they are set to solve_only's values (no counterfactual
+    construction, conjunctive reward as the closest no-op default) purely
+    so every ArmSpec stays fully populated.
     """
 
     reward: str
@@ -30,20 +38,48 @@ class ArmSpec:
     reverse: bool
     prompt_loss: bool
     resp_loss: bool
+    trainer: str = "grpo"
 
 
 ARMS: dict[str, ArmSpec] = {
     # ConPO in full: both construction directions, both counterfactual losses.
-    "full": ArmSpec(reward="conjunctive", forward=True, reverse=True, prompt_loss=True, resp_loss=True),
+    "full": ArmSpec(reward="conjunctive", forward=True, reverse=True, prompt_loss=True, resp_loss=True, trainer="grpo"),
     # IF-RLVR baseline (locked decision 2026-09-02): compute-matched GRPO
     # with open-instruct's additive per-constraint reward, no counterfactual
     # construction at all.
-    "ifrlvr": ArmSpec(reward="additive", forward=False, reverse=False, prompt_loss=False, resp_loss=False),
+    "ifrlvr": ArmSpec(
+        reward="additive", forward=False, reverse=False, prompt_loss=False, resp_loss=False, trainer="grpo"
+    ),
     # Solve-only ablation: conjunctive reward, no counterfactual construction.
-    "solve_only": ArmSpec(reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=False),
+    "solve_only": ArmSpec(
+        reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=False, trainer="grpo"
+    ),
     # H3 ablations: one construction direction at a time.
-    "forward_only": ArmSpec(reward="conjunctive", forward=True, reverse=False, prompt_loss=True, resp_loss=True),
-    "reverse_only": ArmSpec(reward="conjunctive", forward=False, reverse=True, prompt_loss=True, resp_loss=True),
+    "forward_only": ArmSpec(
+        reward="conjunctive", forward=True, reverse=False, prompt_loss=True, resp_loss=True, trainer="grpo"
+    ),
+    "reverse_only": ArmSpec(
+        reward="conjunctive", forward=False, reverse=True, prompt_loss=True, resp_loss=True, trainer="grpo"
+    ),
+    # DPO baselines (locked decision 2026-09-02(c), conpo/pairs.py +
+    # scripts/train_dpo.py): three fixed pair sources, one plain DPO
+    # objective (trl.DPOTrainer), no ConPOTrainer/GRPO mechanism involved.
+    # vf_dpo: verifier-filtered DPO on independently sampled pairs from the
+    # initial policy (the AutoIF / Tulu 3 shape, conpo.pairs.build_vf_pairs).
+    "vf_dpo": ArmSpec(
+        reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=False, trainer="dpo"
+    ),
+    # relax_dpo: relaxation-pair DPO in the Tulu 3 If-Persona-Pref shape
+    # (conpo.pairs.build_relax_pairs, conpo.prompts.counterfactual_prompts).
+    "relax_dpo": ArmSpec(
+        reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=False, trainer="dpo"
+    ),
+    # edge_dpo: plain DPO on a ConPO run's dumped edge buffer
+    # (conpo.pairs.build_edge_pairs) -- isolates ConPO's objective from its
+    # counterfactual-construction machinery.
+    "edge_dpo": ArmSpec(
+        reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=False, trainer="dpo"
+    ),
 }
 
 
@@ -115,4 +151,12 @@ HYPOTHESES: tuple[Hypothesis, ...] = (
     Hypothesis("H4_uniform", "full", "full:selection=uniform", "ifbench_prompt_loose", ">"),
     Hypothesis("H4_half", "full", "full:selection=half", "ifbench_prompt_loose", ">"),
     Hypothesis("H5_lambda_p_zero", "full", "full:lambda_p=0", "ifbench_prompt_loose", ">"),
+    # H2 proxy (locked decision 2026-09-02(c)): full vs the verifier-filtered
+    # independent-pairs DPO baseline, on the one metric this registry wires
+    # today (see the module docstring's ifbench_prompt_loose note above).
+    Hypothesis("H2_vf_dpo", "full", "vf_dpo", "ifbench_prompt_loose", ">"),
+    # Objective-isolation row: full vs plain DPO on full's own dumped edge
+    # buffer, isolating ConPO's contrastive objective from its
+    # counterfactual-construction machinery (same edges, different training).
+    Hypothesis("objective_isolation_edge_dpo", "full", "edge_dpo", "ifbench_prompt_loose", ">"),
 )

@@ -3,6 +3,14 @@
 --score-only skips generation and scores canned responses instead: a jsonl
 of {"key", "response"} records, joined by row.key. See scripts/build_corpus.py
 for the PoolRow JSON schema this reads (`_row_from_json` below is its inverse).
+
+Alongside `--out`'s JSON, `<out>.verdicts.jsonl` carries one line per scored
+prompt (key, split, prompt_strict, prompt_loose, per-instruction
+strict/loose lists) -- conpo.verifiers has no strict/loose distinction (that
+is an IFEval/IFBench evaluation_lib concept), so both columns here are the
+same single verifier_vector verdict, kept for schema parity with
+scripts/eval_external.py's verdicts.jsonl so scripts/analyze.py can read
+both the same way.
 """
 
 import argparse
@@ -14,7 +22,7 @@ from typing import Any
 
 from conpo import config, metrics
 from conpo.data import PoolRow
-from conpo.verifiers import Constraint
+from conpo.verifiers import Constraint, verifier_vector
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
@@ -119,6 +127,37 @@ def _load_canned_responses(path: str) -> dict[str, str]:
     return out
 
 
+def record_verdicts(rows: Sequence[PoolRow], responses: Sequence[str], split_name: str) -> list[dict[str, Any]]:
+    """One verdict dict per row: key, split, prompt_strict, prompt_loose (both
+    the same conpo.verifiers.feasible verdict), instruction_id_list,
+    instruction_strict, instruction_loose (both the same verifier_vector)."""
+    out = []
+    for row, response in zip(rows, responses):
+        vector = [bool(v) for v in verifier_vector(row.constraints, response)]
+        passed = all(vector)
+        out.append(
+            {
+                "key": row.key,
+                "split": split_name,
+                "prompt_strict": passed,
+                "prompt_loose": passed,
+                "instruction_id_list": [c.iid for c in row.constraints],
+                "instruction_strict": vector,
+                "instruction_loose": vector,
+            }
+        )
+    return out
+
+
+def write_verdicts(out_path: str, verdicts: Sequence[dict[str, Any]]) -> str:
+    """Write `verdicts` to `<out_path>.verdicts.jsonl`, one JSON object per line."""
+    verdicts_path = f"{out_path}.verdicts.jsonl"
+    with open(verdicts_path, "w", encoding="utf-8") as f:
+        for v in verdicts:
+            f.write(json.dumps(v) + "\n")
+    return verdicts_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Internal ConPO eval: metrics.summarise over data/ splits.")
     parser.add_argument("--splits", default="dev,eval_i,eval_ii,eval_iii")
@@ -140,6 +179,7 @@ def main() -> None:
     canned = _load_canned_responses(args.score_only) if args.score_only is not None else None
 
     results: dict[str, Any] = {}
+    verdicts: list[dict[str, Any]] = []
     for name, rows in splits.items():
         prompts = [row.prompt for row in rows]
         if canned is not None:
@@ -152,9 +192,13 @@ def main() -> None:
         else:
             responses = _generate_vllm(args.model, args.adapter, prompts, args.max_tokens)
         results[name] = metrics.summarise(rows, responses, name)
+        verdicts.extend(record_verdicts(rows, responses, name))
 
     Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"wrote {args.out}")
+
+    verdicts_path = write_verdicts(args.out, verdicts)
+    print(f"wrote {verdicts_path}")
 
 
 if __name__ == "__main__":

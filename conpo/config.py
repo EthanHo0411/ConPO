@@ -237,3 +237,16 @@ EDGE_PAIRS_PER_STEP = 48  # DEV_SET
 # step, divided across compute_loss calls the same way as
 # EDGE_PAIRS_PER_STEP above (conpo/trainer.py's compute_loss). DEV_SET.
 PROMPT_PAIRS_PER_STEP = 8  # DEV_SET
+
+# ---------------------------------------------------------------------------
+# DPO baselines (locked decision 2026-09-02(c): vf_dpo, relax_dpo, edge_dpo
+# arms; conpo/pairs.py builds the pairs, scripts/train_dpo.py trains on them)
+# ---------------------------------------------------------------------------
+
+# beta in the DPO loss -log sigmoid(beta * (logratio_chosen - logratio_rejected)),
+# scripts/train_dpo.py's DPOConfig(beta=...). IFBench's own published DPO
+# baseline setting is beta=5, learning rate 5e-7; this constant follows that
+# beta (scripts/train_dpo.py keeps learning_rate=config.LR, matching every
+# other arm, rather than adopting 5e-7 too). DEV_SET: not separately tuned on
+# ConPO's own development set.
+DPO_BETA = 5.0  # DEV_SET

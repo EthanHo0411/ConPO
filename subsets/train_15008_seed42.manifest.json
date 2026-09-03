@@ -1,0 +1,22 @@
+{
+  "size": 15008,
+  "requested_size": 15000,
+  "round_to": 16,
+  "seed": 42,
+  "source": "C:\\Users\\leong\\Desktop\\reserch2\\conpo\\data\\train.jsonl",
+  "source_total_rows": 81902,
+  "per_count_sizes": {
+    "1": 4074,
+    "2": 4148,
+    "3": 3907,
+    "4": 2879
+  },
+  "keys_sha256": "2875768545b4e6e5f09bf8be46d624c3efaec54f306a28f3bf75724dc9be3b4b",
+  "source_manifest_split_sizes": {
+    "train": 81902,
+    "dev": 1000,
+    "eval_i": 1500,
+    "eval_ii": 2952,
+    "eval_iii": 6947
+  }
+}

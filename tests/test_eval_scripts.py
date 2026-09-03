@@ -270,6 +270,109 @@ def test_eval_internal_score_only_five_dev_rows(tmp_path: Path, monkeypatch: pyt
         assert key in result["dev"]
 
 
+# --- .verdicts.jsonl (both scripts) -----------------------------------------
+
+
+def test_eval_external_writes_verdicts_jsonl_matching_ifbench_score(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_rows = scoring.load_ifbench_test()
+    sample_rows = scoring.load_sample_output()
+    response_by_prompt = {row["prompt"]: row["response"] for row in sample_rows}
+
+    canned_path = tmp_path / "canned_ifbench.jsonl"
+    with canned_path.open("w", encoding="utf-8") as f:
+        for row in test_rows:
+            f.write(json.dumps({"key": row["key"], "response": response_by_prompt[row["prompt"]]}) + "\n")
+
+    out_path = tmp_path / "out.json"
+    monkeypatch.setattr(sys, "argv", ["eval_external.py", "--score-only", str(canned_path), "--out", str(out_path)])
+    eval_external.main()
+
+    verdicts_path = tmp_path / "out.json.verdicts.jsonl"
+    assert verdicts_path.exists()
+    lines = [json.loads(line) for line in verdicts_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == len(test_rows)
+
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    # prompt_loose fraction over the verdicts must reproduce the aggregate score
+    assert sum(1 for v in lines if v["prompt_loose"]) / len(lines) == result["ifbench"]["prompt_loose"]
+    assert sum(1 for v in lines if v["prompt_strict"]) / len(lines) == result["ifbench"]["prompt_strict"]
+    for v in lines:
+        assert v["benchmark"] == "ifbench"
+        assert len(v["instruction_strict"]) == len(v["instruction_id_list"])
+        assert len(v["instruction_loose"]) == len(v["instruction_id_list"])
+
+
+def test_eval_external_record_verdicts_hand_written_records() -> None:
+    records = [
+        {
+            "key": 2,
+            "prompt": "p3",
+            "response": "Some text.\nBest regards",
+            "instruction_id_list": ["keywords:existence", "startend:end_checker"],
+            "kwargs": [{"keywords": ["text"]}, {"end_phrase": "Some text."}],
+        }
+    ]
+    verdicts = eval_external.record_verdicts(records, "ifeval")
+    assert len(verdicts) == 1
+    v = verdicts[0]
+    assert v["key"] == 2
+    assert v["benchmark"] == "ifeval"
+    assert v["instruction_id_list"] == ["keywords:existence", "startend:end_checker"]
+    assert isinstance(v["prompt_strict"], bool)
+    assert isinstance(v["prompt_loose"], bool)
+    assert len(v["instruction_strict"]) == 2
+    # "startend:end_checker" fails: response does not end with "Some text."
+    assert v["instruction_strict"][1] is False
+
+
+def test_eval_internal_writes_verdicts_jsonl_matching_pacc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = eval_internal.load_split("dev", limit=5)
+    responses = [f"canned response number {i}" for i in range(5)]
+
+    canned_path = tmp_path / "canned_dev.jsonl"
+    with canned_path.open("w", encoding="utf-8") as f:
+        for row, response in zip(rows, responses):
+            f.write(json.dumps({"key": row.key, "response": response}) + "\n")
+
+    out_path = tmp_path / "out.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["eval_internal.py", "--splits", "dev", "--limit", "5", "--score-only", str(canned_path), "--out", str(out_path)],
+    )
+    eval_internal.main()
+
+    verdicts_path = tmp_path / "out.json.verdicts.jsonl"
+    assert verdicts_path.exists()
+    lines = [json.loads(line) for line in verdicts_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == 5
+
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert sum(1 for v in lines if v["prompt_strict"]) / len(lines) == result["dev"]["pacc"]
+    for v in lines:
+        assert v["split"] == "dev"
+        assert v["prompt_strict"] == v["prompt_loose"]  # no strict/loose distinction internally
+        assert v["instruction_strict"] == v["instruction_loose"]
+
+
+def test_eval_internal_record_verdicts_matches_verifier_vector() -> None:
+    rows = eval_internal.load_split("dev", limit=1)
+    responses = ["a plausible response"]
+    verdicts = eval_internal.record_verdicts(rows, responses, "dev")
+    assert len(verdicts) == 1
+    v = verdicts[0]
+    assert v["key"] == rows[0].key
+    assert v["split"] == "dev"
+    assert v["instruction_id_list"] == [c.iid for c in rows[0].constraints]
+    from conpo.verifiers import verifier_vector
+
+    expected = [bool(x) for x in verifier_vector(rows[0].constraints, responses[0])]
+    assert v["instruction_strict"] == expected
+    assert v["prompt_strict"] == all(expected)
+
+
 def test_eval_internal_score_only_missing_key_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     rows = eval_internal.load_split("dev", limit=5)
     canned_path = tmp_path / "canned_dev_short.jsonl"
