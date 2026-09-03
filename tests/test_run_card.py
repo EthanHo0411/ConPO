@@ -187,6 +187,84 @@ def test_front_matter_pending_and_updated(tmp_path: Path) -> None:
     assert f"updated: {AS_OF}" in text
     assert "ifbench_prompt_loose: pending" in text
     assert "retention_gsm8k: not wired" in text
+    assert "eval_dir: pending" in text
+
+
+# --- eval_dir (USER DECISIONS 2026-09-03: 28-key contract) -----------------------
+
+
+def test_contract_has_28_keys_with_eval_dir_immediately_before_updated() -> None:
+    assert len(run_card.FRONT_MATTER_KEYS) == 28
+    assert run_card.FRONT_MATTER_KEYS[-2:] == ("eval_dir", "updated")
+
+
+def test_eval_dir_field_is_repo_relative_posix_path(tmp_path: Path) -> None:
+    run_dir = _write_run_dir(tmp_path, "tmp_run_evaldir")
+    eval_dir = _write_eval_dir(tmp_path, "eval_tmp_run_evaldir")
+    plan = run_card.resolve_plan_for_run(run_dir)
+    text = run_card.render_card(plan, run_dir, eval_dir, None, AS_OF)
+
+    line = next(line for line in text.splitlines() if line.startswith("eval_dir:"))
+    assert "\\" not in line
+    assert line.split("eval_dir: ", 1)[1] != run_card.PENDING
+
+
+def test_eval_dir_pending_when_no_eval_dir_given(tmp_path: Path) -> None:
+    run_dir = _write_run_dir(tmp_path, "tmp_run_no_eval")
+    plan = run_card.resolve_plan_for_run(run_dir)
+    text = run_card.render_card(plan, run_dir, None, None, AS_OF)
+    assert "eval_dir: pending" in text
+
+
+# --- Wilson 95% CI column (USER DECISIONS 2026-09-03) -----------------------------
+
+
+def test_wilson_ci_column_matches_stats_wilson_interval_for_a_known_count() -> None:
+    """87/300 (IFBench_test's fixed n): the rendered CI must equal
+    conpo.stats.wilson_interval(87, 300), formatted to run_card._fmt's
+    4dp-stripped convention."""
+    from conpo.stats import wilson_interval
+
+    value = 87 / 300
+    ci = run_card._wilson_ci_str(value, 300)
+    lo, hi = wilson_interval(87, 300)
+    assert ci == f"[{run_card._fmt(lo)}, {run_card._fmt(hi)}]"
+
+
+def test_wilson_ci_column_uses_fixed_n_fallback_when_json_omits_count(tmp_path: Path) -> None:
+    """The card fixtures' internal.json splits carry num_prompts=10 (not
+    the real 1500/2952/6947), so this checks the fallback path directly:
+    no num_prompts in the eval JSON at all falls back to FIXED_N."""
+    ci = run_card._wilson_ci_str(0.29, None)
+    assert ci == run_card.PENDING
+    ci_fallback = run_card._n_or_fixed(None, "ifbench_prompt")
+    assert ci_fallback == 300
+
+
+def test_results_table_carries_wilson_ci_for_pacc_rows(tmp_path: Path) -> None:
+    run_dir = _write_run_dir(tmp_path, "tmp_run_ci")
+    eval_dir = _write_eval_dir(tmp_path, "eval_tmp_run_ci")
+    plan = run_card.resolve_plan_for_run(run_dir)
+    text = run_card.render_card(plan, run_dir, eval_dir, None, AS_OF)
+    results_section = text.split("## 4. Results")[1].split("## 5.")[0]
+
+    assert "95% CI (Wilson)" in results_section
+    from conpo.stats import wilson_interval
+
+    # _internal_json's eval_i: pacc=0.5, num_prompts=10 -> k=5
+    lo, hi = wilson_interval(5, 10)
+    assert f"[{run_card._fmt(lo)}, {run_card._fmt(hi)}]" in results_section
+    # retention rows stay "not wired" in both columns (with_retention=False here)
+    assert "| Retention gsm8k | not wired | not wired |" in results_section
+
+
+def test_retention_ci_cell_stays_not_wired_when_retention_present(tmp_path: Path) -> None:
+    run_dir = _write_run_dir(tmp_path, "tmp_run_ret")
+    eval_dir = _write_eval_dir(tmp_path, "eval_tmp_run_ret", with_retention=True)
+    plan = run_card.resolve_plan_for_run(run_dir)
+    text = run_card.render_card(plan, run_dir, eval_dir, None, AS_OF)
+    results_section = text.split("## 4. Results")[1].split("## 5.")[0]
+    assert "| Retention gsm8k | 0.8 | not wired |" in results_section
 
 
 # --- results table ---------------------------------------------------------------

@@ -4,6 +4,7 @@ Six synthetic cards (four train, two eval) cover the planned/running/done/
 deferred statuses; a seventh malformed card checks the skip-not-crash path.
 """
 
+import json
 import re
 import subprocess
 import sys
@@ -54,6 +55,7 @@ _TRAIN_KEYS = (
     "retention_mmlu",
     "retention_bbh",
     "retention_alpacaeval2",
+    "eval_dir",
     "updated",
 )
 
@@ -235,15 +237,264 @@ def test_blocks_appear_in_order(cards_dir: Path) -> None:
     assert positions == sorted(positions)
 
 
-def test_done_pair_produces_numeric_delta_and_verdict(cards_dir: Path) -> None:
-    cards = dashboard.load_cards(cards_dir)
+# --- Delta [95% CI] / Verdict from synthetic per-prompt verdict files ------------
+#
+# USER DECISIONS 2026-09-03: the hypothesis Delta/Verdict cells come from
+# conpo.stats.paired_bootstrap_diff over each arm's per-prompt verdicts
+# (scripts/eval_external.py's external.json.verdicts.jsonl), read from the
+# card's own "eval_dir" field, not from a mean of the cards' front-matter
+# values. These fixtures write that verdicts file directly, one prompt key
+# per record, "ifbench" benchmark, and point the card's eval_dir at it
+# (an absolute path here; resolve_eval_dir accepts one unchanged since
+# pathlib's "/" treats an absolute right-hand side as a full replacement --
+# only scripts/run_card.py's real cards store a repo-relative path).
+
+
+def _write_ifbench_verdicts(eval_dir: Path, keys: list[int], passed: list[bool]) -> None:
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    records = [
+        {
+            "key": k,
+            "benchmark": "ifbench",
+            "prompt_strict": p,
+            "prompt_loose": p,
+            "instruction_id_list": [],
+            "instruction_strict": [p],
+            "instruction_loose": [p],
+        }
+        for k, p in zip(keys, passed)
+    ]
+    with (eval_dir / "external.json.verdicts.jsonl").open("w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+
+def _h1_card(cards_root: Path, run_id: str, arm: str, status: str, eval_dir: Path | None) -> None:
+    fields: dict[str, str] = {
+        "run_id": run_id,
+        "kind": "train",
+        "arm": arm,
+        "overrides": "none",
+        "block": "hub" if arm == "full" else "H1",
+        "hypotheses": "H1",
+        "model": "Qwen/Qwen3-4B",
+        "seed": "42",
+        "status": status,
+    }
+    if eval_dir is not None:
+        fields["eval_dir"] = eval_dir.resolve().as_posix()
+    (cards_root / f"{run_id}.md").write_text(_card(**fields), encoding="utf-8")
+
+
+def test_h1_delta_supports_when_treatment_clearly_beats_control(tmp_path: Path) -> None:
+    cards_root = tmp_path / "runs"
+    cards_root.mkdir()
+    keys = list(range(20))
+    _write_ifbench_verdicts(tmp_path / "eval_full", keys, [True] * 16 + [False] * 4)  # 0.8
+    _write_ifbench_verdicts(tmp_path / "eval_ifrlvr", keys, [True] * 4 + [False] * 16)  # 0.2
+    _h1_card(cards_root, "full_s42", "full", "done", tmp_path / "eval_full")
+    _h1_card(cards_root, "ifrlvr_s42", "ifrlvr", "done", tmp_path / "eval_ifrlvr")
+
+    cards = dashboard.load_cards(cards_root)
     out = dashboard.render_dashboard(cards, "2026-09-03")
-    lines = [line for line in out.splitlines() if line.startswith("| H1 |")]
-    assert len(lines) == 1
-    row = lines[0]
-    assert "0.1200" in row
+    row = next(line for line in out.splitlines() if line.startswith("| H1 |"))
+    assert "+0.600" in row
     assert "supports" in row
     assert "pending" not in row
+
+
+def test_h1_delta_null_when_arms_are_identical(tmp_path: Path) -> None:
+    cards_root = tmp_path / "runs"
+    cards_root.mkdir()
+    keys = list(range(20))
+    same = [True] * 10 + [False] * 10
+    _write_ifbench_verdicts(tmp_path / "eval_full", keys, same)
+    _write_ifbench_verdicts(tmp_path / "eval_ifrlvr", keys, same)
+    _h1_card(cards_root, "full_s42", "full", "done", tmp_path / "eval_full")
+    _h1_card(cards_root, "ifrlvr_s42", "ifrlvr", "done", tmp_path / "eval_ifrlvr")
+
+    cards = dashboard.load_cards(cards_root)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    row = next(line for line in out.splitlines() if line.startswith("| H1 |"))
+    assert "+0.000" in row
+    assert "| null |" in row
+
+
+def test_h1_delta_null_opposite_sign_when_control_beats_treatment(tmp_path: Path) -> None:
+    cards_root = tmp_path / "runs"
+    cards_root.mkdir()
+    keys = list(range(20))
+    _write_ifbench_verdicts(tmp_path / "eval_full", keys, [True] * 4 + [False] * 16)  # 0.2
+    _write_ifbench_verdicts(tmp_path / "eval_ifrlvr", keys, [True] * 16 + [False] * 4)  # 0.8
+    _h1_card(cards_root, "full_s42", "full", "done", tmp_path / "eval_full")
+    _h1_card(cards_root, "ifrlvr_s42", "ifrlvr", "done", tmp_path / "eval_ifrlvr")
+
+    cards = dashboard.load_cards(cards_root)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    row = next(line for line in out.splitlines() if line.startswith("| H1 |"))
+    assert "-0.600" in row
+    assert "null (opposite sign)" in row
+
+
+def test_h1_delta_pending_when_one_arm_has_no_verdicts_yet(tmp_path: Path) -> None:
+    cards_root = tmp_path / "runs"
+    cards_root.mkdir()
+    _write_ifbench_verdicts(tmp_path / "eval_full", list(range(20)), [True] * 16 + [False] * 4)
+    _h1_card(cards_root, "full_s42", "full", "done", tmp_path / "eval_full")
+    _h1_card(cards_root, "ifrlvr_s42", "ifrlvr", "planned", None)  # not yet run
+
+    cards = dashboard.load_cards(cards_root)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    row = next(line for line in out.splitlines() if line.startswith("| H1 |"))
+    assert row.endswith("| pending | pending |")
+    assert "supports" not in row
+
+
+def test_multi_seed_averages_per_prompt_before_the_bootstrap(tmp_path: Path) -> None:
+    """Two "done" seeds of the treatment arm: average_verdicts must average
+    each prompt's verdict across both seeds before paired_bootstrap_diff
+    runs -- the point diff is exact (mean(a) - mean(b) on the full data,
+    no resampling), so it is asserted precisely."""
+    cards_root = tmp_path / "runs"
+    cards_root.mkdir()
+    keys = [0, 1, 2, 3]
+    _write_ifbench_verdicts(tmp_path / "eval_full_s42", keys, [True, True, False, False])
+    _write_ifbench_verdicts(tmp_path / "eval_full_s43", keys, [True, False, True, False])
+    # per-key average: 1.0, 0.5, 0.5, 0.0 -> mean 0.5
+    _write_ifbench_verdicts(tmp_path / "eval_ifrlvr", keys, [False, False, False, False])  # mean 0.0
+    _h1_card(cards_root, "full_s42", "full", "done", tmp_path / "eval_full_s42")
+    _h1_card(cards_root, "full_s43", "full", "done", tmp_path / "eval_full_s43")
+    _h1_card(cards_root, "ifrlvr_s42", "ifrlvr", "done", tmp_path / "eval_ifrlvr")
+
+    cards = dashboard.load_cards(cards_root)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    row = next(line for line in out.splitlines() if line.startswith("| H1 |"))
+    assert "+0.500" in row
+
+
+def test_off_graph_full_card_excluded_from_hub_delta(tmp_path: Path) -> None:
+    """A "full"/no-overrides card from an off-graph block (model axis or
+    full-FT point-check) must not be pulled into the hub's per-prompt
+    averaging alongside the hub's own seed replicates: the H1 delta with
+    the off-graph card present must equal the hub-only delta (round 2
+    finding 1)."""
+    cards_root = tmp_path / "runs"
+    cards_root.mkdir()
+    keys = list(range(20))
+    _write_ifbench_verdicts(tmp_path / "eval_full", keys, [True] * 16 + [False] * 4)  # 0.8
+    _write_ifbench_verdicts(tmp_path / "eval_ifrlvr", keys, [True] * 4 + [False] * 16)  # 0.2
+    _write_ifbench_verdicts(tmp_path / "eval_off_graph", keys, [True] * 2 + [False] * 18)  # 0.1
+    _h1_card(cards_root, "full_s42", "full", "done", tmp_path / "eval_full")
+    _h1_card(cards_root, "ifrlvr_s42", "ifrlvr", "done", tmp_path / "eval_ifrlvr")
+    (cards_root / "full_qwen3_8b_s42.md").write_text(
+        _card(
+            run_id="full_qwen3_8b_s42",
+            kind="train",
+            arm="full",
+            overrides="none",
+            block="model axis",
+            hypotheses="none",
+            model="Qwen/Qwen3-8B",
+            seed="42",
+            status="done",
+            eval_dir=(tmp_path / "eval_off_graph").resolve().as_posix(),
+        ),
+        encoding="utf-8",
+    )
+
+    cards = dashboard.load_cards(cards_root)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    row = next(line for line in out.splitlines() if line.startswith("| H1 |"))
+    assert "+0.600" in row
+    assert "supports" in row
+
+
+# --- "Seeds and test" column text -------------------------------------------------
+
+
+def test_seeds_and_test_text_h1_vs_attribution_rows(cards_dir: Path) -> None:
+    """The literal H1 id gets the 3-seed text; the two H1_attribution_* ids
+    (1 seed each per hackmd/conpo-plan.md section 6) must not match on the
+    "H1" prefix and fall through to the 1-seed text."""
+    cards = dashboard.load_cards(cards_dir)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    h1_row = next(line for line in out.splitlines() if line.startswith("| H1 |"))
+    attr_rows = [
+        line
+        for line in out.splitlines()
+        if line.startswith("| H1_attribution_full_vs_solve_only |")
+        or line.startswith("| H1_attribution_solve_only_vs_ifrlvr |")
+    ]
+    assert len(attr_rows) == 2
+    assert "3 seeds per arm; mean and std over seeds" in h1_row
+    for row in attr_rows:
+        assert "3 seeds per arm" not in row
+        assert "1 seed; paired bootstrap 95% CI over the split's prompts, 10,000 resamples" in row
+
+
+# --- Seed summary row ("<arm> mean +/- std over <k> seeds") -----------------------
+
+
+def _seed_card(
+    cards_root: Path, run_id: str, model: str, seed: str, status: str, ifbench_prompt_loose: str
+) -> None:
+    fields: dict[str, str] = {
+        "run_id": run_id,
+        "kind": "train",
+        "arm": "full",
+        "overrides": "none",
+        "block": "model axis",
+        "hypotheses": "none",
+        "model": model,
+        "seed": seed,
+        "status": status,
+        "ifbench_prompt_loose": ifbench_prompt_loose,
+    }
+    (cards_root / f"{run_id}.md").write_text(_card(**fields), encoding="utf-8")
+
+
+def test_seed_summary_row_needs_two_done_seeds(tmp_path: Path) -> None:
+    cards_root = tmp_path / "runs"
+    cards_root.mkdir()
+    _seed_card(cards_root, "full_s42", "Qwen/Qwen3-4B", "42", "done", "0.60")
+    _seed_card(cards_root, "full_s43", "Qwen/Qwen3-4B", "43", "planned", "pending")
+
+    cards = dashboard.load_cards(cards_root)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    assert "mean +/- std over" not in out
+
+    _seed_card(cards_root, "full_s43", "Qwen/Qwen3-4B", "43", "done", "0.70")
+    cards = dashboard.load_cards(cards_root)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    assert "full mean +/- std over 2 seeds" in out
+
+
+def test_seed_summary_row_not_synthesized_across_different_models(tmp_path: Path) -> None:
+    """Two "done" cards sharing arm+overrides but not model (the model-axis
+    block) are not seed replicates of one experiment and must not be
+    grouped into a false summary row."""
+    cards_root = tmp_path / "runs"
+    cards_root.mkdir()
+    _seed_card(cards_root, "full_qwen3_8b_s42", "Qwen/Qwen3-8B", "42", "done", "0.60")
+    _seed_card(cards_root, "full_tulu3_8b_sft_s42", "allenai/Llama-3.1-Tulu-3-8B-SFT", "42", "done", "0.65")
+
+    cards = dashboard.load_cards(cards_root)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    assert "mean +/- std over" not in out
+
+
+# --- ## 5. Statistics compute -----------------------------------------------------
+
+
+def test_statistics_compute_section_present(cards_dir: Path) -> None:
+    cards = dashboard.load_cards(cards_dir)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    assert "## 5. Statistics compute" in out
+    assert "Intervals and bootstraps cost 0 GPU-hours" in out
+    assert "48 H100-h" in out
+    assert "about 1.1 days on 2x H100" in out
+    assert "about 27 H100-h" in out
+    assert "IFBench_test has 300" in out
 
 
 def test_pending_propagates(cards_dir: Path) -> None:

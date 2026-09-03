@@ -29,6 +29,7 @@ from typing import Any
 from conpo import config as cfg
 from conpo.arms import ARMS
 from conpo.data import keys_digest
+from conpo.stats import wilson_interval
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CARDS_DIR = REPO_ROOT.parent / "hackmd" / "runs"
@@ -80,8 +81,20 @@ FRONT_MATTER_KEYS: tuple[str, ...] = (
     "retention_mmlu",
     "retention_bbh",
     "retention_alpacaeval2",
+    "eval_dir",
     "updated",
 )
+
+# Fixed prompt-set sizes (USER DECISIONS 2026-09-03), keyed by the same
+# name used for the eval JSON's own num_prompts field when present -- the
+# Wilson-CI fallback when a card has no real eval JSON to read a count from.
+FIXED_N: dict[str, int] = {
+    "ifbench_prompt": 300,
+    "ifeval_prompt": 541,
+    "eval_i": 1500,
+    "eval_ii": 2952,
+    "eval_iii": 6947,
+}
 
 OVERRIDE_MEANINGS: dict[str, str] = {
     "RUN_SELECTION": "reverse-construction selection rule override (conpo/arms.py Overrides.selection)",
@@ -212,6 +225,42 @@ def _days(h100h: float | None) -> float | None:
     return None if h100h is None else h100h / 48
 
 
+def _n_or_fixed(json_n: Any, fixed_key: str) -> int | None:
+    """The eval JSON's own count field when it parses as a positive number,
+    else FIXED_N[fixed_key] (or None when fixed_key has no fallback --
+    the instruction-level and IAcc rows, design choice 2026-09-03: no
+    fixed instruction-count fallback was given, so those CI cells fall
+    back to "pending" rather than a made-up n)."""
+    if isinstance(json_n, (int, float)) and json_n > 0:
+        return int(json_n)
+    return FIXED_N.get(fixed_key)
+
+
+def _wilson_ci_str(value: float | None, n: int | None) -> str:
+    """"[lo, hi]" (conpo.stats.wilson_interval, 4dp) for one accuracy row,
+    or "pending" when either the value or n is unavailable.
+
+    Design choice 2026-09-03: the eval JSON stores a fraction, not a raw
+    pass count, so the count fed to wilson_interval is round(value * n).
+    """
+    if value is None or n is None or n <= 0:
+        return PENDING
+    k = max(0, min(n, round(value * n)))
+    lo, hi = wilson_interval(k, n)
+    return f"[{_fmt(lo)}, {_fmt(hi)}]"
+
+
+def eval_dir_str(eval_dir: Path | None) -> str:
+    """eval_dir's path relative to REPO_ROOT.parent (the reserch2 root --
+    the same convention section_configuration uses for subset_path), or
+    "pending" when no eval_dir was given. walk_up=True (Python 3.12) keeps
+    this from raising for a path outside the repo tree (e.g. a test's
+    tmp_path), rendering a "../"-prefixed relative path instead."""
+    if eval_dir is None:
+        return PENDING
+    return eval_dir.resolve().relative_to(REPO_ROOT.parent.resolve(), walk_up=True).as_posix()
+
+
 def _overrides_str(overrides: dict[str, str]) -> str:
     return " ".join(f"{k}={v}" for k, v in overrides.items()) or "none"
 
@@ -257,10 +306,14 @@ def extract_external(external: dict[str, Any] | None) -> dict[str, Any]:
         "ifeval_prompt_loose": ifeval.get("prompt_loose"),
         "ifeval_instruction_strict": ifeval.get("instruction_strict"),
         "ifeval_instruction_loose": ifeval.get("instruction_loose"),
+        "ifeval_num_prompts": ifeval.get("num_prompts"),
+        "ifeval_num_instructions": ifeval.get("num_instructions"),
         "ifbench_prompt_strict": ifbench.get("prompt_strict"),
         "ifbench_prompt_loose": ifbench.get("prompt_loose"),
         "ifbench_instruction_strict": ifbench.get("instruction_strict"),
         "ifbench_instruction_loose": ifbench.get("instruction_loose"),
+        "ifbench_num_prompts": ifbench.get("num_prompts"),
+        "ifbench_num_instructions": ifbench.get("num_instructions"),
     }
 
 
@@ -433,27 +486,44 @@ def section_compute(plan: CardPlan, actual_h100h: str, steps: str, tokens_genera
 def section_results(
     ext: dict[str, Any], internal_splits: dict[str, Any], retention_raw: dict[str, Any] | None
 ) -> str:
-    rows: list[tuple[str, str]] = [
-        ("IFEval prompt strict", _fmt(ext["ifeval_prompt_strict"])),
-        ("IFEval prompt loose", _fmt(ext["ifeval_prompt_loose"])),
-        ("IFEval instruction strict", _fmt(ext["ifeval_instruction_strict"])),
-        ("IFEval instruction loose", _fmt(ext["ifeval_instruction_loose"])),
-        ("IFBench prompt strict", _fmt(ext["ifbench_prompt_strict"])),
-        ("IFBench prompt loose", _fmt(ext["ifbench_prompt_loose"])),
-        ("IFBench instruction strict", _fmt(ext["ifbench_instruction_strict"])),
-        ("IFBench instruction loose", _fmt(ext["ifbench_instruction_loose"])),
+    """USER DECISIONS 2026-09-03: every accuracy row carries a 95% CI
+    (Wilson) column, from conpo.stats.wilson_interval via _wilson_ci_str
+    (see its docstring for the count-from-fraction and fixed-n-fallback
+    choices). Retention rows stay "not wired" in both the value and CI
+    columns; instruction-level and IAcc rows read "pending" for CI when
+    the eval JSON carries no instruction count (no fixed fallback exists
+    for those -- design choice 2026-09-03)."""
+
+    def acc_row(name: str, value: Any, n: int | None) -> tuple[str, str, str]:
+        return name, _fmt(value), _wilson_ci_str(value, n)
+
+    ifeval_prompt_n = _n_or_fixed(ext["ifeval_num_prompts"], "ifeval_prompt")
+    ifeval_instr_n = _n_or_fixed(ext["ifeval_num_instructions"], "")
+    ifbench_prompt_n = _n_or_fixed(ext["ifbench_num_prompts"], "ifbench_prompt")
+    ifbench_instr_n = _n_or_fixed(ext["ifbench_num_instructions"], "")
+
+    rows: list[tuple[str, str, str]] = [
+        acc_row("IFEval prompt strict", ext["ifeval_prompt_strict"], ifeval_prompt_n),
+        acc_row("IFEval prompt loose", ext["ifeval_prompt_loose"], ifeval_prompt_n),
+        acc_row("IFEval instruction strict", ext["ifeval_instruction_strict"], ifeval_instr_n),
+        acc_row("IFEval instruction loose", ext["ifeval_instruction_loose"], ifeval_instr_n),
+        acc_row("IFBench prompt strict", ext["ifbench_prompt_strict"], ifbench_prompt_n),
+        acc_row("IFBench prompt loose", ext["ifbench_prompt_loose"], ifbench_prompt_n),
+        acc_row("IFBench instruction strict", ext["ifbench_instruction_strict"], ifbench_instr_n),
+        acc_row("IFBench instruction loose", ext["ifbench_instruction_loose"], ifbench_instr_n),
     ]
     for split in sorted(internal_splits):
         summary = internal_splits[split]
-        rows.append((f"PAcc {split}", _fmt(summary.get("pacc"))))
-        rows.append((f"IAcc {split}", _fmt(summary.get("iacc"))))
+        pacc_n = _n_or_fixed(summary.get("num_prompts"), split)
+        rows.append(acc_row(f"PAcc {split}", summary.get("pacc"), pacc_n))
+        rows.append((f"IAcc {split}", _fmt(summary.get("iacc")), PENDING))
     for key in ("gsm8k", "mmlu", "bbh", "alpacaeval2"):
         if retention_raw is None:
-            rows.append((f"Retention {key}", NOT_WIRED))
+            rows.append((f"Retention {key}", NOT_WIRED, NOT_WIRED))
         else:
-            rows.append((f"Retention {key}", _fmt(retention_raw.get(key))))
-    table = ["| metric | value |", "|---|---|"]
-    table.extend(f"| {name} | {value} |" for name, value in rows)
+            rows.append((f"Retention {key}", _fmt(retention_raw.get(key)), NOT_WIRED))
+    table = ["| metric | value | 95% CI (Wilson) |", "|---|---|---|"]
+    table.extend(f"| {name} | {value} | {ci} |" for name, value, ci in rows)
     return "\n".join(["## 4. Results", ""] + table)
 
 
@@ -586,6 +656,7 @@ def render_card(
         "retention_mmlu": NOT_WIRED if retention is None else _fmt(retention.get("mmlu")),
         "retention_bbh": NOT_WIRED if retention is None else _fmt(retention.get("bbh")),
         "retention_alpacaeval2": NOT_WIRED if retention is None else _fmt(retention.get("alpacaeval2")),
+        "eval_dir": eval_dir_str(eval_dir),
         "updated": as_of,
     }
 

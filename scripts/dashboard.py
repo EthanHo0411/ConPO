@@ -41,19 +41,45 @@ Design choices not fixed by the card contract (dated 2026-09-03):
   synthesizes one row per such H-number directly from the run card that
   names it (``block`` equal to the H-number, or the H-number listed in the
   card's comma-separated ``hypotheses`` field). ``DEFERRED_HYPOTHESES``
-  supplies the row's claim and metric text; its Delta and Verdict cells are
-  always "pending".
+  supplies the row's claim, display metric and internal metric key; its
+  Delta and Verdict cells run the same paired-bootstrap machinery as a
+  HYPOTHESES row, against the ``full`` arm as control.
+
+Statistics compute (USER DECISIONS 2026-09-02/2026-09-03, this script's
+share of it):
+
+* Run-table accuracy cells: "value +/- half-width" from
+  ``conpo.stats.wilson_interval`` at the metric's ``FIXED_N`` prompt count,
+  or the bare "pending" when the card's value is pending. A block whose arm
+  has 2+ "done" seeds also gets a "<arm> mean +/- std over <k> seeds"
+  summary row (``conpo.stats.mean_std`` over each metric's per-seed values).
+* Hypothesis Delta [95% CI]: ``conpo.stats.paired_bootstrap_diff`` (seed 0,
+  10,000 resamples) on the two arms' prompt-aligned per-prompt verdicts,
+  read from ``<eval_dir>/external.json.verdicts.jsonl`` /
+  ``internal.json.verdicts.jsonl`` (``eval_dir`` is a card's own
+  repo-relative field; ``resolve_eval_dir`` resolves it against
+  ``_RESERCH2_ROOT``). A multi-seed arm averages each prompt's verdict
+  across its "done" seeds first (``average_verdicts``). "pending" when
+  either arm has no per-prompt verdicts yet on that metric.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 from conpo.arms import HYPOTHESES, Hypothesis
+from conpo.stats import mean_std, paired_bootstrap_diff, wilson_interval
+
+# reserch2 root, two levels up from scripts/dashboard.py (conpo/scripts ->
+# conpo -> reserch2) -- the base a card's repo-relative "eval_dir" field
+# resolves against (same convention as scripts/run_card.py's eval_dir_str).
+_RESERCH2_ROOT = Path(__file__).resolve().parent.parent.parent
 
 CARD_KEYS: tuple[str, ...] = (
     "run_id",
@@ -82,8 +108,23 @@ CARD_KEYS: tuple[str, ...] = (
     "retention_mmlu",
     "retention_bbh",
     "retention_alpacaeval2",
+    "eval_dir",
     "updated",
 )
+
+# Fixed prompt-set sizes (USER DECISIONS 2026-09-03), mirroring
+# scripts/run_card.py's FIXED_N -- the Wilson half-width fallback for a run
+# table cell when the card's own eval JSON carried no count (a planned card
+# reads "pending" regardless; see accuracy_cell below).
+FIXED_N: dict[str, int] = {
+    "ifbench_prompt_loose": 300,
+    "ifeval_prompt_loose": 541,
+    "pacc_eval_i": 1500,
+    "pacc_eval_ii": 2952,
+    "pacc_eval_iii": 6947,
+}
+
+PENDING = "pending"
 
 BLOCK_ORDER: tuple[str, ...] = (
     "hub",
@@ -114,16 +155,35 @@ CLAIMS: dict[str, str] = {
     "objective_isolation_edge_dpo": "ConPO's contrastive objective beats plain DPO trained on ConPO's own edges.",
 }
 
-# Claim and metric text for H-numbers HYPOTHESES has no entry for (no arm
-# comparison exists yet), keyed by "H<n>". See the module docstring's
-# "Hypothesis ids with no HYPOTHESES entry" note above.
-DEFERRED_HYPOTHESES: dict[str, tuple[str, str]] = {
+# Claim, display metric, and internal metric key for H-numbers HYPOTHESES
+# has no entry for (no arm comparison exists yet), keyed by "H<n>". See the
+# module docstring's "Hypothesis ids with no HYPOTHESES entry" note above.
+# The internal metric key names the per-prompt verdict source
+# hypothesis_delta reads (see _METRIC_VERDICT_SOURCE).
+DEFERRED_HYPOTHESES: dict[str, tuple[str, str, str]] = {
     "H6": (
         "Multi-constraint compositional generalisation (being built: "
         "compositor part A in progress, arm switch part B next)",
         "PAcc eval_iii",
+        "pacc_eval_iii",
     ),
 }
+
+# "Seeds and test" column text (USER DECISIONS 2026-09-03): the literal H1
+# id gets the 3-seed mean/std-plus-bootstrap text (the only row with 3
+# planned seeds per arm); every other hypothesis id -- including
+# H1_attribution_full_vs_solve_only and H1_attribution_solve_only_vs_ifrlvr,
+# which are 1-seed diagnostics per hackmd/conpo-plan.md section 6 -- gets the
+# 1-seed bootstrap-only text.
+_H1_SEEDS_AND_TEST = (
+    "3 seeds per arm; mean and std over seeds; paired bootstrap 95% CI "
+    "over the 300 IFBench prompts, 10,000 resamples"
+)
+_OTHER_SEEDS_AND_TEST = "1 seed; paired bootstrap 95% CI over the split's prompts, 10,000 resamples"
+
+
+def seeds_and_test_text(hypothesis_id: str) -> str:
+    return _H1_SEEDS_AND_TEST if hypothesis_id == "H1" else _OTHER_SEEDS_AND_TEST
 
 _LINE_RE = re.compile(r"^([A-Za-z0-9_]+):\s?(.*)$")
 
@@ -182,8 +242,34 @@ def fmt_arm(card: dict[str, str]) -> str:
     return f'{card["arm"]} {card["overrides"]}'
 
 
+def _fmt_num(x: float) -> str:
+    """4dp rounded, trailing zeros/dot stripped -- mirrors
+    scripts/run_card.py's _fmt for numeric values (dashboard.py has no
+    import path to that script; scripts/ is not an installed package)."""
+    text = f"{round(x, 4):.4f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def accuracy_cell(card: dict[str, str], metric: str) -> str:
+    """"value +/- half-width" (USER DECISIONS 2026-09-03: Wilson 95%
+    half-width, FIXED_N[metric]) for one run-table accuracy cell, or the
+    bare "pending" when the card's value is pending -- never "pending +/-
+    pending"."""
+    value = parse_float(card[metric])
+    if value is None:
+        return PENDING
+    n = FIXED_N[metric]
+    k = max(0, min(n, round(value * n)))
+    lo, hi = wilson_interval(k, n)
+    return f"{_fmt_num(value)} +/- {_fmt_num((hi - lo) / 2)}"
+
+
 def pacc_cell(card: dict[str, str]) -> str:
-    return f'{card["pacc_eval_i"]} / {card["pacc_eval_ii"]} / {card["pacc_eval_iii"]}'
+    return (
+        f"{accuracy_cell(card, 'pacc_eval_i')} / "
+        f"{accuracy_cell(card, 'pacc_eval_ii')} / "
+        f"{accuracy_cell(card, 'pacc_eval_iii')}"
+    )
 
 
 def retention_cell(card: dict[str, str]) -> str:
@@ -198,6 +284,44 @@ def retention_cell(card: dict[str, str]) -> str:
 
 def card_link(card: dict[str, str]) -> str:
     return f'[{card["run_id"]}]({card["run_id"]}.md)'
+
+
+def build_seed_summary_row(same_arm_cards: list[dict[str, str]]) -> str | None:
+    """"<arm> mean +/- std over <k> seeds" (USER DECISIONS 2026-09-03,
+    conpo.stats.mean_std over each metric's per-seed values) for a group of
+    cards sharing one arm+overrides+model identifier, or None when fewer
+    than 2 of them are "done" -- a summary needs at least 2 real seed
+    values from the same model (the model axis puts several models under
+    one arm+overrides pair, and those are not seed replicates of each
+    other)."""
+    done = [c for c in same_arm_cards if c["status"] == "done"]
+    if len(done) < 2:
+        return None
+    label = fmt_arm(done[0])
+
+    def summary_cell(metric: str) -> str:
+        values = [v for v in (parse_float(c[metric]) for c in done) if v is not None]
+        if not values:
+            return PENDING
+        mean, std = mean_std(values)
+        return f"{_fmt_num(mean)} +/- {_fmt_num(std)}"
+
+    pacc = " / ".join(summary_cell(m) for m in ("pacc_eval_i", "pacc_eval_ii", "pacc_eval_iii"))
+    row = [
+        f"{label} mean +/- std over {len(done)} seeds",
+        label,
+        done[0]["model"],
+        f"{len(done)} seeds",
+        "summary",
+        "-",
+        "-",
+        summary_cell("ifbench_prompt_loose"),
+        summary_cell("ifeval_prompt_loose"),
+        pacc,
+        "-",
+        "-",
+    ]
+    return "| " + " | ".join(row) + " |"
 
 
 def build_runs_section(train_cards: list[dict[str, str]]) -> list[str]:
@@ -215,6 +339,7 @@ def build_runs_section(train_cards: list[dict[str, str]]) -> list[str]:
         lines.append("")
         lines.append(header)
         lines.append(sep)
+        groups: dict[str, list[dict[str, str]]] = {}
         for c in block_cards:
             row = [
                 c["run_id"],
@@ -224,13 +349,18 @@ def build_runs_section(train_cards: list[dict[str, str]]) -> list[str]:
                 c["status"],
                 c["est_h100h"],
                 c["actual_h100h"],
-                c["ifbench_prompt_loose"],
-                c["ifeval_prompt_loose"],
+                accuracy_cell(c, "ifbench_prompt_loose"),
+                accuracy_cell(c, "ifeval_prompt_loose"),
                 pacc_cell(c),
                 retention_cell(c),
                 card_link(c),
             ]
             lines.append("| " + " | ".join(row) + " |")
+            groups.setdefault(f'{c["arm"]}|{c["overrides"]}|{c["model"]}', []).append(c)
+        for group_cards in groups.values():
+            summary_row = build_seed_summary_row(group_cards)
+            if summary_row is not None:
+                lines.append(summary_row)
         lines.append("")
     return lines
 
@@ -243,27 +373,140 @@ def hypothesis_metric(h: Hypothesis) -> str:
     return "ifbench_prompt_loose"
 
 
+# Blocks that share an arm/overrides pair with the hypothesis hub (arm="full",
+# overrides="none") but are not part of any hypothesis graph: the model-axis
+# cards and the full-FT point-check card. A bare identifier match must not
+# pull these in alongside the hub's own seed replicates (round 2 finding 1).
+_OFF_GRAPH_BLOCKS = {"model axis", "full-FT point-check"}
+
+
 def resolve_identifier_cards(identifier: str, cards: list[dict[str, str]]) -> list[dict[str, str]]:
     """Cards matching a HYPOTHESES treatment/control identifier.
 
     A plain arm name (e.g. "full") matches cards with that arm and no
-    overrides. An "arm:field=value" identifier (e.g. "full:selection=uniform")
-    matches cards with that arm whose overrides contain the corresponding
-    RUN_<FIELD>=value assignment.
+    overrides, excluding off-graph blocks (model axis, full-FT point-check)
+    that happen to share the same arm/overrides pair. An "arm:field=value"
+    identifier (e.g. "full:selection=uniform") matches cards with that arm
+    whose overrides contain the corresponding RUN_<FIELD>=value assignment.
     """
     if ":" in identifier:
         arm, override_expr = identifier.split(":", 1)
         field, value = override_expr.split("=", 1)
         run_assignment = f"RUN_{field.upper()}={value}"
         return [c for c in cards if c["arm"] == arm and run_assignment in c["overrides"].split()]
-    return [c for c in cards if c["arm"] == identifier and c["overrides"] == "none"]
+    return [
+        c for c in cards
+        if c["arm"] == identifier and c["overrides"] == "none" and c["block"] not in _OFF_GRAPH_BLOCKS
+    ]
 
 
-def mean_metric(cards: list[dict[str, str]], metric: str) -> float | None:
-    values = [v for v in (parse_float(c[metric]) for c in cards) if v is not None]
-    if not values:
+# One metric key -> (per-prompt verdicts filename under eval_dir, the
+# record field to filter on, the value that field must equal). Only the
+# metrics hypothesis_metric()/DEFERRED_HYPOTHESES emit are wired:
+# ifbench_prompt_loose reads scripts/eval_external.py's
+# external.json.verdicts.jsonl (benchmark == "ifbench"); pacc_eval_* reads
+# scripts/eval_internal.py's internal.json.verdicts.jsonl (split ==
+# "eval_i"/"eval_ii"/"eval_iii"). Both verdict shapes carry a "prompt_loose"
+# field per record (eval_internal.py's is the same value as its
+# "prompt_strict" -- conpo.verifiers has no strict/loose distinction, see
+# that script's module docstring), so every source reads that one field.
+_METRIC_VERDICT_SOURCE: dict[str, tuple[str, str, str]] = {
+    "ifbench_prompt_loose": ("external.json.verdicts.jsonl", "benchmark", "ifbench"),
+    "pacc_eval_i": ("internal.json.verdicts.jsonl", "split", "eval_i"),
+    "pacc_eval_ii": ("internal.json.verdicts.jsonl", "split", "eval_ii"),
+    "pacc_eval_iii": ("internal.json.verdicts.jsonl", "split", "eval_iii"),
+}
+
+
+def resolve_eval_dir(card: dict[str, str]) -> Path | None:
+    """card["eval_dir"] resolved against _RESERCH2_ROOT, or None when the
+    card has no real eval_dir yet (still "pending")."""
+    value = card.get("eval_dir", PENDING)
+    if not value or value == PENDING:
         return None
-    return sum(values) / len(values)
+    return (_RESERCH2_ROOT / value).resolve()
+
+
+def load_verdict_map(eval_dir: Path, metric: str) -> dict[Any, bool] | None:
+    """{prompt key: prompt_loose verdict} for one metric's per-prompt
+    verdicts file under eval_dir, or None when the metric has no wired
+    source or the file is not on disk yet."""
+    source = _METRIC_VERDICT_SOURCE.get(metric)
+    if source is None:
+        return None
+    filename, field, value = source
+    path = eval_dir / filename
+    if not path.is_file():
+        return None
+    out: dict[Any, bool] = {}
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get(field) == value:
+                out[record["key"]] = bool(record["prompt_loose"])
+    return out
+
+
+def average_verdicts(cards: list[dict[str, str]], metric: str) -> dict[Any, float] | None:
+    """Per-prompt verdict averaged across every "done" card's own
+    per-prompt verdicts (USER DECISIONS 2026-09-03: multi-seed prompt
+    averaging -- average each prompt's verdict across the done seeds
+    before the paired bootstrap runs). A card that is not "done", or has
+    no eval_dir yet, contributes nothing. None when no card contributed a
+    verdict map, or the contributing maps share no prompt key."""
+    maps: list[dict[Any, bool]] = []
+    for card in cards:
+        if card["status"] != "done":
+            continue
+        eval_dir = resolve_eval_dir(card)
+        if eval_dir is None:
+            continue
+        vmap = load_verdict_map(eval_dir, metric)
+        if vmap:
+            maps.append(vmap)
+    if not maps:
+        return None
+    common_keys = set(maps[0])
+    for m in maps[1:]:
+        common_keys &= set(m)
+    if not common_keys:
+        return None
+    return {k: sum(m[k] for m in maps) / len(maps) for k in common_keys}
+
+
+def _verdict_from_ci(lo: float, hi: float, expected_sign: str) -> str:
+    """"supports" when the interval excludes zero on the expected side,
+    "null (opposite sign)" when it excludes zero on the other side, else
+    "null" (the interval includes zero)."""
+    if lo > 0:
+        return "supports" if expected_sign == ">" else "null (opposite sign)"
+    if hi < 0:
+        return "supports" if expected_sign == "<" else "null (opposite sign)"
+    return "null"
+
+
+def hypothesis_delta(
+    treatment_cards: list[dict[str, str]], control_cards: list[dict[str, str]], metric: str, expected_sign: str
+) -> tuple[str, str]:
+    """(delta string, verdict) for one hypothesis row (USER DECISIONS
+    2026-09-03): "+0.034 [+0.010, +0.058]" (3dp, signed) via
+    conpo.stats.paired_bootstrap_diff (seed 0, 10,000 resamples) on the
+    two arms' prompt-aligned averaged verdict vectors, or ("pending",
+    "pending") when either arm has no per-prompt verdicts on `metric`."""
+    t_map = average_verdicts(treatment_cards, metric)
+    c_map = average_verdicts(control_cards, metric)
+    if not t_map or not c_map:
+        return PENDING, PENDING
+    keys = sorted(set(t_map) & set(c_map), key=str)
+    if not keys:
+        return PENDING, PENDING
+    a = [t_map[k] for k in keys]
+    b = [c_map[k] for k in keys]
+    point, lo, hi = paired_bootstrap_diff(a, b, n_resamples=10000, seed=0)
+    delta_str = f"{point:+.3f} [{lo:+.3f}, {hi:+.3f}]"
+    return delta_str, _verdict_from_ci(lo, hi, expected_sign)
 
 
 def covered_hypothesis_numbers() -> set[str]:
@@ -285,7 +528,10 @@ def find_deferred_card(h_number: str, train_cards: list[dict[str, str]]) -> dict
 
 
 def build_deferred_hypothesis_rows(train_cards: list[dict[str, str]]) -> list[str]:
-    """Synthesized rows for H1..H6 ids HYPOTHESES does not cover."""
+    """Synthesized rows for H1..H6 ids HYPOTHESES does not cover, same
+    columns as a HYPOTHESES row (design choice 2026-09-03: control is
+    always the `full` arm, no overrides -- the hub every H-number
+    compares back to per the plan note's section 4)."""
     covered = covered_hypothesis_numbers()
     rows: list[str] = []
     for n in range(1, 7):
@@ -295,8 +541,14 @@ def build_deferred_hypothesis_rows(train_cards: list[dict[str, str]]) -> list[st
         card = find_deferred_card(h_number, train_cards)
         if card is None:
             continue
-        claim, metric = DEFERRED_HYPOTHESES[h_number]
-        rows.append(f"| {h_number} | {claim} | {card['run_id']} | {metric} | pending | pending |")
+        claim, metric_display, metric_key = DEFERRED_HYPOTHESES[h_number]
+        control_cards = resolve_identifier_cards("full", train_cards)
+        delta_str, verdict = hypothesis_delta([card], control_cards, metric_key, ">")
+        seeds_and_test = seeds_and_test_text(h_number)
+        rows.append(
+            f"| {h_number} | {claim} | {card['run_id']} vs full | {metric_display} | {seeds_and_test} "
+            f"| {delta_str} | {verdict} |"
+        )
     return rows
 
 
@@ -304,24 +556,18 @@ def build_hypotheses_section(train_cards: list[dict[str, str]]) -> list[str]:
     lines = [
         "## 2. Hypothesis verdicts",
         "",
-        "| H | Claim | Arms compared | Metric | Delta | Verdict |",
-        "|---|---|---|---|---|---|",
+        "| H | Claim | Arms compared | Metric | Seeds and test | Delta [95% CI] | Verdict |",
+        "|---|---|---|---|---|---|---|",
     ]
     for h in HYPOTHESES:
         metric = hypothesis_metric(h)
-        t_mean = mean_metric(resolve_identifier_cards(h.treatment, train_cards), metric)
-        c_mean = mean_metric(resolve_identifier_cards(h.control, train_cards), metric)
+        treatment_cards = resolve_identifier_cards(h.treatment, train_cards)
+        control_cards = resolve_identifier_cards(h.control, train_cards)
         claim = CLAIMS.get(h.id, f"{h.treatment} outperforms {h.control} on {metric}.")
         arms = f"{h.treatment} vs {h.control}"
-        if t_mean is None or c_mean is None:
-            delta_str = "pending"
-            verdict = "pending"
-        else:
-            delta = t_mean - c_mean
-            delta_str = f"{delta:.4f}"
-            sign_ok = delta > 0 if h.expected_sign == ">" else delta < 0
-            verdict = "supports" if sign_ok else "null"
-        lines.append(f"| {h.id} | {claim} | {arms} | {metric} | {delta_str} | {verdict} |")
+        delta_str, verdict = hypothesis_delta(treatment_cards, control_cards, metric, h.expected_sign)
+        seeds_and_test = seeds_and_test_text(h.id)
+        lines.append(f"| {h.id} | {claim} | {arms} | {metric} | {seeds_and_test} | {delta_str} | {verdict} |")
     lines += build_deferred_hypothesis_rows(train_cards)
     lines.append("")
     return lines
@@ -373,6 +619,25 @@ def build_totals_section(train_cards: list[dict[str, str]], eval_cards: list[dic
     ]
 
 
+def build_statistics_section() -> list[str]:
+    """USER DECISIONS 2026-09-03: what the statistics cost, in GPU-hours,
+    stated once here rather than repeated per hypothesis row."""
+    return [
+        "## 5. Statistics compute",
+        "",
+        "Intervals and bootstraps cost 0 GPU-hours (CPU, seconds, from the stored per-prompt verdicts).",
+        "",
+        "Seed replication is the only compute that buys statistical power: the 2 extra seeds on the "
+        "headline pair cost 48 H100-h of training (2 x (18 + 6)) plus about 7 H100-h of eval and "
+        "retention, about 55 H100-h, about 1.1 days on 2x H100, already inside the total; each further "
+        "seed on the headline pair costs about 27 H100-h (24 training, 3 eval), about 0.6 days on 2x "
+        "H100, and narrows the seed-level std only.",
+        "",
+        "The prompt-level bootstrap gets tighter only with more eval prompts, and IFBench_test has 300.",
+        "",
+    ]
+
+
 def render_dashboard(cards: list[dict[str, str]], as_of: str) -> str:
     train_cards = [c for c in cards if c["kind"] == "train"]
     eval_cards = [c for c in cards if c["kind"] == "eval"]
@@ -387,6 +652,7 @@ def render_dashboard(cards: list[dict[str, str]], as_of: str) -> str:
     lines += build_hypotheses_section(train_cards)
     lines += build_eval_section(eval_cards)
     lines += build_totals_section(train_cards, eval_cards)
+    lines += build_statistics_section()
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
