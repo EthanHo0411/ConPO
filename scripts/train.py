@@ -228,15 +228,6 @@ def main() -> None:
     rows_by_key = {r.key: r for r in rows}
     dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
 
-    model, tokenizer = _tiny_model_and_tokenizer() if args.tiny else _real_model_and_tokenizer(model_name)
-    lora_config = LoraConfig(
-        r=config.LORA_R,
-        lora_alpha=config.LORA_ALPHA,
-        lora_dropout=config.LORA_DROPOUT,
-        target_modules=list(config.LORA_TARGET_MODULES),
-        task_type="CAUSAL_LM",
-    )
-
     num_generations, max_completion_length, effective_batch = _run_shape(args.tiny)
     per_device_batch = 2 if args.tiny else num_generations
 
@@ -251,6 +242,8 @@ def main() -> None:
     # num_processes fetched unconditionally (not only in the non-tiny branch
     # below) so prompts_per_update -- how many dataset rows one optimiser
     # update consumes -- is defined for --tiny too, for Pass1CheckpointCallback.
+    # PartialState() needs no trainer or model instance, so it (and everything
+    # below through _check_dataset_size) reads before the model/tokenizer load.
     num_processes = PartialState().num_processes
     if args.tiny:
         gradient_accumulation_steps = 1
@@ -261,6 +254,9 @@ def main() -> None:
             f"per_device_train_batch_size ({per_device_batch}) * num_processes ({num_processes})"
         )
     prompts_per_update = num_processes * gradient_accumulation_steps
+    # Moved ahead of the model/tokenizer load (design 2026-09-04): a dataset
+    # too small for one optimizer update now fails within seconds instead of
+    # after the policy model download/load.
     _check_dataset_size(len(rows), prompts_per_update)
     if subset_path:
         _report_subset_prompts_per_update(len(rows), prompts_per_update)
@@ -270,6 +266,15 @@ def main() -> None:
             f"(num_processes={num_processes}, per_device_train_batch_size={per_device_batch}) "
             f"-> {prompts_per_update} prompt(s) per optimizer update"
         )
+
+    model, tokenizer = _tiny_model_and_tokenizer() if args.tiny else _real_model_and_tokenizer(model_name)
+    lora_config = LoraConfig(
+        r=config.LORA_R,
+        lora_alpha=config.LORA_ALPHA,
+        lora_dropout=config.LORA_DROPOUT,
+        target_modules=list(config.LORA_TARGET_MODULES),
+        task_type="CAUSAL_LM",
+    )
 
     judge_mode = config.env("RUN_JUDGE_MODE", getattr(config, "JUDGE_MODE_DEFAULT", "batched"))
     # Same resolution formula as conpo/judge.py:build_judge itself, only for

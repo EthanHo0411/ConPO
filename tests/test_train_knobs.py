@@ -198,3 +198,41 @@ def test_main_tiny_raises_when_run_limit_below_prompts_per_update(
     assert "0" in message
     assert "1" in message  # prompts_per_update on a single CPU process
     assert not (out_dir / "run_metadata.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# scripts/train.py: main() must raise the guard before loading any model or
+# tokenizer (design 2026-09-04, from the RTX 5060 smoke on 2026-09-03 where a
+# wrong RUN_LIMIT was reported only after a 56-minute Qwen3-4B download/load)
+# ---------------------------------------------------------------------------
+
+
+def test_main_raises_before_loading_model_or_tokenizer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=1)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    def _fail_loader(*args: object, **kwargs: object) -> tuple[object, object]:
+        raise AssertionError("model loaded before the guard")
+
+    monkeypatch.setattr(train_script, "_real_model_and_tokenizer", _fail_loader)
+    monkeypatch.setattr(train_script, "_tiny_model_and_tokenizer", _fail_loader)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setattr(sys, "argv", ["train.py"])  # non-tiny: prompts_per_update=16 (8 * 128 // 8)
+
+    with pytest.raises(SystemExit) as exc_info:
+        train_script.main()
+
+    message = str(exc_info.value)
+    assert "dataset_size (1)" in message
+    assert "prompts_per_update (16)" in message
+    assert "RUN_LIMIT" in message
+    assert not (out_dir / "run_metadata.json").exists()
