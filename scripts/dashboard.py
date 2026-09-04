@@ -1,5 +1,10 @@
 """Build the central runs dashboard from per-run HackMD cards.
 
+``## 0. Shared configuration`` (USER DECISION 2026-09-03, see build_configuration_section)
+renders the training and data/evaluation setup common to every run, straight
+from ``conpo/conpo/config.py`` and the 15k subset manifest, ahead of the
+per-card sections below.
+
 Reads every ``*.md`` card in a cards directory (``README.md`` excluded),
 parses the front-matter contract each card starts with (a ``---`` line, one
 ``key: value`` line per contract key, a closing ``---`` line), and writes
@@ -71,8 +76,9 @@ import re
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from conpo import config as cfg
 from conpo.arms import HYPOTHESES, Hypothesis
 from conpo.stats import mean_std, paired_bootstrap_diff, wilson_interval
 
@@ -80,6 +86,15 @@ from conpo.stats import mean_std, paired_bootstrap_diff, wilson_interval
 # conpo -> reserch2) -- the base a card's repo-relative "eval_dir" field
 # resolves against (same convention as scripts/run_card.py's eval_dir_str).
 _RESERCH2_ROOT = Path(__file__).resolve().parent.parent.parent
+_CONPO_REPO_ROOT = _RESERCH2_ROOT / "conpo"
+
+# Default 15k subset manifest (USER DECISION 2026-09-03: the dashboard
+# carries run configuration on its own, section 0 below) -- overridable via
+# render_dashboard's manifest_path for tests.
+SUBSET_MANIFEST_PATH = _CONPO_REPO_ROOT / "subsets" / "train_15000_seed42.manifest.json"
+# The subset keys file the manifest describes; only its path is quoted here
+# (the manifest carries the sha256, not this file directly).
+SUBSET_KEYS_PATH_STR = "conpo/subsets/train_15000_seed42.keys"
 
 CARD_KEYS: tuple[str, ...] = (
     "run_id",
@@ -322,6 +337,156 @@ def build_seed_summary_row(same_arm_cards: list[dict[str, str]]) -> str | None:
         "-",
     ]
     return "| " + " | ".join(row) + " |"
+
+
+# --- ## 0. Shared configuration ---------------------------------------------
+#
+# USER DECISION 2026-09-03: the dashboard is the note teammates read, so it
+# must carry run configuration (model, dataset, hyperparameters) on its own
+# rather than only in per-run cards. This section renders it from
+# conpo/conpo/config.py and the 15k subset manifest at generation time. A
+# value config.py or the manifest does not define renders "pending", never
+# invented.
+
+_SPLIT_ORDER: tuple[str, ...] = ("train", "dev", "eval_i", "eval_ii", "eval_iii")
+
+
+def load_manifest(manifest_path: Path) -> dict[str, Any] | None:
+    """The 15k subset manifest's parsed JSON, or None when it is not on disk."""
+    if not manifest_path.is_file():
+        return None
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def format_subset_sha256(manifest: dict[str, Any] | None) -> str:
+    if manifest is None:
+        return PENDING
+    return str(manifest.get("keys_sha256", PENDING))
+
+
+def format_per_count_sizes(manifest: dict[str, Any] | None) -> str:
+    counts = manifest.get("per_count_sizes") if manifest else None
+    if not counts:
+        return PENDING
+    return ", ".join(f"{k}={v:,}" for k, v in sorted(counts.items(), key=lambda kv: int(kv[0])))
+
+
+def format_split_sizes(manifest: dict[str, Any] | None) -> str:
+    sizes = manifest.get("source_manifest_split_sizes") if manifest else None
+    if not sizes:
+        return PENDING
+    return " / ".join(f"{split} {sizes[split]:,}" for split in _SPLIT_ORDER if split in sizes)
+
+
+def _cfg_row(*attrs: str, render: Callable[..., str]) -> str:
+    """`render(*values)` from named `cfg` attributes, or "pending" if any is undefined.
+
+    Mirrors the veto-period pattern above, applied uniformly so a config.py
+    that drops or renames a constant renders one "pending" cell instead of
+    crashing dashboard regeneration.
+    """
+    values = [getattr(cfg, name, None) for name in attrs]
+    if any(v is None for v in values):
+        return PENDING
+    return render(*values)
+
+
+def build_training_table() -> list[str]:
+    veto_period = getattr(cfg, "VETO_PERIOD_K", None)
+    veto_row = str(veto_period) if veto_period is not None else "batched veto, K pending"
+    rows = [
+        ("policy model", _cfg_row("POLICY_MODEL", render=lambda v: f"{v} (non-thinking)")),
+        (
+            "LoRA",
+            _cfg_row(
+                "LORA_R",
+                "LORA_ALPHA",
+                "LORA_DROPOUT",
+                "LORA_TARGET_MODULES",
+                render=lambda r, a, d, t: f"r={r} alpha={a} dropout={d} targets={','.join(t)}",
+            ),
+        ),
+        ("G", _cfg_row("NUM_GENERATIONS", render=str)),
+        ("temperature", _cfg_row("TEMPERATURE", render=str)),
+        ("top-p", _cfg_row("TOP_P", render=str)),
+        (
+            "max completion / prompt tokens",
+            _cfg_row(
+                "MAX_COMPLETION_TOKENS",
+                "MAX_PROMPT_TOKENS",
+                render=lambda c, p: f"{c} / {p}",
+            ),
+        ),
+        ("max_model_len", _cfg_row("MAX_MODEL_LEN", render=str)),
+        (
+            "optimiser",
+            _cfg_row(
+                "LR",
+                "WARMUP_RATIO",
+                "LR_SCHEDULER",
+                "MAX_GRAD_NORM",
+                render=lambda lr, warmup, sched, clip: (
+                    f"AdamW, LR {lr:g}, warm-up ratio {warmup}, {sched} scheduler, grad clip {clip}"
+                ),
+            ),
+        ),
+        ("effective batch", _cfg_row("EFFECTIVE_BATCH", render=str)),
+        ("loss_type", _cfg_row("LOSS_TYPE", render=str)),
+        ("KL beta", _cfg_row("KL_BETA", render=str)),
+        (
+            "repair caps",
+            _cfg_row(
+                "MAX_CANDIDATES",
+                "MAX_STEPS",
+                render=lambda cands, steps: f"{cands} candidates x {steps} steps",
+            ),
+        ),
+        (
+            "edge buffer",
+            _cfg_row(
+                "BUFFER_SIZE",
+                "BUFFER_AGE_CAP",
+                render=lambda size, cap: f"size {size}, age cap {cap}",
+            ),
+        ),
+        ("judge model", _cfg_row("JUDGE_MODEL", render=str)),
+        ("veto period K", veto_row),
+    ]
+    lines = ["### Training", "", "| setting | value |", "|---|---|"]
+    lines.extend(f"| {name} | {value} |" for name, value in rows)
+    lines.append("")
+    return lines
+
+
+def build_data_and_evaluation_table(manifest: dict[str, Any] | None) -> list[str]:
+    rows = [
+        ("pool dataset", _cfg_row("POOL_DATASET", render=str)),
+        ("15k subset path", SUBSET_KEYS_PATH_STR),
+        ("15k subset sha256", format_subset_sha256(manifest)),
+        ("per-constraint-count sizes", format_per_count_sizes(manifest)),
+        ("split sizes", format_split_sizes(manifest)),
+    ]
+    lines = ["### Data and evaluation", "", "| setting | value |", "|---|---|"]
+    lines.extend(f"| {name} | {value} |" for name, value in rows)
+    lines += [
+        "",
+        "Eval protocol: IFEval 541 and IFBench_test 300 at temperature 0, max new tokens 2048, "
+        "thinking off, no system prompt; internal PAcc on the three splits; retention suite GSM8K, "
+        "MMLU, BBH, AlpacaEval 2 on the headline pair and the untrained policy.",
+        "",
+        "Token-budget rule: ConPO's single pass over the subset, measured at M0; IF-RLVR first-pass "
+        "checkpoint plus token-matched run.",
+        "",
+    ]
+    return lines
+
+
+def build_configuration_section(manifest_path: Path) -> list[str]:
+    manifest = load_manifest(manifest_path)
+    lines = ["## 0. Shared configuration", ""]
+    lines += build_training_table()
+    lines += build_data_and_evaluation_table(manifest)
+    return lines
 
 
 def build_runs_section(train_cards: list[dict[str, str]]) -> list[str]:
@@ -638,7 +803,7 @@ def build_statistics_section() -> list[str]:
     ]
 
 
-def render_dashboard(cards: list[dict[str, str]], as_of: str) -> str:
+def render_dashboard(cards: list[dict[str, str]], as_of: str, manifest_path: Path | None = None) -> str:
     train_cards = [c for c in cards if c["kind"] == "train"]
     eval_cards = [c for c in cards if c["kind"] == "eval"]
     lines = [
@@ -648,6 +813,7 @@ def render_dashboard(cards: list[dict[str, str]], as_of: str) -> str:
         "Hours are H100-hours; days are on 2x H100 with the batched veto.",
         "",
     ]
+    lines += build_configuration_section(manifest_path if manifest_path is not None else SUBSET_MANIFEST_PATH)
     lines += build_runs_section(train_cards)
     lines += build_hypotheses_section(train_cards)
     lines += build_eval_section(eval_cards)

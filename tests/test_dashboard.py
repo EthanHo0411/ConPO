@@ -15,9 +15,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import dashboard  # noqa: E402
+from conpo import config as cfg  # noqa: E402
 
 _REPO_ROOT = Path(__file__).parent.parent
 _SCRIPT = _REPO_ROOT / "scripts" / "dashboard.py"
+_REAL_MANIFEST = _REPO_ROOT / "subsets" / "train_15000_seed42.manifest.json"
 
 # Style contract (USER DECISIONS 2026-09-03): no em dashes, no filler words.
 _FILLER_WORDS = ("just", "really", "basically", "actually", "simply", "very")
@@ -235,6 +237,59 @@ def test_blocks_appear_in_order(cards_dir: Path) -> None:
     order = ["### hub", "### H1", "### H1 attribution", "### H6"]
     positions = [out.index(marker) for marker in order]
     assert positions == sorted(positions)
+
+
+# --- ## 0. Shared configuration -----------------------------------------------
+
+
+def test_shared_configuration_before_runs_section(cards_dir: Path) -> None:
+    cards = dashboard.load_cards(cards_dir)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    assert out.index("## 0. Shared configuration") < out.index("## 1. Runs")
+
+
+def test_shared_configuration_carries_lora_r_and_subset_sha256(cards_dir: Path) -> None:
+    cards = dashboard.load_cards(cards_dir)
+    out = dashboard.render_dashboard(cards, "2026-09-03", manifest_path=_REAL_MANIFEST)
+    section = out.split("## 0. Shared configuration", 1)[1].split("## 1. Runs", 1)[0]
+    assert f"r={cfg.LORA_R}" in section
+    assert "5ca2a257df8b5d10a88cfa16ea4ddb351d0b0b3ec7c62529dcd6435c9697e2e5" in section
+
+
+def test_shared_configuration_missing_manifest_renders_pending(cards_dir: Path, tmp_path: Path) -> None:
+    cards = dashboard.load_cards(cards_dir)
+    missing = tmp_path / "does_not_exist.manifest.json"
+    out = dashboard.render_dashboard(cards, "2026-09-03", manifest_path=missing)
+    section = out.split("## 0. Shared configuration", 1)[1].split("## 1. Runs", 1)[0]
+    assert "pending" in section
+    assert "5ca2a257df8b5d10a88cfa16ea4ddb351d0b0b3ec7c62529dcd6435c9697e2e5" not in section
+
+
+def test_shared_configuration_missing_config_attr_renders_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(cfg, "POLICY_MODEL")
+    rows = dashboard.build_training_table()
+    assert "| policy model | pending |" in rows
+    # Every other row still renders its real value; one missing attribute
+    # does not blank out the rest of the table.
+    assert any(f"r={cfg.LORA_R}" in row for row in rows)
+
+
+def test_shared_configuration_per_count_sizes_uses_thousands_separator(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "counts.manifest.json"
+    manifest_path.write_text(json.dumps({"per_count_sizes": {"1": 4072, "2": 1234}}), encoding="utf-8")
+    manifest = dashboard.load_manifest(manifest_path)
+    assert dashboard.format_per_count_sizes(manifest) == "1=4,072, 2=1,234"
+
+
+def test_shared_configuration_regeneration_idempotent(cards_dir: Path) -> None:
+    cards = dashboard.load_cards(cards_dir)
+    first = dashboard.render_dashboard(cards, "2026-09-03", manifest_path=_REAL_MANIFEST)
+    second = dashboard.render_dashboard(cards, "2026-09-03", manifest_path=_REAL_MANIFEST)
+    assert first == second
 
 
 # --- Delta [95% CI] / Verdict from synthetic per-prompt verdict files ------------
