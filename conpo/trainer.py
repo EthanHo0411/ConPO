@@ -38,11 +38,30 @@ from conpo import config, forward, losses, prompts, reverse, selection
 from conpo.arms import ArmSpec, Overrides
 from conpo.compositor import PairStats
 from conpo.data import PoolRow, TokenMeter
+from conpo.distance import token_distance
 from conpo.edges import Edge, EdgeBuffer, FeasibleBuffer
 from conpo.engine import Engine
 from conpo.judge import PendingPair, PendingQueue, Verdict, VetoRequest, strip_think
 from conpo.selection import FamilyStats
 from conpo.verifiers import feasible, verifier_vector
+
+
+# Design 2026-09-04, item 3: at most this many judged pairs per burst get a
+# raw-reply sample written to RUN_OUT_DIR/judge_replies.jsonl -- a sample for
+# eyeballing judge behaviour, not a full audit log of every verdict.
+JUDGE_REPLY_DUMP_PER_BURST = 8
+
+
+def _pair_edit_distance(pair: PendingPair) -> float:
+    """token_distance(y_plus, y_minus) for one pending pair, at flush time
+    (design 2026-09-04, item 4): forward.py and reverse.py always stamp
+    `edge.meta["distance"]` at construction, so that cached value is used
+    when present; a pair without one (defensive -- no current producer
+    omits it) falls back to computing it fresh from the request text."""
+    stored = pair.edge.meta.get("distance")
+    if isinstance(stored, (int, float)):
+        return float(stored)
+    return token_distance(pair.request.y_plus, pair.request.y_minus)
 
 
 class _QueueingVetoCollector:
@@ -83,7 +102,9 @@ class _QueueingVetoCollector:
 
     def veto(self, req: VetoRequest) -> Verdict:
         self.captured.append(req)
-        return Verdict(keep=True, reason="pending_veto", raw="")
+        # A placeholder, not a parse of anything, so parse_ok is True
+        # regardless (design 2026-09-04, same convention as StaticJudge).
+        return Verdict(keep=True, reason="pending_veto", raw="", parse_ok=True)
 
     def veto_many(self, reqs: Sequence[VetoRequest]) -> list[Verdict]:
         return [self.veto(r) for r in reqs]
@@ -212,10 +233,12 @@ class ConPOTrainer(GRPOTrainer):
         # `pair_stats` parameter treats None as "never attempt a multi-family
         # draw", so every other arm/override combination is unaffected.
         # `out_dir` (RUN_OUT_DIR) is optional so tests that never touch
-        # multi-family edges need not pass one -- save_pair_stats is then a
-        # no-op instead of raising.
+        # multi-family edges or the judge-reply dump need not pass one --
+        # save_pair_stats and _dump_judge_replies are then no-ops instead of
+        # raising.
+        self.out_dir: Path | None = Path(out_dir) if out_dir is not None else None
         self.pair_stats: PairStats | None = PairStats() if self.overrides.multi else None
-        self._pair_stats_path: Path | None = Path(out_dir) / "pair_stats.json" if out_dir is not None else None
+        self._pair_stats_path: Path | None = self.out_dir / "pair_stats.json" if self.out_dir is not None else None
         if self.pair_stats is not None and self._pair_stats_path is not None and self._pair_stats_path.exists():
             self.pair_stats.load(self._pair_stats_path)
         # Cumulative reverse-edge / multi-reverse-edge admission counts
@@ -563,6 +586,10 @@ class ConPOTrainer(GRPOTrainer):
 
         pairs = self.pending_queue.drain()
         requests = [p.request for p in pairs]
+        # Item 4 fix (design 2026-09-04): every pair judged in this burst
+        # gets an edit distance, kept or rejected -- see burst_mean_edit_distance
+        # below for why averaging kept edges alone was wrong.
+        distances = [_pair_edit_distance(p) for p in pairs]
 
         t0 = time.perf_counter()
         slept = self._sleep_engine_if_enabled()
@@ -570,10 +597,17 @@ class ConPOTrainer(GRPOTrainer):
         if slept:
             self._wake_engine()
         burst_seconds = time.perf_counter() - t0
+        self._dump_judge_replies(pairs, verdicts)
 
         kept: Counter[str] = Counter()
         rejected: Counter[str] = Counter()
-        kept_distances: list[float] = []
+        # parse_failures (design 2026-09-04, item 2): counted separately from
+        # rejected -- a parse failure always also counts as a rejected pair
+        # (fail-closed), so burst_rejected_* keeps meaning "all rejections"
+        # for any old reader, while these new counters isolate how many of
+        # them were "the judge's reply never parsed" instead of "the judge
+        # said this pair is degenerate".
+        parse_failures: Counter[str] = Counter()
         unwrapped = self.accelerator.unwrap_model(self.model)
         with torch.no_grad(), unwrapped.disable_adapter():
             for pair, verdict in zip(pairs, verdicts):
@@ -581,12 +615,13 @@ class ConPOTrainer(GRPOTrainer):
                 # tracker (if any) whichever way the verdict fell, before the
                 # early-continue below -- a reject must kill the tracker too.
                 self._resolve_feasible_tracker(pair.edge, verdict.keep)
+                if not verdict.parse_ok:
+                    parse_failures[pair.direction] += 1
                 if not verdict.keep:
                     rejected[pair.direction] += 1
                     continue
                 kept[pair.direction] += 1
                 edge = pair.edge
-                kept_distances.append(float(edge.meta.get("distance", 0.0)))
                 logp_plus, len_plus = score_response(unwrapped, self.processing_class, edge.prompt, edge.y_plus)
                 logp_minus, len_minus = score_response(unwrapped, self.processing_class, edge.prompt, edge.y_minus)
                 scored_edge = dataclasses.replace(
@@ -620,17 +655,48 @@ class ConPOTrainer(GRPOTrainer):
             "burst_kept_reverse": kept["reverse"],
             "burst_rejected_forward": rejected["forward"],
             "burst_rejected_reverse": rejected["reverse"],
+            "burst_parse_failures_forward": parse_failures["forward"],
+            "burst_parse_failures_reverse": parse_failures["reverse"],
             "veto_rate_forward": veto_rate("forward"),
             "veto_rate_reverse": veto_rate("reverse"),
             # Round2 finding 2: the per-step record's mean_edit_distance is
             # only ever real under the no-veto ablation (see the comment in
             # _generate_and_score_completions); this is its batched-path
-            # equivalent, computed from the same edge.meta["distance"] the
-            # per-step version reads, over this burst's kept edges alone.
-            "burst_mean_edit_distance": (sum(kept_distances) / len(kept_distances)) if kept_distances else 0.0,
+            # equivalent. Item 4 fix (design 2026-09-04): averaged over every
+            # pair judged this burst, instead of only the ones the judge
+            # kept -- a burst that rejects everything still has nonzero
+            # distances to report; averaging kept edges alone read 0.0 in
+            # that case, indistinguishable from "measured zero".
+            "burst_mean_edit_distance": (sum(distances) / len(distances)) if distances else 0.0,
         }
         with open(self.mechanism_log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
+
+    def _dump_judge_replies(self, pairs: Sequence[PendingPair], verdicts: Sequence[Verdict]) -> None:
+        """Append the first JUDGE_REPLY_DUMP_PER_BURST judged pairs of this
+        burst to `<out_dir>/judge_replies.jsonl` (design 2026-09-04, item 3):
+        a raw-reply sample for eyeballing judge behaviour on a small judge
+        model, not a full audit log of every verdict. No-op when `out_dir`
+        was never given to the constructor.
+        """
+        if self.out_dir is None:
+            return
+        path = self.out_dir / "judge_replies.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for pair, verdict in zip(pairs[:JUDGE_REPLY_DUMP_PER_BURST], verdicts[:JUDGE_REPLY_DUMP_PER_BURST]):
+                record = {
+                    "step": self.state.global_step,
+                    "direction": pair.direction,
+                    "families": list(pair.request.families),
+                    "keep": verdict.keep,
+                    "parse_ok": verdict.parse_ok,
+                    "raw": verdict.raw,
+                    "prompt_chars": len(pair.request.prompt),
+                    "y_plus_chars": len(pair.request.y_plus),
+                    "y_minus_chars": len(pair.request.y_minus),
+                }
+                f.write(json.dumps(record) + "\n")
 
     def _sleep_engine_if_enabled(self) -> bool:
         """True iff RUN_USE_VLLM=1, args.vllm_enable_sleep_mode is on, and

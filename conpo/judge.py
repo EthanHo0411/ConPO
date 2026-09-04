@@ -166,11 +166,21 @@ class VetoRequest:
 
 @dataclass(frozen=True)
 class Verdict:
-    """keep = not degenerate; the veto only discards, never relabels."""
+    """keep = not degenerate; the veto only discards, never relabels.
+
+    parse_ok is True when `raw` parsed into the expected JSON verdict and
+    False when it did not and the judge fell back to a fail-closed reject
+    (design 2026-09-04): with a small judge model, an unparseable reply is
+    common, and a caller that only reads `keep` cannot tell that rejection
+    apart from a real "this pair is degenerate" verdict. `raw` is always
+    truncated to _MAX_RAW_CHARS so a long reply never bloats the mechanism
+    log or judge_replies.jsonl.
+    """
 
     keep: bool
     reason: str
     raw: str
+    parse_ok: bool
 
 
 def _prompt_seed(req: VetoRequest) -> int:
@@ -216,13 +226,17 @@ def build_veto_prompt(req: VetoRequest) -> str:
     )
 
 
+_MAX_RAW_CHARS = 500
+
+
 def parse_verdict(raw: str) -> Verdict:
     """Parse a judge reply into a Verdict.
 
     Strips a leading think block, then scans for the first JSON object
     anywhere in the remaining text, tolerating surrounding prose. Raises
     ValueError when no JSON object is found or the "degenerate" key is
-    missing.
+    missing; a caller that wants a fail-closed Verdict instead of that
+    exception uses `_fail_closed_verdict(raw)` (design 2026-09-04).
     """
     text = strip_think(raw)
     decoder = json.JSONDecoder()
@@ -243,7 +257,16 @@ def parse_verdict(raw: str) -> Verdict:
         raise ValueError(f"judge JSON missing 'degenerate' key: {obj!r}")
     degenerate = bool(obj["degenerate"])
     reason = str(obj.get("reason", ""))
-    return Verdict(keep=not degenerate, reason=reason, raw=raw)
+    return Verdict(keep=not degenerate, reason=reason, raw=raw[:_MAX_RAW_CHARS], parse_ok=True)
+
+
+def _fail_closed_verdict(raw: str) -> Verdict:
+    """The Verdict every judge falls back to when `parse_verdict(raw)` raises:
+    reject (never a silent keep), with parse_ok=False so a caller can tell
+    this apart from a real "degenerate" rejection (design 2026-09-04)."""
+    return Verdict(
+        keep=False, reason="judge reply did not parse (fail-closed)", raw=raw[:_MAX_RAW_CHARS], parse_ok=False
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +319,15 @@ class HttpJudge:
             model=self.model,
             structured_outputs={"json": _VETO_SCHEMA},
         )
-        verdict = parse_verdict(raw)
+        # Fail closed on an unparseable reply, same convention as
+        # VLLMBatchedJudge/HFBatchedJudge (design 2026-09-04): a transport
+        # failure (chat() raising on a non-200 response or a missing
+        # `content` field) still raises, unchanged -- only a reply that
+        # arrived but did not parse falls back to a reject.
+        try:
+            verdict = parse_verdict(raw)
+        except ValueError:
+            verdict = _fail_closed_verdict(raw)
         self.counts["keep" if verdict.keep else "discard"] += 1
         return verdict
 
@@ -325,7 +356,9 @@ class StaticJudge:
         self.counts: Counter[str] = Counter()
 
     def veto(self, req: VetoRequest) -> Verdict:
-        verdict = Verdict(keep=self.keep, reason="StaticJudge", raw="")
+        # Nothing is parsed here, so this is never a parse failure: parse_ok
+        # is True regardless of self.keep (design 2026-09-04).
+        verdict = Verdict(keep=self.keep, reason="StaticJudge", raw="", parse_ok=True)
         self.counts["keep" if verdict.keep else "discard"] += 1
         return verdict
 
@@ -466,7 +499,7 @@ class VLLMBatchedJudge:
                 try:
                     verdict = parse_verdict(raw)
                 except ValueError:
-                    verdict = Verdict(keep=False, reason="judge reply did not parse (fail-closed)", raw=raw)
+                    verdict = _fail_closed_verdict(raw)
                 verdicts.append(verdict)
                 self.counts["keep" if verdict.keep else "discard"] += 1
             return verdicts
@@ -547,7 +580,7 @@ class HFBatchedJudge:
                     try:
                         verdict = parse_verdict(raw)
                     except ValueError:
-                        verdict = Verdict(keep=False, reason="judge reply did not parse (fail-closed)", raw=raw)
+                        verdict = _fail_closed_verdict(raw)
                     verdicts.append(verdict)
                     self.counts["keep" if verdict.keep else "discard"] += 1
         finally:

@@ -47,6 +47,18 @@ def test_parse_verdict_missing_key_raises() -> None:
         judge.parse_verdict('{"reason": "no degenerate key here"}')
 
 
+def test_parse_verdict_sets_parse_ok_true() -> None:
+    v = judge.parse_verdict('{"degenerate": false, "reason": "fine"}')
+    assert v.parse_ok is True
+
+
+def test_parse_verdict_truncates_raw_to_500_chars() -> None:
+    long_raw = '{"degenerate": false, "reason": "fine"}' + "x" * 600
+    v = judge.parse_verdict(long_raw)
+    assert len(v.raw) == 500
+    assert v.raw == long_raw[:500]
+
+
 # ---------------------------------------------------------------------------
 # build_veto_prompt
 # ---------------------------------------------------------------------------
@@ -115,6 +127,7 @@ def test_static_judge_keep_true() -> None:
     j = judge.StaticJudge(keep=True)
     v = j.veto(_req())
     assert v.keep is True
+    assert v.parse_ok is True
     assert j.counts["keep"] == 1
     assert j.counts["discard"] == 0
 
@@ -209,6 +222,7 @@ def test_http_judge_end_to_end_keep() -> None:
         v = j.veto(_req())
         assert v.keep is True
         assert v.reason == "looks fine"
+        assert v.parse_ok is True
         assert j.counts["keep"] == 1
 
 
@@ -227,6 +241,19 @@ def test_http_judge_veto_many_sequential() -> None:
         assert len(verdicts) == 3
         assert all(v.keep for v in verdicts)
         assert j.counts["keep"] == 3
+
+
+def test_http_judge_fails_closed_on_unparseable_reply() -> None:
+    """A reply that arrives (200 OK) but never parses into the veto JSON --
+    the common failure with a small judge model -- must reject rather than
+    raise, with parse_ok=False marking it apart from a real rejection."""
+    with _stub_server("not valid json at all") as base:
+        j = judge.HttpJudge(base)
+        v = j.veto(_req())
+        assert v.keep is False
+        assert v.parse_ok is False
+        assert j.counts["discard"] == 1
+        assert j.counts["keep"] == 0
 
 
 def test_http_judge_fail_loud_on_server_error() -> None:

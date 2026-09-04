@@ -154,6 +154,8 @@ def test_hf_batched_judge_fails_closed_on_garbage_and_counts_it(tiny_model_dir: 
     verdicts = hfj.veto_many([_req(), _req()])
     assert all(v.keep is False for v in verdicts)
     assert all("fail-closed" in v.reason for v in verdicts)
+    assert all(v.parse_ok is False for v in verdicts)
+    assert all(len(v.raw) <= 500 for v in verdicts)
     assert hfj.counts["discard"] == 2
 
 
@@ -264,10 +266,44 @@ def test_vllm_batched_judge_uses_structured_outputs_not_guided_decoding(
 
     assert len(verdicts) == 1
     assert verdicts[0].keep is True
+    assert verdicts[0].parse_ok is True
     sampling = _FakeVLLM_LLM.last_sampling_params
     assert "structured_outputs" in sampling.kwargs
     assert isinstance(sampling.kwargs["structured_outputs"], _FakeStructuredOutputsParams)
     assert "guided_decoding" not in sampling.kwargs
+
+
+class _FakeVLLM_LLM_Garbage:
+    """Stands in for vllm.LLM answering with a reply that never parses, the
+    shape a small judge model produces often (design 2026-09-04)."""
+
+    def __init__(self, **kwargs: object) -> None:
+        self.kwargs = kwargs
+
+    def chat(self, messages_batch, sampling_params, chat_template_kwargs=None):  # type: ignore[no-untyped-def]
+        return [_FakeLLMOutput("not json at all") for _ in messages_batch]
+
+
+def test_vllm_batched_judge_fails_closed_on_garbage_and_sets_parse_ok_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_sampling_params_mod = types.ModuleType("vllm.sampling_params")
+    fake_sampling_params_mod.StructuredOutputsParams = _FakeStructuredOutputsParams  # type: ignore[attr-defined]
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = _FakeVLLM_LLM_Garbage  # type: ignore[attr-defined]
+    fake_vllm.SamplingParams = _FakeSamplingParams  # type: ignore[attr-defined]
+    fake_vllm.sampling_params = fake_sampling_params_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", fake_sampling_params_mod)
+
+    j = judge.VLLMBatchedJudge("some/judge-model")
+    verdicts = j.veto_many([_req()])
+
+    assert len(verdicts) == 1
+    assert verdicts[0].keep is False
+    assert verdicts[0].parse_ok is False
+    assert "fail-closed" in verdicts[0].reason
+    assert j.counts["discard"] == 1
 
 
 class _RaisingFakeLLM:
