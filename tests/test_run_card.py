@@ -485,7 +485,7 @@ def test_planned_h6_multi_is_planned(tmp_path: Path) -> None:
     text = (out_dir / "h6_multi_s42.md").read_text(encoding="utf-8")
     assert "status: planned" in text
     assert "RUN_MULTI=1" in text
-    assert "RUN_MULTI lands with H6 part B" in text
+    assert "H6: RUN_MULTI=1 built 2026-09-03 (compositor, multi-family edges)" in text
 
 
 def test_planned_out_defaults_to_hackmd_runs_next_to_repo() -> None:

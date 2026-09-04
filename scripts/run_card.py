@@ -162,7 +162,7 @@ PLANNED_RUNS: tuple[CardPlan, ...] = (
     ),
     CardPlan(
         "h6_multi_s42", "train", "full", {"RUN_MULTI": "1"}, "H6", ("H6",), POLICY_MODEL, "42", "planned", 18.0,
-        detail="RUN_MULTI lands with H6 part B",
+        detail="H6: RUN_MULTI=1 built 2026-09-03 (compositor, multi-family edges)",
     ),
     CardPlan(
         "edge_dpo_s42", "train", "edge_dpo", {}, "objective control", ("objective_isolation_edge_dpo",),

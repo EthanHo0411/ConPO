@@ -168,16 +168,20 @@ HYPOTHESES: tuple[Hypothesis, ...] = (
     # buffer, isolating ConPO's contrastive objective from its
     # counterfactual-construction machinery (same edges, different training).
     Hypothesis("objective_isolation_edge_dpo", "full", "edge_dpo", "ifbench_prompt_loose", ">"),
-    # H6 (multi-constraint compositional generalisation, RUN_ARM=full
-    # RUN_MULTI=1 vs full) is deliberately NOT registered here, though its
-    # arm-level mechanism (Overrides.multi, this module's resolve_arm;
-    # conpo/compositor.py, conpo/reverse.py, conpo/trainer.py) is fully
-    # built (H6 part B, design 2026-09-04): scripts/dashboard.py synthesizes
-    # its own H6 row (covered_hypothesis_numbers/build_deferred_hypothesis_
-    # rows) precisely because no "H6*" id exists in this tuple --
-    # tests/test_dashboard.py:test_h6_row_synthesized_h1_to_h5_unchanged
-    # locks that behaviour, and dashboard.py/its tests are a separate
-    # workflow's files, out of scope for this change. Adding an "H6*"
-    # Hypothesis here would silently break that test via
-    # covered_hypothesis_numbers' `re.match(r"H\d+", h.id)` scan.
+    # H6 (multi-constraint compositional generalisation, design 2026-09-03:
+    # H6 is a built arm): full with RUN_MULTI=1 (Overrides.multi, this
+    # module's resolve_arm; conpo/compositor.py, conpo/reverse.py,
+    # conpo/trainer.py) vs full, no overrides. "full:multi=1" is the same
+    # "arm:field=value" identifier convention H4/H5 use against `full`
+    # itself (see resolve_arm's Overrides field names). The metric string
+    # names both PAcc splits the plan's H6 row reads (eval_ii and eval_iii)
+    # while staying parseable by scripts/analyze.py's _parse_metric (a
+    # "<source>_prompt_strict"/"<source>_prompt_loose" suffix, same as
+    # every other row's placeholder metric field) -- scripts/dashboard.py
+    # derives the real per-split metric from the id's H6 prefix instead
+    # (pacc_eval_iii for the Delta/Verdict cells, eval_iii being the harder
+    # split; "PAcc eval_ii, eval_iii" for the Metric column), the same
+    # pattern it already uses for H2-H5 (see dashboard.py's
+    # hypothesis_metric/hypothesis_metric_display).
+    Hypothesis("H6_multi", "full:multi=1", "full", "pacc_eval_ii_and_pacc_eval_iii_prompt_loose", ">"),
 )

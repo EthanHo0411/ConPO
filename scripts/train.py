@@ -89,6 +89,41 @@ def _report_subset_prompts_per_update(dataset_size: int, prompts_per_update: int
         )
 
 
+def _run_shape(tiny: bool) -> tuple[int, int, int]:
+    """(num_generations, max_completion_length, effective_batch) for one run.
+
+    --tiny shrinks generation shape for a fast CPU smoke test and ignores
+    every override below. Otherwise RUN_NUM_GENERATIONS/
+    RUN_MAX_COMPLETION_TOKENS/RUN_EFFECTIVE_BATCH (smoke and shape tests
+    only, design 2026-09-04: cluster runs never set them) override
+    config.py's NUM_GENERATIONS/MAX_COMPLETION_TOKENS/EFFECTIVE_BATCH so a
+    real-model dry run fits a small GPU.
+    """
+    if tiny:
+        return 2, 16, config.EFFECTIVE_BATCH
+    num_generations = int(config.env("RUN_NUM_GENERATIONS", str(config.NUM_GENERATIONS)))
+    max_completion_length = int(config.env("RUN_MAX_COMPLETION_TOKENS", str(config.MAX_COMPLETION_TOKENS)))
+    effective_batch = int(config.env("RUN_EFFECTIVE_BATCH", str(config.EFFECTIVE_BATCH)))
+    return num_generations, max_completion_length, effective_batch
+
+
+def _check_dataset_size(dataset_size: int, prompts_per_update: int) -> None:
+    """Fail loud (design 2026-09-04) instead of silently training nothing.
+
+    TRL's RepeatSampler (trl/trainer/utils.py) never emits a batch shorter
+    than prompts_per_update, so a dataset smaller than that drops every row
+    on every epoch -- the RUN_LIMIT=8 / prompts_per_update=16 case where
+    scripts/train.py still printed "done: N step(s)" with zero rows trained.
+    """
+    if dataset_size < prompts_per_update:
+        raise SystemExit(
+            f"dataset_size ({dataset_size}) is smaller than prompts_per_update ({prompts_per_update}); "
+            "TRL's RepeatSampler would drop every row every epoch and train nothing. Raise RUN_LIMIT to "
+            f"at least {prompts_per_update}, or lower RUN_EFFECTIVE_BATCH so prompts_per_update <= "
+            f"dataset_size ({dataset_size})."
+        )
+
+
 def _tiny_model_and_tokenizer() -> tuple[torch.nn.Module, AutoTokenizer]:
     tokenizer = AutoTokenizer.from_pretrained(config.POLICY_MODEL)
     cfg = Qwen3Config(
@@ -202,20 +237,17 @@ def main() -> None:
         task_type="CAUSAL_LM",
     )
 
-    # --tiny shrinks generation shape too, so a smoke test stays fast; the
-    # real run uses the paper's own sampling shape from config.py.
-    num_generations = 2 if args.tiny else config.NUM_GENERATIONS
-    max_completion_length = 16 if args.tiny else config.MAX_COMPLETION_TOKENS
+    num_generations, max_completion_length, effective_batch = _run_shape(args.tiny)
     per_device_batch = 2 if args.tiny else num_generations
 
     # TRL derives generation_batch_size = per_device_train_batch_size *
     # num_processes * gradient_accumulation_steps (trl.GRPOConfig). With
     # per_device_train_batch_size == num_generations (one prompt's completions
     # per micro-batch), accumulation is the only lever left to reach
-    # config.EFFECTIVE_BATCH (128, paper section 4.1) prompts per optimiser
-    # update; left at the trainer default (1) this silently trained at 1
-    # prompt/update instead. --tiny only ever runs a smoke test on 1 device,
-    # so it stays at accumulation 1.
+    # effective_batch (128 by default, paper section 4.1) prompts per
+    # optimiser update; left at the trainer default (1) this silently trained
+    # at 1 prompt/update instead. --tiny only ever runs a smoke test on 1
+    # device, so it stays at accumulation 1.
     # num_processes fetched unconditionally (not only in the non-tiny branch
     # below) so prompts_per_update -- how many dataset rows one optimiser
     # update consumes -- is defined for --tiny too, for Pass1CheckpointCallback.
@@ -223,12 +255,13 @@ def main() -> None:
     if args.tiny:
         gradient_accumulation_steps = 1
     else:
-        gradient_accumulation_steps = config.EFFECTIVE_BATCH // (per_device_batch * num_processes)
-        assert per_device_batch * num_processes * gradient_accumulation_steps == config.EFFECTIVE_BATCH, (
-            f"config.EFFECTIVE_BATCH ({config.EFFECTIVE_BATCH}) must be an exact multiple of "
+        gradient_accumulation_steps = effective_batch // (per_device_batch * num_processes)
+        assert per_device_batch * num_processes * gradient_accumulation_steps == effective_batch, (
+            f"effective_batch ({effective_batch}) must be an exact multiple of "
             f"per_device_train_batch_size ({per_device_batch}) * num_processes ({num_processes})"
         )
     prompts_per_update = num_processes * gradient_accumulation_steps
+    _check_dataset_size(len(rows), prompts_per_update)
     if subset_path:
         _report_subset_prompts_per_update(len(rows), prompts_per_update)
     if not args.tiny:
@@ -378,6 +411,12 @@ def main() -> None:
         "judge_model": judge_model,
         "veto_period_k": veto_period_k,
         "row_limit": row_limit or None,
+        # Smoke-shape knobs (design 2026-09-04): what shape this run trained
+        # with, whether or not RUN_NUM_GENERATIONS/
+        # RUN_MAX_COMPLETION_TOKENS/RUN_EFFECTIVE_BATCH overrode the default.
+        "num_generations": num_generations,
+        "max_completion_tokens": max_completion_length,
+        "effective_batch": effective_batch,
         # H6 part B: whether this run attempted multi-family reverse edges.
         "multi": overrides.multi,
     }

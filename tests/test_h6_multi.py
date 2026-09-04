@@ -9,12 +9,12 @@ target_indices path and reverse_batch's pair_stats draw, and the tiny
 trainer's end-to-end wiring (mechanism-log fields, pair_stats.json
 save/load, and _prompt_margins on a multi-family edge).
 
-H6 is deliberately NOT added to conpo.arms.HYPOTHESES here (see arms.py's own
-comment at the end of that tuple): scripts/dashboard.py synthesizes its own
-H6 row precisely because no "H6*" id exists there, and its test
-(tests/test_dashboard.py:test_h6_row_synthesized_h1_to_h5_unchanged) locks
-that -- dashboard.py and its tests are a separate workflow's files, out of
-scope for this change.
+conpo.arms.HYPOTHESES carries an "H6_multi" entry (design 2026-09-03: H6 is
+a built arm -- see arms.py's own comment on that entry); scripts/dashboard.py
+and its tests (a separate workflow's files) read that entry directly instead
+of synthesizing an H6 row, and that is locked by
+tests/test_dashboard.py:test_h6_row_uses_the_real_hypotheses_entry, out of
+scope for this file's own coverage.
 """
 
 from __future__ import annotations
@@ -94,11 +94,11 @@ def test_overrides_multi_defaults_false() -> None:
     assert Overrides().multi is False
 
 
-def test_hypotheses_has_no_h6_entry_yet_dashboard_owns_that_synthesis() -> None:
-    """See this file's module docstring: adding an "H6*" id here would
-    silently break tests/test_dashboard.py's H6-synthesis test, which is out
-    of scope for this change."""
-    assert not any(h.id.startswith("H6") for h in HYPOTHESES)
+def test_hypotheses_has_an_h6_entry() -> None:
+    """See this file's module docstring: H6 is a built arm (design
+    2026-09-03), so HYPOTHESES now carries an "H6_multi" entry rather than
+    leaving dashboard.py to synthesize the row."""
+    assert any(h.id.startswith("H6") for h in HYPOTHESES)
 
 
 # ---------------------------------------------------------------------------

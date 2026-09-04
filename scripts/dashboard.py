@@ -16,12 +16,16 @@ message on stderr rather than raising.
 Design choices not fixed by the card contract (dated 2026-09-03):
 
 * Hypothesis headline metric: ``conpo.arms.HYPOTHESES`` carries no
-  H-number-to-metric mapping of its own (every row's ``metric`` field
-  reads ``ifbench_prompt_loose`` today), so this script derives the
-  dashboard's headline metric from the hypothesis id's ``H<n>`` prefix:
-  ``ifbench_prompt_loose`` for H1 rows, ``pacc_eval_i`` for H2 to H5 rows,
-  and ``ifbench_prompt_loose`` for any row outside that numbering (today
-  only ``objective_isolation_edge_dpo``).
+  H-number-to-metric mapping of its own (every row's ``metric`` field is a
+  placeholder kept parseable for ``scripts/analyze.py``'s
+  ``_parse_metric``, not the real metric -- see ``conpo.arms.HYPOTHESES``'s
+  own H6 comment), so this script derives the dashboard's headline metric
+  from the hypothesis id's ``H<n>`` prefix: ``ifbench_prompt_loose`` for H1
+  rows, ``pacc_eval_i`` for H2 to H5 rows, ``pacc_eval_iii`` for H6 rows
+  (design choice 2026-09-03: eval_iii is the harder split; the Metric
+  column shows "PAcc eval_ii, eval_iii" instead, see
+  ``hypothesis_metric_display``), and ``ifbench_prompt_loose`` for any row
+  outside that numbering (today only ``objective_isolation_edge_dpo``).
 * Hypothesis claims: ``conpo.arms.HYPOTHESES`` carries no plain-language
   claim, so ``CLAIMS`` below supplies one short sentence per hypothesis id;
   an id not in ``CLAIMS`` falls back to a generic sentence built from its
@@ -40,15 +44,16 @@ Design choices not fixed by the card contract (dated 2026-09-03):
   a number and ignores ``pending`` ones; if none parse, the total reads
   "pending" rather than 0, since 0 would misreport an all-pending set as
   a completed zero-cost run.
-* Hypothesis ids with no ``HYPOTHESES`` entry (today only H6, being built:
-  compositor part A in progress, arm switch part B next): ``HYPOTHESES`` has
-  no row to compute a treatment/control delta from, so the dashboard
-  synthesizes one row per such H-number directly from the run card that
-  names it (``block`` equal to the H-number, or the H-number listed in the
-  card's comma-separated ``hypotheses`` field). ``DEFERRED_HYPOTHESES``
-  supplies the row's claim, display metric and internal metric key; its
-  Delta and Verdict cells run the same paired-bootstrap machinery as a
-  HYPOTHESES row, against the ``full`` arm as control.
+* Hypothesis ids with no ``HYPOTHESES`` entry (none today: H1-H6 and the
+  objective-isolation row all have a real ``HYPOTHESES`` entry, H6 as of
+  design choice 2026-09-03): whenever a future H-number's arm comparison
+  still has no row in ``HYPOTHESES``, the dashboard synthesizes one
+  directly from the run card that names it (``block`` equal to the
+  H-number, or the H-number listed in the card's comma-separated
+  ``hypotheses`` field). ``DEFERRED_HYPOTHESES`` supplies the row's claim,
+  display metric and internal metric key; its Delta and Verdict cells run
+  the same paired-bootstrap machinery as a HYPOTHESES row, against the
+  ``full`` arm as control.
 
 Statistics compute (USER DECISIONS 2026-09-02/2026-09-03, this script's
 share of it):
@@ -168,17 +173,25 @@ CLAIMS: dict[str, str] = {
     "H5_lambda_p_zero": "The prompt-consistency loss L_prompt contributes to ConPO's full performance.",
     "H2_vf_dpo": "ConPO beats verifier-filtered DPO on independently sampled pairs.",
     "objective_isolation_edge_dpo": "ConPO's contrastive objective beats plain DPO trained on ConPO's own edges.",
+    "H6_multi": "Interaction-selected multi-constraint edges improve compositional generalisation.",
 }
 
 # Claim, display metric, and internal metric key for H-numbers HYPOTHESES
 # has no entry for (no arm comparison exists yet), keyed by "H<n>". See the
 # module docstring's "Hypothesis ids with no HYPOTHESES entry" note above.
 # The internal metric key names the per-prompt verdict source
-# hypothesis_delta reads (see _METRIC_VERDICT_SOURCE).
+# hypothesis_delta reads (see _METRIC_VERDICT_SOURCE). H6 is covered by a
+# real HYPOTHESES entry today (design choice 2026-09-03), so this entry is
+# never read by build_deferred_hypothesis_rows; it stays here, its text
+# updated to "built", for the same reason the covered_hypothesis_numbers
+# skip check exists -- a future regression that ever un-registers an H6
+# HYPOTHESES entry falls back to accurate synthesized text, not stale
+# "being built" wording.
 DEFERRED_HYPOTHESES: dict[str, tuple[str, str, str]] = {
     "H6": (
-        "Multi-constraint compositional generalisation (being built: "
-        "compositor part A in progress, arm switch part B next)",
+        "Multi-constraint compositional generalisation (built 2026-09-03: "
+        "RUN_ARM=full RUN_MULTI=1, compositor part A and arm switch part B "
+        "both done)",
         "PAcc eval_iii",
         "pacc_eval_iii",
     ),
@@ -531,11 +544,30 @@ def build_runs_section(train_cards: list[dict[str, str]]) -> list[str]:
 
 
 def hypothesis_metric(h: Hypothesis) -> str:
+    """The internal metric key a hypothesis row's Delta/Verdict cells
+    compute on (a ``_METRIC_VERDICT_SOURCE`` key), derived from the id's
+    ``H<n>`` prefix, not ``h.metric`` (see the module docstring)."""
     if h.id.startswith("H1"):
         return "ifbench_prompt_loose"
+    if h.id.startswith("H6"):
+        # Design choice 2026-09-03: eval_iii is the harder split, so the
+        # Delta/Verdict cells compute on it alone; eval_ii is reported in
+        # the Metric column only (hypothesis_metric_display).
+        return "pacc_eval_iii"
     if h.id[:2] in ("H2", "H3", "H4", "H5"):
         return "pacc_eval_i"
     return "ifbench_prompt_loose"
+
+
+def hypothesis_metric_display(h: Hypothesis) -> str:
+    """The Metric column's text for one HYPOTHESES row: hypothesis_metric's
+    internal key for every id, except H6 (design choice 2026-09-03), whose
+    plan row (hackmd/conpo-plan.md section 4) reads "PAcc on eval_ii and
+    eval_iii" -- both splits are named here even though the Delta/Verdict
+    cells compute on eval_iii alone."""
+    if h.id.startswith("H6"):
+        return "PAcc eval_ii, eval_iii"
+    return hypothesis_metric(h)
 
 
 # Blocks that share an arm/overrides pair with the hypothesis hub (arm="full",
@@ -732,7 +764,8 @@ def build_hypotheses_section(train_cards: list[dict[str, str]]) -> list[str]:
         arms = f"{h.treatment} vs {h.control}"
         delta_str, verdict = hypothesis_delta(treatment_cards, control_cards, metric, h.expected_sign)
         seeds_and_test = seeds_and_test_text(h.id)
-        lines.append(f"| {h.id} | {claim} | {arms} | {metric} | {seeds_and_test} | {delta_str} | {verdict} |")
+        metric_display = hypothesis_metric_display(h)
+        lines.append(f"| {h.id} | {claim} | {arms} | {metric_display} | {seeds_and_test} | {delta_str} | {verdict} |")
     lines += build_deferred_hypothesis_rows(train_cards)
     lines.append("")
     return lines

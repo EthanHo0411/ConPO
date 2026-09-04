@@ -168,13 +168,13 @@ def _write_cards(cards_dir: Path) -> None:
         _card(
             run_id="h6_multi_s42",
             kind="train",
-            arm="h6_multi",
-            overrides="none",
+            arm="full",
+            overrides="RUN_MULTI=1",
             block="H6",
-            hypotheses="none",
+            hypotheses="H6_multi",
             model="Qwen/Qwen3-4B",
             seed="42",
-            status="deferred",
+            status="planned",
             est_h100h="18",
             est_days_2xh100="0.375",
             updated="2026-09-03",
@@ -609,27 +609,101 @@ def test_totals_section_present(cards_dir: Path) -> None:
     assert "Grand total" in out
 
 
-def test_h6_row_synthesized_h1_to_h5_unchanged(cards_dir: Path) -> None:
-    """h6_multi_s42 (block H6, no HYPOTHESES entry) gets a synthesized row;
-    every HYPOTHESES id (H1-H5, plus H2/objective-isolation) keeps its own
-    unaltered row."""
+def test_h6_row_uses_the_real_hypotheses_entry(cards_dir: Path) -> None:
+    """H6_multi is a real HYPOTHESES entry (design 2026-09-03: H6 is a
+    built arm), so its dashboard row comes straight from that entry, not a
+    synthesized placeholder; every other HYPOTHESES id (H1-H5, plus H2/
+    objective-isolation) still gets exactly one unaltered row."""
     cards = dashboard.load_cards(cards_dir)
     out = dashboard.render_dashboard(cards, "2026-09-03")
 
-    h6_lines = [line for line in out.splitlines() if line.startswith("| H6 |")]
+    h6_lines = [line for line in out.splitlines() if line.startswith("| H6_multi |")]
     assert len(h6_lines) == 1
     h6_row = h6_lines[0]
-    assert "Multi-constraint compositional generalisation" in h6_row
-    assert "being built" in h6_row
-    assert "compositor part A in progress, arm switch part B next" in h6_row
-    assert "h6_multi_s42" in h6_row
-    assert "PAcc eval_iii" in h6_row
-    assert h6_row.count("pending") == 2
+    assert "Interaction-selected multi-constraint edges improve compositional generalisation" in h6_row
+    assert "full:multi=1 vs full" in h6_row
+    assert "PAcc eval_ii, eval_iii" in h6_row
+    assert h6_row.endswith("| pending | pending |")
+    assert "being built" not in h6_row
     assert "deferred" not in h6_row
+
+    # No leftover synthesized "H6" row (the deferred-synthesis path is
+    # skipped once HYPOTHESES covers the H-number).
+    assert not any(line.startswith("| H6 |") for line in out.splitlines())
 
     for h in dashboard.HYPOTHESES:
         rows = [line for line in out.splitlines() if line.startswith(f"| {h.id} |")]
         assert len(rows) == 1
+
+
+def _write_internal_verdicts(eval_dir: Path, split: str, keys: list[int], passed: list[bool]) -> None:
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    records = [
+        {
+            "key": k,
+            "split": split,
+            "prompt_strict": p,
+            "prompt_loose": p,
+            "instruction_id_list": [],
+            "instruction_strict": [p],
+            "instruction_loose": [p],
+        }
+        for k, p in zip(keys, passed)
+    ]
+    with (eval_dir / "internal.json.verdicts.jsonl").open("w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+
+def test_h6_delta_computed_from_pacc_eval_iii_per_prompt_verdicts(tmp_path: Path) -> None:
+    """H6_multi's Delta/Verdict cells come from pacc_eval_iii's per-prompt
+    verdicts (design choice 2026-09-03: eval_iii is the harder split),
+    read from internal.json.verdicts.jsonl (scripts/eval_internal.py's
+    write_verdicts record shape) the same way an H2-H5 row would, keyed on
+    the "full:multi=1" vs "full" identifiers."""
+    cards_root = tmp_path / "runs"
+    cards_root.mkdir()
+    keys = list(range(20))
+    _write_internal_verdicts(tmp_path / "eval_h6multi", "eval_iii", keys, [True] * 15 + [False] * 5)  # 0.75
+    _write_internal_verdicts(tmp_path / "eval_full", "eval_iii", keys, [True] * 5 + [False] * 15)  # 0.25
+
+    (cards_root / "h6_multi_s42.md").write_text(
+        _card(
+            run_id="h6_multi_s42",
+            kind="train",
+            arm="full",
+            overrides="RUN_MULTI=1",
+            block="H6",
+            hypotheses="H6_multi",
+            model="Qwen/Qwen3-4B",
+            seed="42",
+            status="done",
+            eval_dir=(tmp_path / "eval_h6multi").resolve().as_posix(),
+        ),
+        encoding="utf-8",
+    )
+    (cards_root / "full_s42.md").write_text(
+        _card(
+            run_id="full_s42",
+            kind="train",
+            arm="full",
+            overrides="none",
+            block="hub",
+            hypotheses="H1,H3,H4,H5",
+            model="Qwen/Qwen3-4B",
+            seed="42",
+            status="done",
+            eval_dir=(tmp_path / "eval_full").resolve().as_posix(),
+        ),
+        encoding="utf-8",
+    )
+
+    cards = dashboard.load_cards(cards_root)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    row = next(line for line in out.splitlines() if line.startswith("| H6_multi |"))
+    assert "+0.500" in row
+    assert "supports" in row
+    assert "pending" not in row
 
 
 def test_cli_writes_readme(cards_dir: Path) -> None:
