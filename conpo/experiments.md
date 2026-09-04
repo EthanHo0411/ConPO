@@ -6,10 +6,10 @@ open-instruct's additive per-constraint `IFEvalVerifier` reward, compute-
 matched to ConPO) as the headline baseline in place of the paper's
 solve-only comparator. Every arm below maps to `RUN_ARM` plus, for the
 ablations, one env-override on top of `RUN_ARM=full`. The RUN_* names,
-their defaults, the five arms and the five override knobs are the contract
+their defaults, the five arms and the six override knobs are the contract
 in `conpo/arms.py` (`ArmSpec`, `Overrides`, `resolve_arm`) and
-`README.md`; `config.py`'s own RUN_* docstring covers only `RUN_ARM`
-through `RUN_OUT_DIR` and does not yet list `ifrlvr` or the override names.
+`README.md`; `config.py`'s own RUN_* docstring covers `RUN_ARM` through
+`RUN_MULTI` but does not yet list `ifrlvr` or the other override names.
 
 ## Arms
 
@@ -26,10 +26,11 @@ through `RUN_OUT_DIR` and does not yet list `ifrlvr` or the override names.
 | RUN_NO_EXACTNESS | `RUN_ARM=full RUN_NO_EXACTNESS=1` | 42 | Corruption exactness admission off: reverse edges no longer required to satisfy `V(x, y_A^-) = A` exactly |
 | RUN_NO_DISTANCE | `RUN_ARM=full RUN_NO_DISTANCE=1` | 42 | Distance bound `delta` off on both directions: minimality (`d_Y <= delta`) no longer gates admission |
 | RUN_LAMBDA_P=0 | `RUN_ARM=full RUN_LAMBDA_P=0` | 42 | Prompt counterfactuals off: the `L_prompt` term is zeroed |
+| RUN_MULTI=1 (H6) | `RUN_ARM=full RUN_MULTI=1` | 42 | Multi-constraint compositional generalisation: `full` with `Overrides.multi` on -- `conpo/trainer.py` owns a `conpo.compositor.PairStats` (updated every optimiser step from the G-sample verifier vectors already computed for the reward path), and `conpo/reverse.py:reverse_batch` attempts a multi-family edge (`registry.corrupt_set`/`exact_set`, `prompts.counterfactual_prompts_set`) on a share of its draws (`config.MULTI_EDGE_SHARE`) whenever `compositor.sample_family_set` finds a phi-correlated family pair |
 
-`RUN_SELECTION`, `RUN_NO_VETO`, `RUN_NO_EXACTNESS`, `RUN_NO_DISTANCE` and
-`RUN_LAMBDA_P` are overrides on top of `RUN_ARM=full`, not separate arm
-names; `slurm/train.sbatch` passes them through unmodified via
+`RUN_SELECTION`, `RUN_NO_VETO`, `RUN_NO_EXACTNESS`, `RUN_NO_DISTANCE`,
+`RUN_LAMBDA_P` and `RUN_MULTI` are overrides on top of `RUN_ARM=full`, not
+separate arm names; `slurm/train.sbatch` passes them through unmodified via
 `--export=ALL,<name>` (see README.md's cluster launch sequence).
 
 ## Hypotheses
@@ -44,7 +45,7 @@ against the locked headline baseline; H2-H5 are unchanged from the paper.
 | H3 | Forward repair and reverse corruption provide complementary relevance and coverage | `full` vs `forward_only` vs `reverse_only` | Internal PAcc splits |
 | H4 | Transfer-aware selection is more compute-efficient than uniform or 50%-success sampling | `full` vs `RUN_SELECTION=uniform` vs `RUN_SELECTION=half` | Internal PAcc splits, normalised by generated tokens and by admitted edges |
 | H5 | Prompt counterfactuals improve constraint-conditional preferences | `full` vs `RUN_LAMBDA_P=0` | Internal PAcc splits, alongside the `Gamma_theta` diagnostic |
-| H6 | Interaction-selected multi-constraint examples improve compositional generalisation | none yet | Deferred: needs the phi-coefficient multi-constraint compositor (M4+, `ConPO-Build-Plan.md` section 10), not built in this scope |
+| H6 | Interaction-selected multi-constraint examples improve compositional generalisation | `RUN_ARM=full RUN_MULTI=1` vs `full` (seed 42, ~18 H100-h; `hackmd/runs/h6_multi_s42.md`) | PAcc `eval_ii` (unseen family combinations) and `eval_iii` (five-constraint prompts) |
 
 `RUN_NO_VETO` does not decide a single H. It is a robustness check on H2/H3:
 whether the quality veto (discarding degraded pairs before admission) is
@@ -72,8 +73,13 @@ automated harness wiring the internal-PAcc comparisons in `eval_internal.py`
 yet; and `H2` (exactness/minimality) and `H6` are not pre-registered there
 at all -- `H2` has no dedicated arm of its own (it reads `reverse_only`
 against the `RUN_NO_EXACTNESS`/`RUN_NO_DISTANCE` overrides, both of which
-exist as knobs but not yet as a registered comparison), and `H6` waits on
-the multi-constraint compositor as noted above.
+exist as knobs but not yet as a registered comparison), and `H6`'s own
+mechanism (`Overrides.multi`, `conpo/compositor.py`, the `RUN_MULTI=1`
+reverse/trainer wiring) is fully built but deliberately kept out of
+`HYPOTHESES`: `scripts/dashboard.py` synthesizes the H6 dashboard row itself
+precisely because no `"H6*"` id exists in that tuple (its own
+`covered_hypothesis_numbers`/`build_deferred_hypothesis_rows`), and that
+script and its tests are a separate workflow's files.
 
 ## Seeds
 

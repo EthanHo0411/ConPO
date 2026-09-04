@@ -36,6 +36,7 @@ from trl import GRPOTrainer
 
 from conpo import config, forward, losses, prompts, reverse, selection
 from conpo.arms import ArmSpec, Overrides
+from conpo.compositor import PairStats
 from conpo.data import PoolRow, TokenMeter
 from conpo.edges import Edge, EdgeBuffer, FeasibleBuffer
 from conpo.engine import Engine
@@ -182,6 +183,7 @@ class ConPOTrainer(GRPOTrainer):
         probe_enabled: bool = True,
         veto_period_k: int = config.VETO_PERIOD_K,
         pending_queue_max: int = config.PENDING_QUEUE_MAX,
+        out_dir: str | Path | None = None,
         **kwargs: object,
     ) -> None:
         self.arm = arm
@@ -204,6 +206,23 @@ class ConPOTrainer(GRPOTrainer):
         # Lifetime count of edges admitted into edge_buffer, independent of the
         # buffer's own FIFO/age-cap eviction, for the cumulative mechanism-log rate.
         self.cumulative_admitted_edges = 0
+
+        # H6 part B (design 2026-09-04): a PairStats only exists at all when
+        # overrides.multi is set (RUN_MULTI=1); reverse_batch's own
+        # `pair_stats` parameter treats None as "never attempt a multi-family
+        # draw", so every other arm/override combination is unaffected.
+        # `out_dir` (RUN_OUT_DIR) is optional so tests that never touch
+        # multi-family edges need not pass one -- save_pair_stats is then a
+        # no-op instead of raising.
+        self.pair_stats: PairStats | None = PairStats() if self.overrides.multi else None
+        self._pair_stats_path: Path | None = Path(out_dir) / "pair_stats.json" if out_dir is not None else None
+        if self.pair_stats is not None and self._pair_stats_path is not None and self._pair_stats_path.exists():
+            self.pair_stats.load(self._pair_stats_path)
+        # Cumulative reverse-edge / multi-reverse-edge admission counts
+        # (mirrors cumulative_admitted_edges above), for
+        # multi_edge_share_cumulative in the per-step mechanism-log record.
+        self._cumulative_reverse_admitted = 0
+        self._cumulative_multi_reverse_admitted = 0
 
         # Batched veto (USER DECISIONS 2026-09-02): edges that pass exactness/
         # distance wait here, tagged with the VetoRequest that will decide
@@ -284,6 +303,7 @@ class ConPOTrainer(GRPOTrainer):
         new_edges: list[Edge] = []
         degenerate_groups = 0
         total_groups = 0
+        multi_attempted = 0
 
         for start in range(0, len(inputs), n):
             end = start + n
@@ -297,8 +317,13 @@ class ConPOTrainer(GRPOTrainer):
 
             observations: dict[str, list[bool]] = {c.iid: [] for c in row.constraints}
             failed_responses: list[str] = []
+            # H6 part B: every sample's verifier vector, in constraint order,
+            # for PairStats.update below -- the same verdicts computed for
+            # `observations` a few lines down, never re-verified.
+            group_verdicts: list[tuple[bool, ...]] = []
             for text in group_completions:
                 verdicts = verifier_vector(row.constraints, text)
+                group_verdicts.append(verdicts)
                 for c, ok in zip(row.constraints, verdicts):
                     observations[c.iid].append(ok)
                 if verdicts and all(verdicts):
@@ -307,6 +332,8 @@ class ConPOTrainer(GRPOTrainer):
                     failed_responses.append(text)
             if observations:
                 self.stats.update_pass_rates(observations)
+            if self.pair_stats is not None and group_verdicts:
+                self.pair_stats.update(row.constraints, tuple(group_verdicts))
 
             if self.arm.forward and failed_responses:
                 veto_flag = not self.overrides.no_veto
@@ -361,7 +388,12 @@ class ConPOTrainer(GRPOTrainer):
                 exactness=not self.overrides.no_exactness,
                 distance_gate=not self.overrides.no_distance,
                 veto=veto_flag,
+                pair_stats=self.pair_stats,
             )
+            # A comma-joined ReverseResult.family (reverse.py's own
+            # multi-vs-single-family signal) marks a multi-family attempt,
+            # whatever it was ultimately admitted, distance-gated or vetoed.
+            multi_attempted += sum(1 for r in results if r.family is not None and "," in r.family)
             if veto_flag:
                 captured_iter = iter(collector.captured)
                 for r in results:
@@ -385,6 +417,7 @@ class ConPOTrainer(GRPOTrainer):
         # on the veto_flush record instead for the batched-path equivalent.
         distances: list[float] = []
         admitted_by_direction: Counter[str] = Counter()
+        multi_admitted = 0
         unwrapped = self.accelerator.unwrap_model(self.model)
         with torch.no_grad(), unwrapped.disable_adapter():
             for edge in new_edges:
@@ -400,6 +433,11 @@ class ConPOTrainer(GRPOTrainer):
                 self.edge_buffer.push(scored_edge)
                 admitted_by_direction[scored_edge.direction] += 1
                 distances.append(float(scored_edge.meta.get("distance", 0.0)))
+                if scored_edge.direction == "reverse":
+                    self._cumulative_reverse_admitted += 1
+                    if len(scored_edge.families) > 1:
+                        self._cumulative_multi_reverse_admitted += 1
+                        multi_admitted += 1
 
         self.cumulative_admitted_edges += len(new_edges)
         tokens_this_step = self.meter.total - tokens_before_step
@@ -426,7 +464,25 @@ class ConPOTrainer(GRPOTrainer):
             "edge_buffer_size": len(self.edge_buffer),
             "feasible_buffer_size": len(self.feasible_buffer),
             "family_stats": self.stats.snapshot(),
+            # H6 part B: multi_attempted counts every reverse draw that tried
+            # a multi-family target this step (admitted, distance-gated or
+            # vetoed alike); multi_admitted only counts an edge that reached
+            # edge_buffer here -- like admitted_by_direction above, that is
+            # only ever nonzero under the no-veto ablation, since a
+            # batched-veto multi edge is still sitting in pending_queue at
+            # this point in the step. multi_edge_share_cumulative reads
+            # regardless of veto mode: flush_pending_veto below also updates
+            # the same cumulative counters.
+            "multi_attempted": multi_attempted,
+            "multi_admitted": multi_admitted,
+            "multi_edge_share_cumulative": (
+                (self._cumulative_multi_reverse_admitted / self._cumulative_reverse_admitted)
+                if self._cumulative_reverse_admitted
+                else 0.0
+            ),
         }
+        if self.pair_stats is not None and current_update % config.PROBE_PERIOD_S == 0:
+            record["pair_stats_top_pairs"] = [list(row) for row in self.pair_stats.top_pairs(5)]
         with open(self.mechanism_log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
 
@@ -542,6 +598,10 @@ class ConPOTrainer(GRPOTrainer):
                 )
                 self.edge_buffer.push(scored_edge)
                 self.cumulative_admitted_edges += 1
+                if scored_edge.direction == "reverse":
+                    self._cumulative_reverse_admitted += 1
+                    if len(scored_edge.families) > 1:
+                        self._cumulative_multi_reverse_admitted += 1
 
         for direction in ("forward", "reverse"):
             self._veto_seen_by_direction[direction] += kept[direction] + rejected[direction]
@@ -622,9 +682,21 @@ class ConPOTrainer(GRPOTrainer):
 
     def _save_checkpoint(self, model: torch.nn.Module, trial: object) -> None:
         """Flush before every checkpoint save (USER DECISIONS 2026-09-02),
-        so a saved edges.jsonl / resumed run never carries unscored pairs."""
+        so a saved edges.jsonl / resumed run never carries unscored pairs.
+        Also persists pair_stats (H6 part B) so a resumed run's phi/count
+        table survives the restart instead of starting cold."""
         self.flush_pending_veto()
+        self.save_pair_stats()
         super()._save_checkpoint(model, trial)
+
+    def save_pair_stats(self) -> None:
+        """Persist `self.pair_stats` to `<out_dir>/pair_stats.json` (H6 part
+        B). No-op when `overrides.multi` is off (`pair_stats` is None) or no
+        `out_dir` was given to the constructor."""
+        if self.pair_stats is None or self._pair_stats_path is None:
+            return
+        self._pair_stats_path.parent.mkdir(parents=True, exist_ok=True)
+        self.pair_stats.save(self._pair_stats_path)
 
     # -----------------------------------------------------------------
     # Losses
@@ -668,21 +740,29 @@ class ConPOTrainer(GRPOTrainer):
         return q_plus - q_minus, ages_t
 
     def _prompt_margins(self, model: torch.nn.Module, edges: Sequence[Edge]) -> tuple[torch.Tensor, torch.Tensor]:
-        """m_plus = m_theta(x^+A), m_minus = m_theta(x^-A) (ConPO.pdf section 2.5) for single-family edges.
+        """m_plus = m_theta(x^+A), m_minus = m_theta(x^-A) (ConPO.pdf section 2.5).
 
-        x^+A is `edge.prompt` itself (counterfactual_prompts leaves it
-        unchanged), so its reference log-probs are already cached on the
-        edge; x^-A's reference log-probs are computed fresh here, under
-        `disable_adapter()`, since no edge caches them.
+        x^-A drops every family in `edge.families` (H6 part B:
+        prompts.counterfactual_prompts_set generalises the single-family
+        prompts.counterfactual_prompts this used to call directly --
+        identical output for a single-family edge, per its own docstring --
+        so a multi-family edge now joins the same L_prompt term instead of
+        being excluded from it by compute_loss's own sampling predicate).
+        x^+A is `edge.prompt` itself (unchanged), so its reference log-probs
+        are already cached on the edge; x^-A's reference log-probs are
+        computed fresh here, under `disable_adapter()`, since no edge caches
+        them.
         """
         unwrapped = self.accelerator.unwrap_model(model)
         m_plus_terms: list[torch.Tensor] = []
         m_minus_terms: list[torch.Tensor] = []
         for edge in edges:
             row = self.rows_by_key[edge.prompt_id]
-            family = next(iter(edge.families))
-            target_index = next(i for i, c in enumerate(row.constraints) if c.iid == family)
-            x_plus, x_minus = prompts.counterfactual_prompts(row, target_index)
+            # First occurrence of each family, same convention the old
+            # single-family lookup used (`next(i for i, c in ... if c.iid ==
+            # family)`), applied per family in edge.families.
+            target_indices = [next(i for i, c in enumerate(row.constraints) if c.iid == family) for family in edge.families]
+            x_plus, x_minus = prompts.counterfactual_prompts_set(row, target_indices)
 
             lp_plus_xplus, _ = score_response(model, self.processing_class, x_plus, edge.y_plus)
             lp_minus_xplus, _ = score_response(model, self.processing_class, x_plus, edge.y_minus)
@@ -790,9 +870,16 @@ class ConPOTrainer(GRPOTrainer):
                     stats[f"resp_margin_{direction}_{family}"] = sum(values) / len(values)
 
         if self.arm.prompt_loss and self.overrides.lambda_p > 0 and len(self.edge_buffer) > 0:
-            prompt_edges = self.edge_buffer.sample_where(
-                lambda e: len(e.families) == 1, prompt_n, current_update, self.rng
-            )
+            # _prompt_margins handles a multi-family edge exactly like a
+            # single-family one (H6 part B), but admitting `>= 1` families
+            # only under overrides.multi: gating on the RUN_MULTI flag keeps
+            # every non-H6 arm's L_prompt population (H1/H3/H4/H5's
+            # full/forward_only/reverse_only runs) bit-identical to before
+            # this change, even on the steps where forward.py's own
+            # multi-constraint repair (independent of RUN_MULTI) admits a
+            # multi-family edge into edge_buffer.
+            family_predicate = (lambda e: len(e.families) >= 1) if self.overrides.multi else (lambda e: len(e.families) == 1)
+            prompt_edges = self.edge_buffer.sample_where(family_predicate, prompt_n, current_update, self.rng)
             if prompt_edges:
                 m_plus, m_minus = self._prompt_margins(model, prompt_edges)
                 loss_prompt, prompt_stats = losses.prompt_loss(

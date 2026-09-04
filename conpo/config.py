@@ -219,6 +219,7 @@ def env(name: str, default: str) -> str:
 # RUN_MODEL: overrides POLICY_MODEL for the policy checkpoint scripts/train.py loads.
 # RUN_LIMIT: caps training rows after RUN_SUBSET is applied, "0" (default) = no cap.
 # RUN_OUT_DIR: directory to write run artefacts (checkpoints, logs, metrics).
+# RUN_MULTI: "1" to turn on multi-constraint reverse edges (Overrides.multi, H6 part B).
 
 # ---------------------------------------------------------------------------
 # Trainer step sizes (section 2.4-2.6: sampled once per optimiser step from
@@ -258,6 +259,33 @@ PENDING_QUEUE_MAX = 2000  # DEV_SET
 # RUN_JUDGE_MODE default: "batched" (VLLMBatchedJudge/HFBatchedJudge, no
 # resident judge server) or "http" (HttpJudge against slurm/judge_server.sbatch).
 JUDGE_MODE_DEFAULT = "batched"
+
+# ---------------------------------------------------------------------------
+# H6 multi-constraint compositor (design 2026-09-03/2026-09-04): phi-
+# coefficient pair statistics (conpo/compositor.py:PairStats) pick which
+# constraint-family pairs are worth a joint (multi-family) counterfactual
+# edge; conpo/reverse.py:reverse_batch draws one with probability
+# MULTI_EDGE_SHARE when Overrides.multi (RUN_MULTI=1) is set. Moved here
+# from conpo/compositor.py (part B; compositor.py now imports these names
+# from this module instead of defining them).
+# ---------------------------------------------------------------------------
+
+# Phi coefficient floor a family pair must clear to be sample_family_set-
+# eligible. DEV_SET.
+PHI_MIN = 0.1  # DEV_SET
+# Minimum contingency-table sample count (PairStats.count) before a pair is
+# trusted at all. DEV_SET.
+MIN_COUNT = 20  # DEV_SET
+# Softmax temperature over eligible pairs' phi/eta scores in
+# sample_family_set (mirrors selection.mu's ETA). DEV_SET.
+ETA_PHI = 0.2  # DEV_SET
+# sample_family_set's default target-set size; only size=2 is implemented
+# (compositor.py's own NotImplementedError for anything else).
+MAX_EDGE_FAMILIES = 2
+# Share of reverse_batch draws that attempt a multi-family edge when a
+# qualifying pair exists (Overrides.multi only; an empty sample_family_set
+# draw always falls back to the ordinary single-family draw). DEV_SET.
+MULTI_EDGE_SHARE = 0.5  # DEV_SET
 
 # ---------------------------------------------------------------------------
 # DPO baselines (locked decision 2026-09-02(c): vf_dpo, relax_dpo, edge_dpo

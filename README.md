@@ -58,6 +58,7 @@ export env only and never retype a value `scripts/train.py` can read from
 | `RUN_NO_EXACTNESS` | `1` | `conpo/arms.py:resolve_arm` -> `Overrides.no_exactness` |
 | `RUN_NO_DISTANCE` | `1` | `conpo/arms.py:resolve_arm` -> `Overrides.no_distance` |
 | `RUN_LAMBDA_P` | float, default `config.LAMBDA_P` (1.0) | `conpo/arms.py:resolve_arm` -> `Overrides.lambda_p` |
+| `RUN_MULTI` | `1` | `conpo/arms.py:resolve_arm` -> `Overrides.multi`; `conpo/trainer.py` then owns a `conpo.compositor.PairStats` and passes it to `conpo/reverse.py:reverse_batch`, which attempts a multi-family edge on a share of its draws (`config.MULTI_EDGE_SHARE`) instead of always drawing one family (H6) |
 
 `conpo/arms.py:resolve_arm` and the `ConPOTrainer` it configures are
 exercised on CPU by `tests/test_trainer_tiny.py`, which constructs the

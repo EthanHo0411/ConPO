@@ -193,6 +193,46 @@ def test_reverse_edge_exactness_false_allows_collateral_damage(monkeypatch: pyte
     assert not check(LOWERCASE, loose_result.edge.y_minus)  # collateral damage went unchecked, as designed
 
 
+def test_reverse_edge_multi_target_exactness_false_retries_past_a_missing_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A target whose operator yields no candidate on one attempt must not
+    burn the whole max_candidates budget: the next attempt draws a fresh
+    generator and can still succeed (round-2 fix to
+    _corrupt_set_without_exactness, which used to `return None` on the
+    first miss instead of retrying)."""
+    row, y_plus = _two_constraint_setup()  # constraints = (NO_COMMA, LOWERCASE)
+    calls = {"no_comma": 0}
+
+    def _flaky_no_comma(response: str, constraint: Constraint, rng: random.Random):
+        calls["no_comma"] += 1
+        if calls["no_comma"] >= 2:  # first call yields nothing, every later call succeeds
+            yield response + ","
+
+    def _break_lowercase(response: str, constraint: Constraint, rng: random.Random):
+        yield response[0].upper() + response[1:]
+
+    monkeypatch.setitem(registry.OPERATORS, NO_COMMA.iid, _flaky_no_comma)
+    monkeypatch.setitem(registry.OPERATORS, LOWERCASE.iid, _break_lowercase)
+
+    result = reverse_edge(
+        row,
+        y_plus,
+        FamilyStats(),
+        StaticJudge(keep=True),
+        random.Random(0),
+        current_update=0,
+        target_indices=(0, 1),
+        exactness=False,
+    )
+
+    assert calls["no_comma"] >= 2  # the first miss did not stop retrying
+    assert result.edge is not None
+    assert result.reason == "admitted"
+    assert not check(NO_COMMA, result.edge.y_minus)
+    assert not check(LOWERCASE, result.edge.y_minus)
+
+
 # --- reverse_batch -------------------------------------------------------------
 
 

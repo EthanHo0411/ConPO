@@ -25,7 +25,7 @@ class ArmSpec:
     are added to the training objective. trainer: "grpo" (conpo.trainer.
     ConPOTrainer, scripts/train.py) or "dpo" (trl.DPOTrainer on
     conpo.pairs-built pairs, scripts/train_dpo.py) -- which script and
-    trainer class the arm actually runs through. For "dpo" arms,
+    trainer class the arm runs through. For "dpo" arms,
     reward/forward/reverse/prompt_loss/resp_loss describe no mechanism
     scripts/train_dpo.py reads (that script trains on a fixed pairs file
     instead); they are set to solve_only's values (no counterfactual
@@ -98,7 +98,14 @@ class Overrides:
     no_veto/no_exactness/no_distance: disable that admission gate (reverse.py
     exactness/distance_gate, forward.py/reverse.py veto). lambda_p: override
     for config.LAMBDA_P (H5: lambda_P = 0 ablates L_prompt's contribution
-    even when arm.prompt_loss is True).
+    even when arm.prompt_loss is True). multi (H6 part B, RUN_MULTI=1):
+    conpo.trainer.ConPOTrainer owns a conpo.compositor.PairStats and passes
+    it to conpo.reverse.reverse_batch, which then attempts a multi-family
+    edge on a share of its draws (config.MULTI_EDGE_SHARE) instead of always
+    drawing a single family. Only meaningful when the arm reverse-
+    constructs at all (arm.reverse=True, i.e. "full" or "reverse_only");
+    "forward_only" and any reverse=False arm ignore it since no reverse
+    draw ever happens.
     """
 
     selection: str = "transfer"
@@ -109,6 +116,7 @@ class Overrides:
     # config.LAMBDA_P once at import time, so a test's monkeypatch of
     # config.LAMBDA_P after import would be silently ignored.
     lambda_p: float = field(default_factory=lambda: config.LAMBDA_P)
+    multi: bool = False
 
 
 def resolve_arm(name: str) -> tuple[ArmSpec, Overrides]:
@@ -120,6 +128,7 @@ def resolve_arm(name: str) -> tuple[ArmSpec, Overrides]:
         no_exactness=config.env("RUN_NO_EXACTNESS", "0") == "1",
         no_distance=config.env("RUN_NO_DISTANCE", "0") == "1",
         lambda_p=float(config.env("RUN_LAMBDA_P", str(config.LAMBDA_P))),
+        multi=config.env("RUN_MULTI", "0") == "1",
     )
     return ARMS[name], overrides
 
@@ -159,4 +168,16 @@ HYPOTHESES: tuple[Hypothesis, ...] = (
     # buffer, isolating ConPO's contrastive objective from its
     # counterfactual-construction machinery (same edges, different training).
     Hypothesis("objective_isolation_edge_dpo", "full", "edge_dpo", "ifbench_prompt_loose", ">"),
+    # H6 (multi-constraint compositional generalisation, RUN_ARM=full
+    # RUN_MULTI=1 vs full) is deliberately NOT registered here, though its
+    # arm-level mechanism (Overrides.multi, this module's resolve_arm;
+    # conpo/compositor.py, conpo/reverse.py, conpo/trainer.py) is fully
+    # built (H6 part B, design 2026-09-04): scripts/dashboard.py synthesizes
+    # its own H6 row (covered_hypothesis_numbers/build_deferred_hypothesis_
+    # rows) precisely because no "H6*" id exists in this tuple --
+    # tests/test_dashboard.py:test_h6_row_synthesized_h1_to_h5_unchanged
+    # locks that behaviour, and dashboard.py/its tests are a separate
+    # workflow's files, out of scope for this change. Adding an "H6*"
+    # Hypothesis here would silently break that test via
+    # covered_hypothesis_numbers' `re.match(r"H\d+", h.id)` scan.
 )

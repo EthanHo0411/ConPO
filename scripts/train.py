@@ -21,7 +21,7 @@ from conpo import config
 from conpo.arms import resolve_arm
 from conpo.data import PoolRow, TokenMeter, keys_digest, load_subset
 from conpo.edges import EdgeBuffer, FeasibleBuffer
-from conpo.engine import HFEngine, VLLMColocateEngine
+from conpo.engine import Engine, HFEngine, VLLMColocateEngine
 from conpo.judge import build_judge
 from conpo.selection import FamilyStats
 from conpo.trainer import ConPOTrainer
@@ -297,7 +297,7 @@ def main() -> None:
         dtype=torch.bfloat16 if torch.cuda.is_available() else None,
     )
 
-    def engine_factory(trainer: ConPOTrainer):
+    def engine_factory(trainer: ConPOTrainer) -> Engine:
         if use_vllm:
             # UNTESTED: no GPU in this environment, see engine.py's VLLMColocateEngine docstring
             return VLLMColocateEngine(trainer)
@@ -331,6 +331,7 @@ def main() -> None:
         seed=seed,
         overrides=overrides,
         veto_period_k=veto_period_k,
+        out_dir=out_dir,
         peft_config=lora_config,
         callbacks=[pass1_callback],
     )
@@ -342,6 +343,9 @@ def main() -> None:
     # run finishes normally (the other three -- period, queue size, and
     # before a checkpoint save -- run inside ConPOTrainer itself).
     trainer.flush_pending_veto()
+    # H6 part B: persists RUN_OUT_DIR/pair_stats.json at train end too (a
+    # no-op when RUN_MULTI is off, save_pair_stats's own contract).
+    trainer.save_pair_stats()
 
     trainer.save_model(str(out_dir / "adapter"))
     edge_buffer.save(out_dir / "edges.jsonl")
@@ -374,6 +378,8 @@ def main() -> None:
         "judge_model": judge_model,
         "veto_period_k": veto_period_k,
         "row_limit": row_limit or None,
+        # H6 part B: whether this run attempted multi-family reverse edges.
+        "multi": overrides.multi,
     }
     (out_dir / "run_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
 

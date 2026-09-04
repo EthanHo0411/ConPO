@@ -14,9 +14,12 @@ which is the signal sample_family_set uses to pick worth-building joint
 extended to a target SET instead of one target, see operators/registry.py's
 exact_set/corrupt_set).
 
-Part B (trainer.py, config.py) wires PHI_MIN, MIN_COUNT, ETA_PHI and
-MAX_EDGE_FAMILIES into config.py and the training loop; they live here as
-defaults until then.
+Part B (trainer.py, config.py, reverse.py, design 2026-09-04): PHI_MIN,
+MIN_COUNT, ETA_PHI and MAX_EDGE_FAMILIES now live in config.py (imported
+here under the same names, so every reference below is unchanged);
+conpo/reverse.py:reverse_batch draws a multi-family edge with config.py's
+MULTI_EDGE_SHARE, and conpo/trainer.py owns the PairStats instance those
+draws read from.
 """
 
 from __future__ import annotations
@@ -27,13 +30,9 @@ import math
 import random
 from pathlib import Path
 
+from conpo.config import ETA_PHI, MAX_EDGE_FAMILIES, MIN_COUNT, PHI_MIN
 from conpo.operators.registry import NO_OPERATOR
 from conpo.verifiers import Constraint
-
-PHI_MIN = 0.1
-MIN_COUNT = 20
-ETA_PHI = 0.2
-MAX_EDGE_FAMILIES = 2
 
 _CountRow = dict[str, int]
 
