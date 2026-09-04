@@ -1,11 +1,11 @@
 """Render ConPO run cards under the CARD FRONT-MATTER CONTRACT (USER DECISIONS
 2026-09-03): a central hackmd/runs dashboard plus one generated markdown card
-per run, produced from run/eval artefacts. `--planned` renders the 21 planned
-training cards and the 2 planned eval cards from PLANNED_RUNS / PLANNED_EVALS
-below (design estimates, pre-M0); a bare run directory renders one train card
-from its real artefacts, enriched with the matching planned entry when its
-run_id is one of the 21 (block, hypotheses, estimate), else with pending
-placeholders for those fields.
+per run, produced from run/eval artefacts. `--planned` renders the 22 planned
+training cards (21 trained arms plus the untrained floor) and the 2 planned
+eval cards from PLANNED_RUNS / PLANNED_EVALS below (design estimates, pre-M0);
+a bare run directory renders one train card from its real artefacts, enriched
+with the matching planned entry when its run_id is one of the 22 (block,
+hypotheses, estimate), else with pending placeholders for those fields.
 
 Reads (see their docstrings for the exact shapes): scripts/train.py
 (run_metadata.json, pass1.json), conpo/conpo/trainer.py (mechanism.jsonl
@@ -80,7 +80,6 @@ FRONT_MATTER_KEYS: tuple[str, ...] = (
     "retention_gsm8k",
     "retention_mmlu",
     "retention_bbh",
-    "retention_alpacaeval2",
     "eval_dir",
     "updated",
 )
@@ -133,6 +132,15 @@ PLANNED_RUNS: tuple[CardPlan, ...] = (
     CardPlan("full_s42", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "42", "planned", 18.0),
     CardPlan("full_s43", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "43", "planned", 18.0),
     CardPlan("full_s44", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "44", "planned", 18.0),
+    # The untrained base policy: never trains (arm kept out of conpo.arms.ARMS
+    # on purpose), so its status is derived from its own eval_dir alone
+    # (see render_card's _EVAL_ONLY_STATUS_RUN_IDS branch) rather than from
+    # run_metadata.json/derive_status like every trained arm above.
+    CardPlan(
+        "untrained", "train", "untrained", {}, "floor", ("H1",), POLICY_MODEL, "-", "planned", 0.0,
+        detail="eval hours are counted in the eval job rows.",
+        launch="N/A: this policy never trains; sbatch slurm/eval.sbatch and sbatch slurm/retention.sbatch with no adapter",
+    ),
     CardPlan("ifrlvr_s42", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "42", "planned", 6.0),
     CardPlan("ifrlvr_s43", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "43", "planned", 6.0),
     CardPlan("ifrlvr_s44", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "44", "planned", 6.0),
@@ -195,9 +203,13 @@ PLANNED_EVALS: tuple[CardPlan, ...] = (
         ),
     ),
     CardPlan(
-        "eval_retention", "eval", "GSM8K, MMLU, BBH, AlpacaEval 2", {},
-        "7 checkpoints: full x3, ifrlvr token-matched x3, untrained", (), "none", "none", "planned", 7.0,
-        detail="retention.json not wired yet; about 1 H100-h per checkpoint.",
+        # The retention suite's fourth benchmark was dropped (user decision
+        # 2026-09-04); est_h100h down from 7.0 to 4.0 with it. retention.py
+        # / scripts/eval_retention.py are wired as of wave 1, so the detail
+        # no longer says "not wired" (design choice, builder, 2026-09-04).
+        "eval_retention", "eval", "GSM8K, MMLU, BBH", {},
+        "7 checkpoints: full x3, ifrlvr token-matched x3, untrained", (), "none", "none", "planned", 4.0,
+        detail="about 0.6 H100-h per checkpoint.",
     ),
 )
 
@@ -248,6 +260,28 @@ def _wilson_ci_str(value: float | None, n: int | None) -> str:
     k = max(0, min(n, round(value * n)))
     lo, hi = wilson_interval(k, n)
     return f"[{_fmt(lo)}, {_fmt(hi)}]"
+
+
+def _retention_row(label: str, retention_raw: dict[str, Any] | None) -> tuple[str, str, str]:
+    """One retention row's (name, value, CI): "not wired"/"not wired" when
+    the run has no retention.json at all; "pending"/"pending" when
+    retention.json exists but `label` is absent (a benchmark not run, see
+    conpo/retention.py's shape); else the fraction plus a Wilson 95% CI from
+    retention.json's own "correct"/"n" counts, falling back to
+    config.RETENTION_SIZES[label] when "n" is missing (design choice,
+    builder, 2026-09-04)."""
+    name = f"Retention {label}"
+    if retention_raw is None:
+        return name, NOT_WIRED, NOT_WIRED
+    if label not in retention_raw:
+        return name, PENDING, PENDING
+    value = retention_raw[label]
+    n = (retention_raw.get("n") or {}).get(label, cfg.RETENTION_SIZES.get(label))
+    correct = (retention_raw.get("correct") or {}).get(label)
+    if n is None or correct is None:
+        return name, _fmt(value), PENDING
+    lo, hi = wilson_interval(correct, n)
+    return name, _fmt(value), f"[{_fmt(lo)}, {_fmt(hi)}]"
 
 
 def eval_dir_str(eval_dir: Path | None) -> str:
@@ -326,6 +360,13 @@ def derive_status(has_run_metadata: bool, has_external: bool, planned_status: st
     if has_external:
         return "done"
     return "running"
+
+
+# CardPlans that never train (see PLANNED_RUNS' "untrained" comment): their
+# status comes from their own eval_dir alone -- external.json present means
+# done, else the plan's own planned_status -- instead of derive_status's
+# run_metadata.json check, which they'd never satisfy.
+_EVAL_ONLY_STATUS_RUN_IDS = frozenset({"untrained"})
 
 
 def resolve_plan_for_run(run_dir: Path) -> CardPlan:
@@ -471,7 +512,30 @@ def section_configuration(plan: CardPlan, metadata: dict[str, Any] | None) -> st
     return "\n".join(lines)
 
 
-def section_compute(plan: CardPlan, actual_h100h: str, steps: str, tokens_generated: str) -> str:
+def last_mechanism_field(mechanism: list[dict[str, Any]], field: str) -> Any:
+    """`field`'s value on the last mechanism.jsonl record that carries it
+    (scanned in reverse), or None when no record does -- e.g.
+    cumulative_admitted_edges/edges_per_million_tokens_cumulative, which
+    live only on per-step records, not on veto_flush records (see
+    section_mechanism's docstring)."""
+    record = next((r for r in reversed(mechanism) if field in r), None)
+    return record.get(field) if record is not None else None
+
+
+def mean_of_last_n_with_field(mechanism: list[dict[str, Any]], field: str, n: int = 20) -> float | None:
+    """Mean of `field` over the last `n` mechanism.jsonl records that carry
+    it (conpo/trainer.py merges prompt_gamma_theta into a per-step record
+    only when the arm has the prompt term), or None when none do."""
+    values = [r[field] for r in mechanism if field in r]
+    if not values:
+        return None
+    tail = values[-n:]
+    return sum(tail) / len(tail)
+
+
+def section_compute(
+    plan: CardPlan, actual_h100h: str, steps: str, tokens_generated: str, admitted_edges: str
+) -> str:
     lines = [
         "## 3. Compute",
         "",
@@ -479,6 +543,7 @@ def section_compute(plan: CardPlan, actual_h100h: str, steps: str, tokens_genera
         f"- actual H100-h: {actual_h100h}",
         f"- steps: {steps}",
         f"- tokens generated: {tokens_generated}",
+        f"- admitted edges: {admitted_edges}",
     ]
     return "\n".join(lines)
 
@@ -489,10 +554,12 @@ def section_results(
     """USER DECISIONS 2026-09-03: every accuracy row carries a 95% CI
     (Wilson) column, from conpo.stats.wilson_interval via _wilson_ci_str
     (see its docstring for the count-from-fraction and fixed-n-fallback
-    choices). Retention rows stay "not wired" in both the value and CI
-    columns; instruction-level and IAcc rows read "pending" for CI when
-    the eval JSON carries no instruction count (no fixed fallback exists
-    for those -- design choice 2026-09-03)."""
+    choices). Retention rows (GSM8K, MMLU, BBH; the suite's fourth benchmark
+    dropped, user decision 2026-09-04) get their own Wilson CI
+    from retention.json's "correct"/"n" counts (see _retention_row);
+    instruction-level and IAcc rows read "pending" for CI when the eval
+    JSON carries no instruction count (no fixed fallback exists for those
+    -- design choice 2026-09-03)."""
 
     def acc_row(name: str, value: Any, n: int | None) -> tuple[str, str, str]:
         return name, _fmt(value), _wilson_ci_str(value, n)
@@ -517,11 +584,8 @@ def section_results(
         pacc_n = _n_or_fixed(summary.get("num_prompts"), split)
         rows.append(acc_row(f"PAcc {split}", summary.get("pacc"), pacc_n))
         rows.append((f"IAcc {split}", _fmt(summary.get("iacc")), PENDING))
-    for key in ("gsm8k", "mmlu", "bbh", "alpacaeval2"):
-        if retention_raw is None:
-            rows.append((f"Retention {key}", NOT_WIRED, NOT_WIRED))
-        else:
-            rows.append((f"Retention {key}", _fmt(retention_raw.get(key)), NOT_WIRED))
+    for key in ("gsm8k", "mmlu", "bbh"):
+        rows.append(_retention_row(key, retention_raw))
     table = ["| metric | value | 95% CI (Wilson) |", "|---|---|---|"]
     table.extend(f"| {name} | {value} | {ci} |" for name, value, ci in rows)
     return "\n".join(["## 4. Results", ""] + table)
@@ -542,7 +606,11 @@ def section_mechanism(mechanism: list[dict[str, Any]], pass1: dict[str, Any] | N
     last record that carries them, not blindly the last record in
     the file (a completed run's mechanism.jsonl often ends on a
     veto_flush record: scripts/train.py calls flush_pending_veto once after
-    trainer.train() returns)."""
+    trainer.train() returns). H5 diagnostic (design choice, builder,
+    2026-09-04): prompt_gamma_theta is a per-step-only field merged in by
+    conpo/trainer.py's compute_loss whenever the arm has the prompt term
+    (including under RUN_LAMBDA_P=0); mean_of_last_n_with_field reports its
+    mean over the last 20 records that carry it."""
     lines = ["## 5. Mechanism metrics", ""]
     if not mechanism:
         lines.append(f"- admission/veto rates: {PENDING}")
@@ -567,10 +635,7 @@ def section_mechanism(mechanism: list[dict[str, Any]], pass1: dict[str, Any] | N
             lines.append(f"- {direction}: admission rate {admission_rate}, veto rate {veto_rate}")
         if not admitted and not vetoed:
             lines.append(f"- admission/veto rates: {PENDING}")
-        cumulative_record = next(
-            (r for r in reversed(mechanism) if "edges_per_million_tokens_cumulative" in r), None
-        )
-        cumulative = cumulative_record.get("edges_per_million_tokens_cumulative") if cumulative_record else None
+        cumulative = last_mechanism_field(mechanism, "edges_per_million_tokens_cumulative")
         lines.append(f"- edges per million tokens (cumulative): {_fmt(cumulative)}")
         family_record = next((r for r in reversed(mechanism) if r.get("family_stats")), None)
         family_stats = family_record.get("family_stats", {}) if family_record else {}
@@ -588,6 +653,8 @@ def section_mechanism(mechanism: list[dict[str, Any]], pass1: dict[str, Any] | N
                 )
         else:
             lines.append(f"- family stats: {PENDING}")
+    gamma_mean = mean_of_last_n_with_field(mechanism, "prompt_gamma_theta")
+    lines.append(f"- prompt gamma theta (mean, last 20 records): {_fmt(gamma_mean)}")
     if pass1 is not None:
         step = pass1.get("global_step", PENDING)
         tokens = pass1.get("tokens_so_far", PENDING)
@@ -613,7 +680,12 @@ def render_card(
     internal = load_json(eval_dir / "internal.json") if eval_dir is not None else None
     retention = load_json(eval_dir / "retention.json") if eval_dir is not None else None
 
-    status = status_override or derive_status(metadata is not None, external is not None, plan.status)
+    if status_override is not None:
+        status = status_override
+    elif plan.run_id in _EVAL_ONLY_STATUS_RUN_IDS:
+        status = "done" if external is not None else plan.status
+    else:
+        status = derive_status(metadata is not None, external is not None, plan.status)
 
     ext = extract_external(external)
     internal_splits = internal or {}
@@ -628,6 +700,7 @@ def render_card(
         steps = PENDING
     tokens_generated = _fmt(metadata.get("tokens_generated")) if metadata is not None else PENDING
     actual_h100h = _fmt(metadata.get("actual_h100h")) if metadata is not None else PENDING
+    admitted_edges = _fmt(last_mechanism_field(mechanism, "cumulative_admitted_edges"))
 
     fields = {
         "run_id": plan.run_id,
@@ -655,7 +728,6 @@ def render_card(
         "retention_gsm8k": NOT_WIRED if retention is None else _fmt(retention.get("gsm8k")),
         "retention_mmlu": NOT_WIRED if retention is None else _fmt(retention.get("mmlu")),
         "retention_bbh": NOT_WIRED if retention is None else _fmt(retention.get("bbh")),
-        "retention_alpacaeval2": NOT_WIRED if retention is None else _fmt(retention.get("alpacaeval2")),
         "eval_dir": eval_dir_str(eval_dir),
         "updated": as_of,
     }
@@ -666,7 +738,7 @@ def render_card(
             f"# Run {plan.run_id}",
             section_header(plan, status),
             section_configuration(plan, metadata),
-            section_compute(plan, actual_h100h, steps, tokens_generated),
+            section_compute(plan, actual_h100h, steps, tokens_generated, admitted_edges),
             section_results(ext, internal_splits, retention),
             section_mechanism(mechanism, pass1),
         ]
@@ -714,7 +786,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Render ConPO run cards (see the card front-matter contract).")
     parser.add_argument("run_dir", nargs="?", default=None, help="run directory (RUN_OUT_DIR) to render a card for")
     parser.add_argument(
-        "--planned", action="store_true", help="render the 21 planned training cards and 2 planned eval cards"
+        "--planned", action="store_true", help="render the 22 planned training cards and 2 planned eval cards"
     )
     parser.add_argument("--eval-dir", default=None, help="eval directory (external.json / internal.json / retention.json)")
     parser.add_argument("--out", default=None, help="cards output directory (default: hackmd/runs next to the repo)")

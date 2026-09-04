@@ -32,6 +32,7 @@ from conpo.forward import RepairResult
 from conpo.judge import StaticJudge
 from conpo.operators import registry
 from conpo.operators.registry import FIXTURES
+from conpo.reverse import ReverseResult
 from conpo.selection import FamilyStats
 from conpo.trainer import ConPOTrainer, score_response
 from conpo.verifiers import Constraint, feasible
@@ -118,6 +119,53 @@ def _hand_built_edges() -> list[Edge]:
             )
         )
     return edges
+
+
+def _multi_family_edge(row: PoolRow, seed: int = 0) -> Edge:
+    """A reverse edge whose families carry both of `row`'s constraints
+    (H6-style joint corruption via registry.corrupt_set), for gap 4's
+    L_resp-ungated-on-multi regression test."""
+    y_plus = FIXTURES[LOWERCASE.iid](LOWERCASE, random.Random(seed))
+    assert feasible(row.constraints, y_plus)
+    corrupted = registry.corrupt_set(row.constraints, (0, 1), y_plus, random.Random(seed + 100))
+    assert corrupted is not None
+    return Edge(
+        prompt_id=row.key,
+        prompt=row.prompt,
+        y_plus=y_plus,
+        y_minus=corrupted,
+        families=frozenset({NO_COMMA.iid, LOWERCASE.iid}),
+        direction="reverse",
+        step=0,
+        logp_ref_plus=float("nan"),
+        logp_ref_minus=float("nan"),
+        len_plus=0,
+        len_minus=0,
+        created_update=0,
+        meta={"distance": token_distance(y_plus, corrupted)},
+    )
+
+
+def _canned_edge(direction: str) -> Edge:
+    """A minimal placeholder edge for gap 5's arm-direction-gating test,
+    where the real construction path is monkeypatched away and only the
+    trainer's own routing (which direction's result lands in edge_buffer)
+    is under test."""
+    return Edge(
+        prompt_id=ROW_A.key,
+        prompt=ROW_A.prompt,
+        y_plus="a response with no comma",
+        y_minus="a response, with comma",
+        families=frozenset({NO_COMMA.iid}),
+        direction=direction,
+        step=0,
+        logp_ref_plus=float("nan"),
+        logp_ref_minus=float("nan"),
+        len_plus=0,
+        len_minus=0,
+        created_update=0,
+        meta={"distance": 0.1},
+    )
 
 
 class _CaptureCallback(TrainerCallback):
@@ -242,9 +290,15 @@ def test_full_arm_two_optimizer_steps(tmp_path: Path, monkeypatch: pytest.Monkey
         "edge_buffer_size",
         "feasible_buffer_size",
         "family_stats",
+        "tokens_cumulative",
+        "cumulative_admitted_edges",
     }
     for record in records:
         assert expected_keys <= record.keys()
+    # Both raw anchors are lifetime cumulative counters (gap 3): never
+    # decrease from one step's record to the next.
+    assert records[0]["tokens_cumulative"] <= records[1]["tokens_cumulative"]
+    assert records[0]["cumulative_admitted_edges"] <= records[1]["cumulative_admitted_edges"]
 
     assert len(capture.per_step) == 2
     step1_resp_loss = capture.per_step[0]["resp_loss"]
@@ -495,6 +549,270 @@ def test_forward_feasible_endpoints_reach_feasible_buffer(tmp_path: Path, monkey
     # feasible_buffer gets populated at all is via RepairResult.feasible_endpoints,
     # confirming trainer.py wires it through.
     assert feasible_buffer._by_prompt in ({ROW_A.key: [sentinel]}, {ROW_B.key: [sentinel]})
+
+
+# ---------------------------------------------------------------------------
+# gap 2: the H5 prompt diagnostic (prompt_gamma_theta) is computed and
+# logged even when RUN_LAMBDA_P=0 zeroes out L_prompt's weighted contribution.
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_gamma_theta_logged_when_lambda_p_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "MAX_COMPLETION_TOKENS", 16)
+    monkeypatch.setattr(config, "REVERSE_DRAWS_PER_STEP", 2)
+
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A, ROW_B]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=1,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    arm, _ = resolve_arm("full")
+    edge_buffer = EdgeBuffer()
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=edge_buffer,
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=Overrides(lambda_p=0.0),  # RUN_LAMBDA_P=0
+        peft_config=_lora_config(),
+        probe_enabled=False,
+    )
+    assert trainer.overrides.lambda_p == 0.0
+
+    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+    with torch.no_grad(), unwrapped.disable_adapter():
+        for edge in _hand_built_edges():
+            logp_plus, len_plus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_plus)
+            logp_minus, len_minus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_minus)
+            edge_buffer.push(
+                dataclasses.replace(
+                    edge,
+                    logp_ref_plus=logp_plus.item(),
+                    logp_ref_minus=logp_minus.item(),
+                    len_plus=len_plus,
+                    len_minus=len_minus,
+                )
+            )
+
+    trainer.train()
+
+    # lambda_p == 0 must not stop the diagnostic from being computed: only
+    # its weighted contribution to `total` is skipped.
+    assert "prompt_gamma_theta" in trainer.last_loss_stats
+    assert math.isfinite(trainer.last_loss_stats["prompt_gamma_theta"])
+
+    # The per-step mechanism record (mechanism.jsonl) carries the same
+    # diagnostic, not only the in-memory last_loss_stats: compute_loss merges
+    # its prompt_* stats into the record before it is written.
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "mechanism.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert records
+    assert "prompt_gamma_theta" in records[-1]
+    assert math.isfinite(records[-1]["prompt_gamma_theta"])
+
+
+# ---------------------------------------------------------------------------
+# gap 4: L_resp's edge sample stays ungated on Overrides.multi -- a
+# multi-family edge is still eligible even with RUN_MULTI unset.
+# ---------------------------------------------------------------------------
+
+
+def test_multi_family_edge_reaches_resp_loss_sample_without_run_multi(tmp_path: Path) -> None:
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=1,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    # forward/reverse off: the only edge compute_loss can possibly draw from
+    # is the multi-family one pushed below.
+    arm = ArmSpec(reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=True)
+    edge_buffer = EdgeBuffer()
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=edge_buffer,
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=Overrides(),  # multi=False (RUN_MULTI unset), the default
+        peft_config=_lora_config(),
+        probe_enabled=False,
+    )
+    assert trainer.overrides.multi is False
+
+    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+    with torch.no_grad(), unwrapped.disable_adapter():
+        edge = _multi_family_edge(ROW_A)
+        logp_plus, len_plus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_plus)
+        logp_minus, len_minus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_minus)
+        edge_buffer.push(
+            dataclasses.replace(
+                edge,
+                logp_ref_plus=logp_plus.item(),
+                logp_ref_minus=logp_minus.item(),
+                len_plus=len_plus,
+                len_minus=len_minus,
+            )
+        )
+
+    trainer.train()
+
+    # edge_buffer holds exactly this one edge, so EdgeBuffer.sample is
+    # certain to draw it if L_resp's sampling is ungated on family count --
+    # the per-family margin stat only appears under key "multi" if it was.
+    assert "resp_margin_reverse_multi" in trainer.last_loss_stats
+
+
+# ---------------------------------------------------------------------------
+# gap 5: forward_only/reverse_only must never let the disabled direction's
+# construction path run, whatever its own preconditions would otherwise allow.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("arm_name", ["forward_only", "reverse_only"])
+def test_arm_direction_gating_produces_only_the_enabled_direction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm_name: str
+) -> None:
+    monkeypatch.setattr("conpo.trainer.verifier_vector", lambda constraints, text: [False] * len(constraints))
+    enabled_direction = "forward" if arm_name == "forward_only" else "reverse"
+    disabled_target = "conpo.reverse.reverse_batch" if arm_name == "forward_only" else "conpo.forward.repair_failed_group"
+
+    def _raise_if_called(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f"{disabled_target} must not run when its direction is disabled")
+
+    monkeypatch.setattr(disabled_target, _raise_if_called)
+
+    if arm_name == "forward_only":
+        monkeypatch.setattr(
+            "conpo.forward.repair_failed_group",
+            lambda *a, **kw: RepairResult(edges=[_canned_edge("forward")], feasible_endpoints=[], endpoint_sources=[]),
+        )
+    else:
+        monkeypatch.setattr(
+            "conpo.reverse.reverse_batch",
+            lambda *a, **kw: [
+                ReverseResult(
+                    edge=_canned_edge("reverse"), family=NO_COMMA.iid, reason="admitted", distance=0.1, veto_kept=True
+                )
+            ],
+        )
+
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A, ROW_B]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=1,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    arm, _ = resolve_arm(arm_name)
+    edge_buffer = EdgeBuffer()
+    feasible_buffer = FeasibleBuffer()
+    # Non-empty regardless of arm_name: this is what would let reverse
+    # construction run if arm.reverse gating ever broke.
+    feasible_buffer.add(ROW_A.key, "already feasible response")
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=edge_buffer,
+        feasible_buffer=feasible_buffer,
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=Overrides(no_veto=True),
+        peft_config=_lora_config(),
+        probe_enabled=False,
+    )
+
+    trainer.train()
+
+    assert len(edge_buffer) >= 1
+    assert all(e.direction == enabled_direction for e in edge_buffer._edges)
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,13 @@ Usage:
 --subset points at a committed key-list file, one row key per line (blank
 lines and lines starting with "#" ignored); omitted, every row in --rows is
 checked. --limit caps the number of --rows lines read, for a fast sample run.
+
+--internal-splits switches to a different check: disjointness between the
+training subset's keys and the three internal PAcc eval splits (eval_i,
+eval_ii, eval_iii, data/eval_*.jsonl) -- these are held-out rows drawn from
+the same pool as training data, so the risk is a key leaking into both a
+training run and an eval split, not the external-benchmark text overlap the
+default mode checks. Exits 1 if any split shares a key with the subset.
 """
 
 import argparse
@@ -51,6 +58,33 @@ def load_subset_base_prompts(rows_path: Path, subset_path: Path | None, limit: i
     return texts
 
 
+def load_eval_split_keys(path: Path) -> set[str]:
+    """The "key" field of every row in an internal eval split JSONL file
+    (data/eval_i.jsonl and friends)."""
+    keys = set()
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                keys.add(json.loads(line)["key"])
+    return keys
+
+
+def check_internal_splits(
+    subset_keys: set[str], eval_i_keys: set[str], eval_ii_keys: set[str], eval_iii_keys: set[str]
+) -> dict[str, int]:
+    """Key counts for the subset and the three internal eval splits, plus
+    the subset's intersection size with each split (0 means disjoint)."""
+    return {
+        "subset": len(subset_keys),
+        "eval_i": len(eval_i_keys),
+        "eval_ii": len(eval_ii_keys),
+        "eval_iii": len(eval_iii_keys),
+        "overlap_eval_i": len(subset_keys & eval_i_keys),
+        "overlap_eval_ii": len(subset_keys & eval_ii_keys),
+        "overlap_eval_iii": len(subset_keys & eval_iii_keys),
+    }
+
+
 def _report_dict(report: OverlapReport) -> dict:
     return {
         "exact_matches": report.exact_matches,
@@ -68,7 +102,34 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="cap the number of --rows lines read")
     parser.add_argument("--n", type=int, default=13)
     parser.add_argument("--out", default=str(ROOT / "overlap_report.json"))
+    parser.add_argument(
+        "--internal-splits", action="store_true",
+        help="check the training subset against eval_i/eval_ii/eval_iii for key overlap instead",
+    )
+    parser.add_argument(
+        "--subset-keys", default=str(ROOT / "subsets" / "train_15000_seed42.keys"),
+        help="--internal-splits only: the subset key-list file",
+    )
+    parser.add_argument("--eval-i", default=str(ROOT / "data" / "eval_i.jsonl"), help="--internal-splits only")
+    parser.add_argument("--eval-ii", default=str(ROOT / "data" / "eval_ii.jsonl"), help="--internal-splits only")
+    parser.add_argument("--eval-iii", default=str(ROOT / "data" / "eval_iii.jsonl"), help="--internal-splits only")
     args = parser.parse_args()
+
+    if args.internal_splits:
+        subset_keys = load_subset_keys(Path(args.subset_keys))
+        eval_i_keys = load_eval_split_keys(Path(args.eval_i))
+        eval_ii_keys = load_eval_split_keys(Path(args.eval_ii))
+        eval_iii_keys = load_eval_split_keys(Path(args.eval_iii))
+        report = check_internal_splits(subset_keys, eval_i_keys, eval_ii_keys, eval_iii_keys)
+        print(
+            f"subset: {report['subset']} keys | "
+            f"eval_i: {report['eval_i']} keys, overlap={report['overlap_eval_i']} | "
+            f"eval_ii: {report['eval_ii']} keys, overlap={report['overlap_eval_ii']} | "
+            f"eval_iii: {report['eval_iii']} keys, overlap={report['overlap_eval_iii']}"
+        )
+        if report["overlap_eval_i"] or report["overlap_eval_ii"] or report["overlap_eval_iii"]:
+            raise SystemExit(1)
+        return
 
     subset_path = Path(args.subset) if args.subset is not None else None
     subset_texts = load_subset_base_prompts(Path(args.rows), subset_path, args.limit)

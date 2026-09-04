@@ -69,21 +69,24 @@ def monotone_admit(
     after: Sequence[bool],
     d: float,
     delta: float = config.DELTA,
+    distance_gate: bool = True,
 ) -> tuple[bool, str]:
     """Repair-proposal admission gate (section 2.2).
 
     Admitted only if no previously satisfied verifier regresses, at least
-    one previously failed verifier now passes, and the fidelity bound
-    d_Y(y_t, y_{t+1}) <= delta holds. `before`/`after`/`constraints` are
-    index-aligned. Reason strings: "regression:<iid>" (naming the first
-    constraint that regressed), "no_improvement", "distance", "admitted".
+    one previously failed verifier now passes, and (when `distance_gate`,
+    the RUN_NO_DISTANCE ablation's off-switch, matching reverse.py's own
+    `distance_gate` parameter) the fidelity bound d_Y(y_t, y_{t+1}) <= delta
+    holds. `before`/`after`/`constraints` are index-aligned. Reason strings:
+    "regression:<iid>" (naming the first constraint that regressed),
+    "no_improvement", "distance", "admitted".
     """
     for c, was_ok, is_ok in zip(constraints, before, after):
         if was_ok and not is_ok:
             return False, f"regression:{c.iid}"
     if not any(not was_ok and is_ok for was_ok, is_ok in zip(before, after)):
         return False, "no_improvement"
-    if d > delta:
+    if distance_gate and d > delta:
         return False, "distance"
     return True, "admitted"
 
@@ -125,6 +128,7 @@ def repair_trajectory(
     max_steps: int = config.MAX_STEPS,
     max_candidates: int = config.MAX_CANDIDATES,
     veto: bool = True,
+    distance_gate: bool = True,
 ) -> RepairResult:
     """Run at most `max_steps` repair steps on `response` (section 2.2).
 
@@ -132,6 +136,9 @@ def repair_trajectory(
     repair-step index it was admitted at. The trajectory's final response
     (whether or not any step was admitted) is recorded as a feasible
     endpoint if it satisfies every constraint in `row.constraints`.
+    `distance_gate=False` (RUN_NO_DISTANCE) threads through to every
+    `monotone_admit` call, same convention as reverse.py's own
+    `distance_gate` parameter.
     """
     result = RepairResult()
     y_t = response
@@ -164,7 +171,7 @@ def repair_trajectory(
         for candidate in proposals:
             d = token_distance(y_t, candidate)
             after = verifier_vector(row.constraints, candidate)
-            ok, reason = monotone_admit(row.constraints, before, after, d)
+            ok, reason = monotone_admit(row.constraints, before, after, d, distance_gate=distance_gate)
             if not ok:
                 result.reasons[reason] += 1
                 continue
@@ -227,12 +234,16 @@ def repair_failed_group(
     max_steps: int = config.MAX_STEPS,
     max_candidates: int = config.MAX_CANDIDATES,
     veto: bool = True,
+    distance_gate: bool = True,
 ) -> RepairResult:
     """Run `repair_trajectory` on every failed response of one clean group
-    and merge the results (section 2.2)."""
+    and merge the results (section 2.2). `distance_gate` passes straight
+    through to every `repair_trajectory` call."""
     merged = RepairResult()
     for response in responses:
-        r = repair_trajectory(row, response, engine, judge, rng, meter, current_update, max_steps, max_candidates, veto)
+        r = repair_trajectory(
+            row, response, engine, judge, rng, meter, current_update, max_steps, max_candidates, veto, distance_gate
+        )
         merged.edges.extend(r.edges)
         merged.feasible_endpoints.extend(r.feasible_endpoints)
         merged.endpoint_sources.extend(r.endpoint_sources)

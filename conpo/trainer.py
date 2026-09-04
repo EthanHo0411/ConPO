@@ -21,6 +21,7 @@ probe (conpo/selection.py section 2.6).
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import math
@@ -28,10 +29,11 @@ import random
 import time
 import warnings
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 
 import torch
+from accelerate.utils import is_peft_model
 from trl import GRPOTrainer
 
 from conpo import config, forward, losses, prompts, reverse, selection
@@ -181,7 +183,9 @@ class ConPOTrainer(GRPOTrainer):
     adapter (peft's default init), the adapter's output equals the base
     model's, so every `logp_ref_*` cached on an Edge is computed once, at
     admission, under `accelerator.unwrap_model(model).disable_adapter()`
-    (see `score_response`), and never recomputed.
+    (see `score_response`), and never recomputed. Under RUN_FULL_FT=1 there
+    is no adapter to disable; `_reference_model` yields TRL's own
+    `self.ref_model` instead (see its docstring).
     """
 
     def __init__(
@@ -220,6 +224,13 @@ class ConPOTrainer(GRPOTrainer):
         self.rng = random.Random(seed)
         self.probe_enabled = probe_enabled
         self.last_loss_stats: dict[str, float] = {}
+        # design choice (builder, 2026-09-04): the per-step mechanism record is
+        # built here but its file write is deferred to compute_loss (see the
+        # merge there). _generate_and_score_completions runs before compute_loss
+        # for the same step, so a record written here would only ever carry
+        # last_loss_stats from the PREVIOUS step; stashing it and writing after
+        # compute_loss lets the record carry this step's own prompt_gamma_theta.
+        self._pending_mechanism_record: dict[str, object] | None = None
         # Guards the T_c probe to once per optimiser step: self.state.global_step
         # is constant across every micro-batch of one accumulation cycle, so a
         # value change (including the first call, None != 0) marks a new step.
@@ -274,7 +285,36 @@ class ConPOTrainer(GRPOTrainer):
             processing_class=processing_class,
             **kwargs,
         )
+        # RUN_FULL_FT=1 (design choice, builder 2026-09-04): GRPOTrainer builds
+        # self.ref_model via create_reference_model only when the policy isn't
+        # PEFT and beta != 0.0 (trl 1.9.2 grpo_trainer.py); config.KL_BETA is
+        # nonzero in every arm, so this should always hold for a full fine-tune
+        # run -- checked here, at construction, so a misconfiguration fails
+        # before training rather than with an AttributeError on the first step.
+        if not is_peft_model(self.accelerator.unwrap_model(self.model)) and self.ref_model is None:
+            raise ValueError(
+                "Full fine-tune (RUN_FULL_FT=1) needs a reference model, but the policy "
+                "is not PEFT and self.ref_model is None. This happens only if beta == 0.0 "
+                "(config.KL_BETA); set it nonzero or run with a PEFT adapter instead."
+            )
         self.engine: Engine = engine_factory(self)
+
+    @contextlib.contextmanager
+    def _reference_model(self, model: torch.nn.Module) -> Iterator[torch.nn.Module]:
+        """The model to score pi_ref under, with gradients disabled.
+
+        PEFT: the unwrapped policy with its adapter turned off reverts to the
+        frozen initial policy (class docstring). Full fine-tune: TRL's own
+        `self.ref_model` instead, guaranteed non-None by the __init__ check
+        above.
+        """
+        unwrapped = self.accelerator.unwrap_model(model)
+        with torch.no_grad():
+            if is_peft_model(unwrapped):
+                with unwrapped.disable_adapter():
+                    yield unwrapped
+            else:
+                yield self.ref_model
 
     # -----------------------------------------------------------------
     # Reward functions (the arm decides which one is passed to GRPOTrainer)
@@ -370,6 +410,7 @@ class ConPOTrainer(GRPOTrainer):
                     self.meter,
                     current_update,
                     veto=veto_flag,
+                    distance_gate=not self.overrides.no_distance,
                 )
                 if veto_flag:
                     # Register a tracker for every trajectory-derived endpoint
@@ -441,11 +482,10 @@ class ConPOTrainer(GRPOTrainer):
         distances: list[float] = []
         admitted_by_direction: Counter[str] = Counter()
         multi_admitted = 0
-        unwrapped = self.accelerator.unwrap_model(self.model)
-        with torch.no_grad(), unwrapped.disable_adapter():
+        with self._reference_model(self.model) as ref_model:
             for edge in new_edges:
-                logp_plus, len_plus = score_response(unwrapped, self.processing_class, edge.prompt, edge.y_plus)
-                logp_minus, len_minus = score_response(unwrapped, self.processing_class, edge.prompt, edge.y_minus)
+                logp_plus, len_plus = score_response(ref_model, self.processing_class, edge.prompt, edge.y_plus)
+                logp_minus, len_minus = score_response(ref_model, self.processing_class, edge.prompt, edge.y_minus)
                 scored_edge = dataclasses.replace(
                     edge,
                     logp_ref_plus=logp_plus.item(),
@@ -487,6 +527,12 @@ class ConPOTrainer(GRPOTrainer):
             "edge_buffer_size": len(self.edge_buffer),
             "feasible_buffer_size": len(self.feasible_buffer),
             "family_stats": self.stats.snapshot(),
+            # Raw anchors behind the ratios above (edges_per_million_tokens_*):
+            # both are monotone non-decreasing over a run's lifetime, unlike
+            # edge_buffer_size, so a reader can recompute any windowed rate
+            # from two records without needing the buffer's own eviction state.
+            "tokens_cumulative": self.meter.total,
+            "cumulative_admitted_edges": self.cumulative_admitted_edges,
             # H6 part B: multi_attempted counts every reverse draw that tried
             # a multi-family target this step (admitted, distance-gated or
             # vetoed alike); multi_admitted only counts an edge that reached
@@ -506,8 +552,11 @@ class ConPOTrainer(GRPOTrainer):
         }
         if self.pair_stats is not None and current_update % config.PROBE_PERIOD_S == 0:
             record["pair_stats_top_pairs"] = [list(row) for row in self.pair_stats.top_pairs(5)]
-        with open(self.mechanism_log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        # Stashed, not written here -- see the __init__ comment on
+        # _pending_mechanism_record. compute_loss merges in this step's
+        # prompt_* diagnostics (prompt_gamma_theta included) and writes the
+        # single record for this step.
+        self._pending_mechanism_record = record
 
         # The periodic flush condition (USER DECISIONS 2026-09-02); the
         # queue-size condition is enforced per-push by _push_pending above
@@ -608,8 +657,7 @@ class ConPOTrainer(GRPOTrainer):
         # them were "the judge's reply never parsed" instead of "the judge
         # said this pair is degenerate".
         parse_failures: Counter[str] = Counter()
-        unwrapped = self.accelerator.unwrap_model(self.model)
-        with torch.no_grad(), unwrapped.disable_adapter():
+        with self._reference_model(self.model) as ref_model:
             for pair, verdict in zip(pairs, verdicts):
                 # Round2 finding 1: check this edge off its feasible-endpoint
                 # tracker (if any) whichever way the verdict fell, before the
@@ -622,8 +670,8 @@ class ConPOTrainer(GRPOTrainer):
                     continue
                 kept[pair.direction] += 1
                 edge = pair.edge
-                logp_plus, len_plus = score_response(unwrapped, self.processing_class, edge.prompt, edge.y_plus)
-                logp_minus, len_minus = score_response(unwrapped, self.processing_class, edge.prompt, edge.y_minus)
+                logp_plus, len_plus = score_response(ref_model, self.processing_class, edge.prompt, edge.y_plus)
+                logp_minus, len_minus = score_response(ref_model, self.processing_class, edge.prompt, edge.y_minus)
                 scored_edge = dataclasses.replace(
                     edge,
                     logp_ref_plus=logp_plus.item(),
@@ -819,7 +867,6 @@ class ConPOTrainer(GRPOTrainer):
         computed fresh here, under `disable_adapter()`, since no edge caches
         them.
         """
-        unwrapped = self.accelerator.unwrap_model(model)
         m_plus_terms: list[torch.Tensor] = []
         m_minus_terms: list[torch.Tensor] = []
         for edge in edges:
@@ -846,9 +893,9 @@ class ConPOTrainer(GRPOTrainer):
 
             lp_plus_xminus, len_p_xminus = score_response(model, self.processing_class, x_minus, edge.y_plus)
             lp_minus_xminus, len_m_xminus = score_response(model, self.processing_class, x_minus, edge.y_minus)
-            with torch.no_grad(), unwrapped.disable_adapter():
-                ref_plus_xminus, _ = score_response(unwrapped, self.processing_class, x_minus, edge.y_plus)
-                ref_minus_xminus, _ = score_response(unwrapped, self.processing_class, x_minus, edge.y_minus)
+            with self._reference_model(model) as ref_model:
+                ref_plus_xminus, _ = score_response(ref_model, self.processing_class, x_minus, edge.y_plus)
+                ref_minus_xminus, _ = score_response(ref_model, self.processing_class, x_minus, edge.y_minus)
             q_plus_xminus = losses.q_theta(
                 lp_plus_xminus, ref_plus_xminus.detach(), torch.tensor(len_p_xminus, device=lp_plus_xminus.device)
             )
@@ -916,6 +963,12 @@ class ConPOTrainer(GRPOTrainer):
         edge_n = math.ceil(config.EDGE_PAIRS_PER_STEP / grad_accum)
         prompt_n = math.ceil(config.PROMPT_PAIRS_PER_STEP / grad_accum)
 
+        # Design choice (orchestrator, 2026-09-04): L_resp stays UNGATED on
+        # Overrides.multi. Forward multi-family repair edges are part of
+        # every arm's edge stream and the hub arm "full" must not change;
+        # H6 isolates the phi-selected reverse multi-family corruption edges
+        # plus their prompt term (L_prompt below is the only term gated by
+        # overrides.multi).
         if self.arm.resp_loss and len(self.edge_buffer) > 0:
             resp_edges = self.edge_buffer.sample(edge_n, current_update, self.rng, balanced=True)
             if resp_edges:
@@ -935,7 +988,7 @@ class ConPOTrainer(GRPOTrainer):
                 for (direction, family), values in margins_by_direction_family.items():
                     stats[f"resp_margin_{direction}_{family}"] = sum(values) / len(values)
 
-        if self.arm.prompt_loss and self.overrides.lambda_p > 0 and len(self.edge_buffer) > 0:
+        if self.arm.prompt_loss and len(self.edge_buffer) > 0:
             # _prompt_margins handles a multi-family edge exactly like a
             # single-family one (H6 part B), but admitting `>= 1` families
             # only under overrides.multi: gating on the RUN_MULTI flag keeps
@@ -947,17 +1000,32 @@ class ConPOTrainer(GRPOTrainer):
             family_predicate = (lambda e: len(e.families) >= 1) if self.overrides.multi else (lambda e: len(e.families) == 1)
             prompt_edges = self.edge_buffer.sample_where(family_predicate, prompt_n, current_update, self.rng)
             if prompt_edges:
+                # The margins and prompt_gamma_theta diagnostic are computed
+                # (and logged) whenever the arm carries L_prompt at all,
+                # independent of overrides.lambda_p: the H5 ablation
+                # (RUN_LAMBDA_P=0) needs prompt_gamma_theta on record to show
+                # what L_prompt would have measured had it not been zeroed
+                # out. Only the weighted contribution to `total` is gated on
+                # lambda_p > 0 -- that is what "ablates L_prompt's
+                # contribution" (arms.py's Overrides docstring) means.
                 m_plus, m_minus = self._prompt_margins(model, prompt_edges)
                 loss_prompt, prompt_stats = losses.prompt_loss(
                     m_plus, m_minus, tau_p=config.TAU_P, lambda_0=config.LAMBDA_0
                 )
-                total = total + self.overrides.lambda_p * loss_prompt
+                if self.overrides.lambda_p > 0:
+                    total = total + self.overrides.lambda_p * loss_prompt
                 stats["prompt_loss"] = loss_prompt.item()
                 stats.update({f"prompt_{k}": v for k, v in prompt_stats.items()})
 
         if self.probe_enabled and len(self.edge_buffer) > 0 and current_update != self._last_probe_step:
             self._run_probe(model, clean, current_update)
             self._last_probe_step = current_update
+
+        if self._pending_mechanism_record is not None:
+            self._pending_mechanism_record.update({k: v for k, v in stats.items() if k.startswith("prompt_")})
+            with open(self.mechanism_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(self._pending_mechanism_record) + "\n")
+            self._pending_mechanism_record = None
 
         self.last_loss_stats = stats
         mode = "train" if model.training else "eval"

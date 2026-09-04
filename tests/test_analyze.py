@@ -134,12 +134,12 @@ def test_analyze_end_to_end_synthetic(tmp_path: Path, monkeypatch: pytest.Monkey
     assert h1["bootstrap_diff"] == 1.0
     assert h1["ci_lo"] == 1.0
     assert h1["ci_hi"] == 1.0
-    assert h1["verdict"] == "PASS"
+    assert h1["verdict"] == "supports"
 
     # a hypothesis row naming an arm with no runs at all is reported, not dropped
     unmatched = hyp_by_id["H3_forward"]  # full vs forward_only; forward_only has no runs here
     assert unmatched["n_seed_pairs"] == 0
-    assert unmatched["verdict"] == "INCONCLUSIVE"
+    assert unmatched["verdict"] == "pending"
     assert unmatched["note"] == "no matched seed pairs"
 
 

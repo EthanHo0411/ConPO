@@ -56,6 +56,24 @@ def test_mcnemar_ten_vs_two_discordant() -> None:
     assert abs(result.p_value - 2 * 79 / 4096) < 1e-9
 
 
+def test_verdict_from_ci_supports_expected_positive_sign() -> None:
+    assert stats.verdict_from_ci(0.01, 0.05, ">") == "supports"
+
+
+def test_verdict_from_ci_supports_expected_negative_sign() -> None:
+    assert stats.verdict_from_ci(-0.05, -0.01, "<") == "supports"
+
+
+def test_verdict_from_ci_opposite_sign_is_null_opposite() -> None:
+    assert stats.verdict_from_ci(0.01, 0.05, "<") == "null (opposite sign)"
+    assert stats.verdict_from_ci(-0.05, -0.01, ">") == "null (opposite sign)"
+
+
+def test_verdict_from_ci_interval_spans_zero_is_null() -> None:
+    assert stats.verdict_from_ci(-0.02, 0.03, ">") == "null"
+    assert stats.verdict_from_ci(-0.02, 0.03, "<") == "null"
+
+
 def test_holm_ordering() -> None:
     adjusted = stats.holm([0.01, 0.02, 0.03, 0.5])
     assert adjusted == [0.04, 0.06, 0.06, 0.5]

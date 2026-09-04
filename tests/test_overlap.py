@@ -9,6 +9,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from conpo.overlap import check_overlap, ngrams, normalise
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
@@ -147,6 +149,100 @@ def test_load_subset_base_prompts_filters_by_subset_and_limit(tmp_path: Path) ->
 
     limited = check_overlap_script.load_subset_base_prompts(rows_path, None, limit=2)
     assert limited == {"k0": "prompt 0", "k1": "prompt 1"}
+
+
+# --- scripts/check_overlap.py: --internal-splits -----------------------------
+
+
+def test_load_eval_split_keys_reads_key_field(tmp_path: Path) -> None:
+    path = tmp_path / "eval_i.jsonl"
+    with path.open("w", encoding="utf-8") as f:
+        f.write(json.dumps({"key": "k0", "base_prompt": "p0"}) + "\n")
+        f.write(json.dumps({"key": "k1", "base_prompt": "p1"}) + "\n")
+
+    assert check_overlap_script.load_eval_split_keys(path) == {"k0", "k1"}
+
+
+def test_check_internal_splits_reports_zero_overlap_when_disjoint() -> None:
+    report = check_overlap_script.check_internal_splits(
+        subset_keys={"s0", "s1", "s2"},
+        eval_i_keys={"i0", "i1"},
+        eval_ii_keys={"ii0"},
+        eval_iii_keys={"iii0", "iii1"},
+    )
+    assert report == {
+        "subset": 3,
+        "eval_i": 2,
+        "eval_ii": 1,
+        "eval_iii": 2,
+        "overlap_eval_i": 0,
+        "overlap_eval_ii": 0,
+        "overlap_eval_iii": 0,
+    }
+
+
+def test_check_internal_splits_detects_injected_overlap() -> None:
+    report = check_overlap_script.check_internal_splits(
+        subset_keys={"s0", "s1", "shared"},
+        eval_i_keys={"i0", "shared"},  # injected overlap
+        eval_ii_keys={"ii0"},
+        eval_iii_keys={"iii0"},
+    )
+    assert report["overlap_eval_i"] == 1
+    assert report["overlap_eval_ii"] == 0
+    assert report["overlap_eval_iii"] == 0
+
+
+def _write_eval_split(path: Path, keys: list[str]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for key in keys:
+            f.write(json.dumps({"key": key, "base_prompt": f"prompt for {key}"}) + "\n")
+
+
+def test_check_overlap_script_internal_splits_exits_zero_when_disjoint(tmp_path: Path, monkeypatch) -> None:
+    subset_path = tmp_path / "keys.txt"
+    subset_path.write_text("s0\ns1\n", encoding="utf-8")
+    eval_i = tmp_path / "eval_i.jsonl"
+    eval_ii = tmp_path / "eval_ii.jsonl"
+    eval_iii = tmp_path / "eval_iii.jsonl"
+    _write_eval_split(eval_i, ["i0"])
+    _write_eval_split(eval_ii, ["ii0"])
+    _write_eval_split(eval_iii, ["iii0"])
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "check_overlap.py", "--internal-splits",
+            "--subset-keys", str(subset_path),
+            "--eval-i", str(eval_i), "--eval-ii", str(eval_ii), "--eval-iii", str(eval_iii),
+        ],
+    )
+    check_overlap_script.main()  # no SystemExit raised
+
+
+def test_check_overlap_script_internal_splits_exits_one_when_overlapping(tmp_path: Path, monkeypatch) -> None:
+    subset_path = tmp_path / "keys.txt"
+    subset_path.write_text("s0\nshared\n", encoding="utf-8")
+    eval_i = tmp_path / "eval_i.jsonl"
+    eval_ii = tmp_path / "eval_ii.jsonl"
+    eval_iii = tmp_path / "eval_iii.jsonl"
+    _write_eval_split(eval_i, ["shared"])  # injected overlap with the subset
+    _write_eval_split(eval_ii, ["ii0"])
+    _write_eval_split(eval_iii, ["iii0"])
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "check_overlap.py", "--internal-splits",
+            "--subset-keys", str(subset_path),
+            "--eval-i", str(eval_i), "--eval-ii", str(eval_ii), "--eval-iii", str(eval_iii),
+        ],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        check_overlap_script.main()
+    assert excinfo.value.code == 1
 
 
 # --- scripts/check_overlap.py: full run on the real sample --------------------

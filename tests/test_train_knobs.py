@@ -16,9 +16,17 @@ import sys
 from pathlib import Path
 
 import pytest
+from datasets import Dataset
+from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
 from trl import GRPOConfig
 
 from conpo import config
+from conpo.arms import resolve_arm
+from conpo.data import TokenMeter
+from conpo.edges import EdgeBuffer, FeasibleBuffer
+from conpo.judge import StaticJudge
+from conpo.selection import FamilyStats
+from conpo.trainer import ConPOTrainer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -198,6 +206,114 @@ def test_main_tiny_raises_when_run_limit_below_prompts_per_update(
     assert "0" in message
     assert "1" in message  # prompts_per_update on a single CPU process
     assert not (out_dir / "run_metadata.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# scripts/train.py: main() with RUN_FULL_FT=1 (design 2026-09-04, real run
+# since B7 2026-09-04: conpo/trainer.py's ConPOTrainer._reference_model now
+# scores pi_ref under TRL's own self.ref_model when there is no adapter to
+# disable, so a real ConPOTrainer.train() completes instead of raising
+# AttributeError -- see conpo/trainer.py for the reference-scoring path)
+# ---------------------------------------------------------------------------
+
+
+def test_main_tiny_run_full_ft_writes_flag_and_no_adapter_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_FULL_FT=1 with RUN_ARM=full (exercises every reference-scoring
+    site: forward/reverse edge admission and the prompt-margin term) runs a
+    real training step, records full_ft: true, writes no adapter_config.json
+    under out_dir/adapter (peft_config=None -> plain model.save_pretrained),
+    and logs exactly one mechanism.jsonl record for the one optimiser step."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "full")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setenv("RUN_FULL_FT", "1")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["full_ft"] is True
+    assert not (out_dir / "adapter" / "adapter_config.json").exists()
+    mechanism_lines = (out_dir / "mechanism.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(mechanism_lines) == 1
+
+
+# ---------------------------------------------------------------------------
+# conpo/trainer.py: ConPOTrainer.__init__'s construction-time guard (review
+# finding, B7 2026-09-04) -- a non-PEFT model with beta == 0.0 leaves TRL's
+# self.ref_model None, which _reference_model would otherwise hand to a
+# reference-scoring site with nothing to score under; the guard must reject
+# that combination before super().__init__() returns, not on the first step.
+# ---------------------------------------------------------------------------
+
+
+def _no_ref_model_trainer_args(tmp_path: Path) -> tuple[Qwen3ForCausalLM, AutoTokenizer, GRPOConfig]:
+    tokenizer = AutoTokenizer.from_pretrained(config.POLICY_MODEL)
+    cfg = Qwen3Config(
+        vocab_size=151936,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=64,
+        max_position_embeddings=512,
+    )
+    model = Qwen3ForCausalLM(cfg)
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=8,
+        max_steps=1,
+        use_vllm=False,
+        beta=0.0,  # trl only builds self.ref_model when beta != 0.0
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    return model, tokenizer, grpo_config
+
+
+def test_full_ft_with_zero_beta_raises_before_engine_factory_runs(tmp_path: Path) -> None:
+    model, tokenizer, grpo_config = _no_ref_model_trainer_args(tmp_path)
+    row = {"prompt": [{"role": "user", "content": "Explain gravity."}], "key": "row-0"}
+    dataset = Dataset.from_list([row])
+    arm, overrides = resolve_arm("solve_only")
+
+    def _engine_factory(_trainer: ConPOTrainer) -> object:
+        raise AssertionError("engine_factory must not run: the guard raises during super().__init__()")
+
+    with pytest.raises(ValueError, match="RUN_FULL_FT"):
+        ConPOTrainer(
+            model=model,
+            args=grpo_config,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            arm=arm,
+            rows_by_key={},
+            edge_buffer=EdgeBuffer(),
+            feasible_buffer=FeasibleBuffer(),
+            stats=FamilyStats(),
+            judge=StaticJudge(keep=True),
+            engine_factory=_engine_factory,
+            meter=TokenMeter(budget=0),
+            mechanism_log_path=tmp_path / "mechanism.jsonl",
+            seed=0,
+            overrides=overrides,
+            peft_config=None,  # non-PEFT model
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -161,7 +161,15 @@ def _write_eval_dir(tmp_path: Path, name: str, *, with_retention: bool = False) 
     (eval_dir / "external.json").write_text(json.dumps(_external_json()), encoding="utf-8")
     (eval_dir / "internal.json").write_text(json.dumps(_internal_json()), encoding="utf-8")
     if with_retention:
-        retention = {"gsm8k": 0.8, "mmlu": 0.55, "bbh": 0.4, "alpacaeval2": 0.3}
+        # correct/n counts chosen so correct/n == the fraction each test
+        # already asserts (16/20=0.8, 11/20=0.55, 8/20=0.4).
+        retention = {
+            "gsm8k": 0.8,
+            "mmlu": 0.55,
+            "bbh": 0.4,
+            "n": {"gsm8k": 20, "mmlu": 20, "bbh": 20},
+            "correct": {"gsm8k": 16, "mmlu": 11, "bbh": 8},
+        }
         (eval_dir / "retention.json").write_text(json.dumps(retention), encoding="utf-8")
     return eval_dir
 
@@ -190,11 +198,15 @@ def test_front_matter_pending_and_updated(tmp_path: Path) -> None:
     assert "eval_dir: pending" in text
 
 
-# --- eval_dir (USER DECISIONS 2026-09-03: 28-key contract) -----------------------
+# --- eval_dir (USER DECISIONS 2026-09-03: 27-key contract) -----------------------
 
 
-def test_contract_has_28_keys_with_eval_dir_immediately_before_updated() -> None:
-    assert len(run_card.FRONT_MATTER_KEYS) == 28
+def test_contract_has_27_keys_with_eval_dir_immediately_before_updated() -> None:
+    # The retention suite's fourth benchmark was dropped (user decision
+    # 2026-09-04): 28 keys down to 27, three retention_* keys left.
+    assert len(run_card.FRONT_MATTER_KEYS) == 27
+    retention_keys = [k for k in run_card.FRONT_MATTER_KEYS if k.startswith("retention_")]
+    assert retention_keys == ["retention_gsm8k", "retention_mmlu", "retention_bbh"]
     assert run_card.FRONT_MATTER_KEYS[-2:] == ("eval_dir", "updated")
 
 
@@ -258,13 +270,62 @@ def test_results_table_carries_wilson_ci_for_pacc_rows(tmp_path: Path) -> None:
     assert "| Retention gsm8k | not wired | not wired |" in results_section
 
 
-def test_retention_ci_cell_stays_not_wired_when_retention_present(tmp_path: Path) -> None:
+def test_retention_ci_computed_from_correct_and_n(tmp_path: Path) -> None:
+    """Retention rows get a real Wilson CI computed from retention.json's
+    own "correct"/"n" counts (design choice, builder 2026-09-04). The user
+    dropped the fourth retention benchmark for now (2026-09-04), leaving
+    three."""
     run_dir = _write_run_dir(tmp_path, "tmp_run_ret")
     eval_dir = _write_eval_dir(tmp_path, "eval_tmp_run_ret", with_retention=True)
     plan = run_card.resolve_plan_for_run(run_dir)
     text = run_card.render_card(plan, run_dir, eval_dir, None, AS_OF)
     results_section = text.split("## 4. Results")[1].split("## 5.")[0]
-    assert "| Retention gsm8k | 0.8 | not wired |" in results_section
+
+    from conpo.stats import wilson_interval
+
+    lo, hi = wilson_interval(16, 20)
+    assert f"| Retention gsm8k | 0.8 | [{run_card._fmt(lo)}, {run_card._fmt(hi)}] |" in results_section
+    retention_rows = [line for line in results_section.splitlines() if line.startswith("| Retention ")]
+    assert len(retention_rows) == 3
+
+
+def test_retention_ci_falls_back_to_config_retention_sizes_when_n_absent(tmp_path: Path) -> None:
+    run_dir = _write_run_dir(tmp_path, "tmp_run_ret2")
+    eval_dir = tmp_path / "runs" / "eval_tmp_run_ret2"
+    eval_dir.mkdir(parents=True)
+    (eval_dir / "external.json").write_text(json.dumps(_external_json()), encoding="utf-8")
+    (eval_dir / "internal.json").write_text(json.dumps(_internal_json()), encoding="utf-8")
+    (eval_dir / "retention.json").write_text(
+        json.dumps({"gsm8k": 0.5, "correct": {"gsm8k": 660}}), encoding="utf-8"
+    )
+    plan = run_card.resolve_plan_for_run(run_dir)
+    text = run_card.render_card(plan, run_dir, eval_dir, None, AS_OF)
+    results_section = text.split("## 4. Results")[1].split("## 5.")[0]
+
+    from conpo import config as cfg
+    from conpo.stats import wilson_interval
+
+    lo, hi = wilson_interval(660, cfg.RETENTION_SIZES["gsm8k"])
+    assert f"| Retention gsm8k | 0.5 | [{run_card._fmt(lo)}, {run_card._fmt(hi)}] |" in results_section
+
+
+def test_retention_ci_pending_when_benchmark_absent(tmp_path: Path) -> None:
+    """conpo/retention.py leaves a benchmark it didn't run out of
+    retention.json entirely -- the row must read pending, not crash on a
+    missing key or fall back to "not wired"."""
+    run_dir = _write_run_dir(tmp_path, "tmp_run_ret3")
+    eval_dir = tmp_path / "runs" / "eval_tmp_run_ret3"
+    eval_dir.mkdir(parents=True)
+    (eval_dir / "external.json").write_text(json.dumps(_external_json()), encoding="utf-8")
+    (eval_dir / "internal.json").write_text(json.dumps(_internal_json()), encoding="utf-8")
+    (eval_dir / "retention.json").write_text(
+        json.dumps({"gsm8k": 0.5, "n": {"gsm8k": 1319}, "correct": {"gsm8k": 660}}), encoding="utf-8"
+    )
+    plan = run_card.resolve_plan_for_run(run_dir)
+    text = run_card.render_card(plan, run_dir, eval_dir, None, AS_OF)
+    results_section = text.split("## 4. Results")[1].split("## 5.")[0]
+    assert "| Retention mmlu | pending | pending |" in results_section
+    assert "| Retention bbh | pending | pending |" in results_section
 
 
 # --- results table ---------------------------------------------------------------
@@ -449,17 +510,17 @@ def test_notes_preserved_across_regeneration(tmp_path: Path) -> None:
 # --- --planned -----------------------------------------------------------------
 
 
-def test_planned_writes_exactly_23_files_with_listed_run_ids(tmp_path: Path) -> None:
+def test_planned_writes_exactly_24_files_with_listed_run_ids(tmp_path: Path) -> None:
     out_dir = tmp_path / "cards"
     run_card.main(["--planned", "--out", str(out_dir), "--as-of", AS_OF])
 
     written = {p.stem for p in out_dir.glob("*.md")}
     expected = {plan.run_id for plan in run_card.ALL_PLANS}
-    assert len(expected) == 23
+    assert len(expected) == 24
     assert written == expected
 
     expected_train_ids = {
-        "full_s42", "full_s43", "full_s44",
+        "full_s42", "full_s43", "full_s44", "untrained",
         "ifrlvr_s42", "ifrlvr_s43", "ifrlvr_s44",
         "solve_only_s42",
         "full_no_exactness_s42", "full_no_distance_s42", "vf_dpo_s42",
@@ -475,8 +536,8 @@ def test_planned_writes_exactly_23_files_with_listed_run_ids(tmp_path: Path) -> 
 def test_planned_estimates_sum_to_documented_totals(tmp_path: Path) -> None:
     training_total = sum(p.est_h100h for p in run_card.PLANNED_RUNS)
     eval_total = sum(p.est_h100h for p in run_card.PLANNED_EVALS)
-    assert training_total == 375.0
-    assert eval_total == 27.0
+    assert training_total == 375.0  # "untrained" adds 0.0, sum unchanged
+    assert eval_total == 24.0  # eval_retention 7.0 -> 4.0 (suite's fourth benchmark dropped)
 
 
 def test_planned_h6_multi_is_planned(tmp_path: Path) -> None:
@@ -633,3 +694,113 @@ def test_main_single_run_dir_writes_one_card(tmp_path: Path) -> None:
 def test_main_requires_run_dir_or_planned() -> None:
     with pytest.raises(SystemExit):
         run_card.main([])
+
+
+# --- untrained-policy card (design choice, builder, 2026-09-04) --------------------
+
+
+def test_untrained_planned_card_is_planned_and_out_of_arms(tmp_path: Path) -> None:
+    out_dir = tmp_path / "cards"
+    run_card.main(["--planned", "--out", str(out_dir), "--as-of", AS_OF])
+    text = (out_dir / "untrained.md").read_text(encoding="utf-8")
+    assert "arm: untrained" in text
+    assert "block: floor" in text
+    assert "status: planned" in text
+    assert "est_h100h: 0" in text
+    from conpo.arms import ARMS
+
+    assert "untrained" not in ARMS
+
+
+def test_untrained_status_done_when_eval_dir_has_external_json(tmp_path: Path) -> None:
+    """The untrained card never trains (no run_dir with metadata), so its
+    status must come from its own eval_dir's external.json, not from
+    derive_status's run_metadata.json check (which it would never pass)."""
+    plan = next(p for p in run_card.PLANNED_RUNS if p.run_id == "untrained")
+    eval_dir = _write_eval_dir(tmp_path, "eval_untrained")
+    text = run_card.render_card(plan, None, eval_dir, None, AS_OF)
+    assert "status: done" in text
+
+
+def test_untrained_status_planned_when_no_eval_dir(tmp_path: Path) -> None:
+    plan = next(p for p in run_card.PLANNED_RUNS if p.run_id == "untrained")
+    text = run_card.render_card(plan, None, None, None, AS_OF)
+    assert "status: planned" in text
+
+
+def test_untrained_status_override_still_wins(tmp_path: Path) -> None:
+    plan = next(p for p in run_card.PLANNED_RUNS if p.run_id == "untrained")
+    eval_dir = _write_eval_dir(tmp_path, "eval_untrained2")
+    text = run_card.render_card(plan, None, eval_dir, "failed", AS_OF)
+    assert "status: failed" in text
+
+
+# --- H4 compute section: admitted edges (design choice, builder, 2026-09-04) -------
+
+
+def test_last_mechanism_field_reads_last_record_that_carries_it() -> None:
+    records = [{"step": 1, "cumulative_admitted_edges": 3}, {"step": 2}, {"step": 3, "cumulative_admitted_edges": 9}]
+    assert run_card.last_mechanism_field(records, "cumulative_admitted_edges") == 9
+    assert run_card.last_mechanism_field(records, "no_such_field") is None
+
+
+def test_compute_section_reports_admitted_edges(tmp_path: Path) -> None:
+    run_dir = _write_run_dir(tmp_path, "tmp_run_edges")
+    plan = run_card.resolve_plan_for_run(run_dir)
+    text = run_card.render_card(plan, run_dir, None, None, AS_OF)
+    compute_section = text.split("## 3. Compute")[1].split("## 4.")[0]
+    # _mechanism_records's last record with the field carries no
+    # cumulative_admitted_edges key at all (the fixture predates wave 2),
+    # so this must read pending rather than crash.
+    assert "admitted edges: pending" in compute_section
+
+
+def test_compute_section_reads_cumulative_admitted_edges(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "tmp_run_edges2"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_metadata.json").write_text(json.dumps(_run_metadata()), encoding="utf-8")
+    records = [
+        {"step": 1, "cumulative_admitted_edges": 4},
+        {"step": 2, "cumulative_admitted_edges": 11},
+    ]
+    with (run_dir / "mechanism.jsonl").open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
+    plan = run_card.resolve_plan_for_run(run_dir)
+    text = run_card.render_card(plan, run_dir, None, None, AS_OF)
+    compute_section = text.split("## 3. Compute")[1].split("## 4.")[0]
+    assert "admitted edges: 11" in compute_section
+
+
+# --- H5 diagnostic: mean prompt_gamma_theta (design choice, builder, 2026-09-04) ---
+
+
+def test_mean_of_last_n_with_field_averages_only_the_last_n_that_carry_it() -> None:
+    records = [{"prompt_gamma_theta": 1.0}, {"step": 2}, {"prompt_gamma_theta": 3.0}]
+    assert run_card.mean_of_last_n_with_field(records, "prompt_gamma_theta", n=20) == 2.0
+    assert run_card.mean_of_last_n_with_field(records, "no_such_field") is None
+
+
+def test_mechanism_section_reports_prompt_gamma_theta_pending_with_no_data(tmp_path: Path) -> None:
+    run_dir = _write_run_dir(tmp_path, "tmp_run_gamma_pending")
+    plan = run_card.resolve_plan_for_run(run_dir)
+    text = run_card.render_card(plan, run_dir, None, None, AS_OF)
+    mechanism_section = text.split("## 5. Mechanism metrics")[1]
+    assert "prompt gamma theta (mean, last 20 records): pending" in mechanism_section
+
+
+def test_mechanism_section_reports_mean_prompt_gamma_theta_over_last_20_records(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "tmp_run_gamma"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_metadata.json").write_text(json.dumps(_run_metadata()), encoding="utf-8")
+    # 25 records: the first 5 carry no prompt_gamma_theta at all (as if the
+    # arm had no prompt term yet), the last 20 do, values 1..20 (mean 10.5).
+    records = [{"step": i} for i in range(5)]
+    records += [{"step": 5 + i, "prompt_gamma_theta": float(i + 1)} for i in range(20)]
+    with (run_dir / "mechanism.jsonl").open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
+    plan = run_card.resolve_plan_for_run(run_dir)
+    text = run_card.render_card(plan, run_dir, None, None, AS_OF)
+    mechanism_section = text.split("## 5. Mechanism metrics")[1]
+    assert "prompt gamma theta (mean, last 20 records): 10.5" in mechanism_section

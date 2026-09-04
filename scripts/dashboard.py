@@ -36,10 +36,13 @@ Design choices not fixed by the card contract (dated 2026-09-03):
   block name and arm name -- an eval card's ``block`` holds a free-text
   checkpoint count description and its ``arm`` holds a free-text suite
   description.
-* Retention column: the contract stores four separate ``retention_*``
-  fields; the dashboard's single "Retention" cell shows ``not wired`` when
-  all four are ``not wired``, ``pending`` when all four are ``pending``, and
-  otherwise every value as ``label=value`` pairs.
+* Retention column: the contract stores three separate ``retention_*``
+  fields (GSM8K, MMLU, BBH; the retention suite's fourth benchmark was
+  dropped, user decision 2026-09-04); the dashboard's single "Retention" cell shows
+  ``not wired`` when all three are ``not wired``, ``pending`` when all
+  three are ``pending``, and otherwise every value as a Wilson half-width
+  cell (see ``retention_cell``), the same style as the IFBench/IFEval
+  accuracy cells.
 * Totals: an "actual" total sums whatever ``actual_h100h`` values parse as
   a number and ignores ``pending`` ones; if none parse, the total reads
   "pending" rather than 0, since 0 would misreport an all-pending set as
@@ -71,6 +74,15 @@ share of it):
   ``_RESERCH2_ROOT``). A multi-seed arm averages each prompt's verdict
   across its "done" seeds first (``average_verdicts``). "pending" when
   either arm has no per-prompt verdicts yet on that metric.
+* H4/H5 row extras (design choice, builder, 2026-09-04): the H4 rows carry
+  an extra column with each arm's tokens generated, admitted edges, and
+  PAcc(eval_i) per 1e6 generated tokens / per 1e3 admitted edges
+  (``h4_compute_cell``, ``rate_per_unit``); the H5 row carries an extra
+  column with each arm's mean prompt_gamma_theta over its last 20
+  mechanism.jsonl records (``h5_gamma_cell``). Both read mechanism.jsonl
+  straight from the training run directory the run_id/RUN_OUT_DIR
+  convention implies (``resolve_run_dir``), since that field is not part of
+  the card contract. Every other row shows "-" in both columns.
 """
 
 from __future__ import annotations
@@ -85,7 +97,7 @@ from typing import Any, Callable
 
 from conpo import config as cfg
 from conpo.arms import HYPOTHESES, Hypothesis
-from conpo.stats import mean_std, paired_bootstrap_diff, wilson_interval
+from conpo.stats import mean_std, paired_bootstrap_diff, verdict_from_ci, wilson_interval
 
 # reserch2 root, two levels up from scripts/dashboard.py (conpo/scripts ->
 # conpo -> reserch2) -- the base a card's repo-relative "eval_dir" field
@@ -127,7 +139,6 @@ CARD_KEYS: tuple[str, ...] = (
     "retention_gsm8k",
     "retention_mmlu",
     "retention_bbh",
-    "retention_alpacaeval2",
     "eval_dir",
     "updated",
 )
@@ -148,6 +159,7 @@ PENDING = "pending"
 
 BLOCK_ORDER: tuple[str, ...] = (
     "hub",
+    "floor",
     "H1",
     "H1 attribution",
     "H2",
@@ -278,18 +290,20 @@ def _fmt_num(x: float) -> str:
     return text if text else "0"
 
 
-def accuracy_cell(card: dict[str, str], metric: str) -> str:
-    """"value +/- half-width" (USER DECISIONS 2026-09-03: Wilson 95%
-    half-width, FIXED_N[metric]) for one run-table accuracy cell, or the
-    bare "pending" when the card's value is pending -- never "pending +/-
-    pending"."""
-    value = parse_float(card[metric])
-    if value is None:
+def _half_width_cell(value: float | None, n: int | None) -> str:
+    """"value +/- half-width" (Wilson 95% half-width at n), or the bare
+    "pending" when value or n is unavailable -- never "pending +/- pending"."""
+    if value is None or n is None:
         return PENDING
-    n = FIXED_N[metric]
     k = max(0, min(n, round(value * n)))
     lo, hi = wilson_interval(k, n)
     return f"{_fmt_num(value)} +/- {_fmt_num((hi - lo) / 2)}"
+
+
+def accuracy_cell(card: dict[str, str], metric: str) -> str:
+    """One run-table accuracy cell (USER DECISIONS 2026-09-03: Wilson 95%
+    half-width at FIXED_N[metric]) -- see _half_width_cell."""
+    return _half_width_cell(parse_float(card[metric]), FIXED_N.get(metric))
 
 
 def pacc_cell(card: dict[str, str]) -> str:
@@ -301,13 +315,22 @@ def pacc_cell(card: dict[str, str]) -> str:
 
 
 def retention_cell(card: dict[str, str]) -> str:
-    labels = ("gsm8k", "mmlu", "bbh", "alpacaeval2")
-    values = tuple(card[f"retention_{label}"] for label in labels)
-    if all(v == "not wired" for v in values):
+    """"label=value +/- half-width" per benchmark (three now, the retention
+    suite's fourth benchmark dropped, user decision 2026-09-04), Wilson half-width at
+    conpo.config.RETENTION_SIZES[label] -- same style as accuracy_cell/the
+    IFBench cell (design choice, builder, 2026-09-04)."""
+    labels = ("gsm8k", "mmlu", "bbh")
+    raw = tuple(card[f"retention_{label}"] for label in labels)
+    if all(v == "not wired" for v in raw):
         return "not wired"
-    if all(v == "pending" for v in values):
+    if all(v == "pending" for v in raw):
         return "pending"
-    return ", ".join(f"{label}={v}" for label, v in zip(labels, values))
+    cells = []
+    for label, v in zip(labels, raw):
+        value = parse_float(v)
+        cell = _half_width_cell(value, cfg.RETENTION_SIZES.get(label)) if value is not None else v
+        cells.append(f"{label}={cell}")
+    return ", ".join(cells)
 
 
 def card_link(card: dict[str, str]) -> str:
@@ -485,7 +508,7 @@ def build_data_and_evaluation_table(manifest: dict[str, Any] | None) -> list[str
         "",
         "Eval protocol: IFEval 541 and IFBench_test 300 at temperature 0, max new tokens 2048, "
         "thinking off, no system prompt; internal PAcc on the three splits; retention suite GSM8K, "
-        "MMLU, BBH, AlpacaEval 2 on the headline pair and the untrained policy.",
+        "MMLU, BBH on the headline pair and the untrained policy.",
         "",
         "Token-budget rule: ConPO's single pass over the subset, measured at M0; IF-RLVR first-pass "
         "checkpoint plus token-matched run.",
@@ -673,15 +696,102 @@ def average_verdicts(cards: list[dict[str, str]], metric: str) -> dict[Any, floa
     return {k: sum(m[k] for m in maps) / len(maps) for k in common_keys}
 
 
-def _verdict_from_ci(lo: float, hi: float, expected_sign: str) -> str:
-    """"supports" when the interval excludes zero on the expected side,
-    "null (opposite sign)" when it excludes zero on the other side, else
-    "null" (the interval includes zero)."""
-    if lo > 0:
-        return "supports" if expected_sign == ">" else "null (opposite sign)"
-    if hi < 0:
-        return "supports" if expected_sign == "<" else "null (opposite sign)"
-    return "null"
+# --- H4/H5 row extras: run_metadata.json's tokens_generated is already on
+# the card (front matter); cumulative_admitted_edges and prompt_gamma_theta
+# live only in mechanism.jsonl, which is not part of the card contract, so
+# these read it straight from the training run directory the run_id/
+# RUN_OUT_DIR convention implies (runs/<run_id>, mirroring
+# scripts/run_card.py's launch_line and slurm/train.sbatch's RUN_OUT_DIR
+# default) -- design choice, builder, 2026-09-04.
+
+
+def resolve_run_dir(card: dict[str, str]) -> Path:
+    return _CONPO_REPO_ROOT / "runs" / card["run_id"]
+
+
+def _load_mechanism(path: Path) -> list[dict[str, Any]]:
+    """Mirrors scripts/run_card.py's load_mechanism (dashboard.py has no
+    import path to that script, same reason as _fmt_num above)."""
+    if not path.is_file():
+        return []
+    records: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                records.append(json.loads(line))
+    return records
+
+
+def _last_mechanism_field(records: list[dict[str, Any]], field: str) -> Any:
+    """Mirrors scripts/run_card.py's last_mechanism_field."""
+    record = next((r for r in reversed(records) if field in r), None)
+    return record.get(field) if record is not None else None
+
+
+def admitted_edges_for_card(card: dict[str, str]) -> int | None:
+    mechanism = _load_mechanism(resolve_run_dir(card) / "mechanism.jsonl")
+    return _last_mechanism_field(mechanism, "cumulative_admitted_edges")
+
+
+def prompt_gamma_theta_mean_for_card(card: dict[str, str]) -> float | None:
+    """Mean of prompt_gamma_theta over the last 20 mechanism.jsonl records
+    that carry it (mirrors scripts/run_card.py's
+    mean_of_last_n_with_field), or None when none do."""
+    mechanism = _load_mechanism(resolve_run_dir(card) / "mechanism.jsonl")
+    values = [r["prompt_gamma_theta"] for r in mechanism if "prompt_gamma_theta" in r]
+    if not values:
+        return None
+    tail = values[-20:]
+    return sum(tail) / len(tail)
+
+
+def rate_per_unit(value: float | None, denom: float | None, scale: float) -> str:
+    """value / denom * scale, 4dp (mirrors _fmt_num), or "pending" when
+    value or denom is missing or non-positive -- the one small helper for
+    the H4 row's PAcc-per-1e6-tokens / PAcc-per-1e3-edges arithmetic."""
+    if value is None or denom is None or denom <= 0:
+        return PENDING
+    return _fmt_num(value / denom * scale)
+
+
+def _first_card(cards: list[dict[str, str]]) -> dict[str, str] | None:
+    # ponytail: reports one representative seed's compute/gamma stats, not a
+    # multi-seed mean, so a 3-seed arm's H4/H5 columns reflect only 1 of 3
+    # seeds; revisit with a real mean if per-seed compute/gamma varies.
+    return next((c for c in cards if c["status"] == "done"), cards[0] if cards else None)
+
+
+def h4_compute_cell(treatment_cards: list[dict[str, str]], control_cards: list[dict[str, str]]) -> str:
+    """"tok T/C edges T/C PAcc/1e6tok T/C PAcc/1e3edges T/C" for an H4 row,
+    or "-" when either arm resolves to no card at all."""
+    t_card, c_card = _first_card(treatment_cards), _first_card(control_cards)
+    if t_card is None or c_card is None:
+        return "-"
+    t_tokens, c_tokens = parse_float(t_card["tokens_generated"]), parse_float(c_card["tokens_generated"])
+    t_edges, c_edges = admitted_edges_for_card(t_card), admitted_edges_for_card(c_card)
+    t_pacc, c_pacc = parse_float(t_card["pacc_eval_i"]), parse_float(c_card["pacc_eval_i"])
+
+    def fmt_or_pending(v: float | int | None) -> str:
+        return _fmt_num(v) if v is not None else PENDING
+
+    tok = f"{fmt_or_pending(t_tokens)}/{fmt_or_pending(c_tokens)}"
+    edges = f"{fmt_or_pending(t_edges)}/{fmt_or_pending(c_edges)}"
+    per_tok = f"{rate_per_unit(t_pacc, t_tokens, 1e6)}/{rate_per_unit(c_pacc, c_tokens, 1e6)}"
+    per_edge = f"{rate_per_unit(t_pacc, t_edges, 1e3)}/{rate_per_unit(c_pacc, c_edges, 1e3)}"
+    return f"tok {tok} edges {edges} PAcc/1e6tok {per_tok} PAcc/1e3edges {per_edge}"
+
+
+def h5_gamma_cell(treatment_cards: list[dict[str, str]], control_cards: list[dict[str, str]]) -> str:
+    """"treatment/control" mean prompt_gamma_theta for the H5 row, or "-"
+    when either arm resolves to no card at all."""
+    t_card, c_card = _first_card(treatment_cards), _first_card(control_cards)
+    if t_card is None or c_card is None:
+        return "-"
+    t_mean = prompt_gamma_theta_mean_for_card(t_card)
+    c_mean = prompt_gamma_theta_mean_for_card(c_card)
+    t_str = _fmt_num(t_mean) if t_mean is not None else PENDING
+    c_str = _fmt_num(c_mean) if c_mean is not None else PENDING
+    return f"{t_str}/{c_str}"
 
 
 def hypothesis_delta(
@@ -703,7 +813,7 @@ def hypothesis_delta(
     b = [c_map[k] for k in keys]
     point, lo, hi = paired_bootstrap_diff(a, b, n_resamples=10000, seed=0)
     delta_str = f"{point:+.3f} [{lo:+.3f}, {hi:+.3f}]"
-    return delta_str, _verdict_from_ci(lo, hi, expected_sign)
+    return delta_str, verdict_from_ci(lo, hi, expected_sign)
 
 
 def covered_hypothesis_numbers() -> set[str]:
@@ -742,9 +852,11 @@ def build_deferred_hypothesis_rows(train_cards: list[dict[str, str]]) -> list[st
         control_cards = resolve_identifier_cards("full", train_cards)
         delta_str, verdict = hypothesis_delta([card], control_cards, metric_key, ">")
         seeds_and_test = seeds_and_test_text(h_number)
+        # No deferred H-number is H4 or H5 today (H4/H5 both have real
+        # HYPOTHESES entries), so these two columns are always "-" here.
         rows.append(
             f"| {h_number} | {claim} | {card['run_id']} vs full | {metric_display} | {seeds_and_test} "
-            f"| {delta_str} | {verdict} |"
+            f"| {delta_str} | {verdict} | - | - |"
         )
     return rows
 
@@ -753,8 +865,9 @@ def build_hypotheses_section(train_cards: list[dict[str, str]]) -> list[str]:
     lines = [
         "## 2. Hypothesis verdicts",
         "",
-        "| H | Claim | Arms compared | Metric | Seeds and test | Delta [95% CI] | Verdict |",
-        "|---|---|---|---|---|---|---|",
+        "| H | Claim | Arms compared | Metric | Seeds and test | Delta [95% CI] | Verdict "
+        "| H4 compute tok/edges/rates (T/C) | H5 prompt gamma theta (T/C) |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for h in HYPOTHESES:
         metric = hypothesis_metric(h)
@@ -765,7 +878,12 @@ def build_hypotheses_section(train_cards: list[dict[str, str]]) -> list[str]:
         delta_str, verdict = hypothesis_delta(treatment_cards, control_cards, metric, h.expected_sign)
         seeds_and_test = seeds_and_test_text(h.id)
         metric_display = hypothesis_metric_display(h)
-        lines.append(f"| {h.id} | {claim} | {arms} | {metric_display} | {seeds_and_test} | {delta_str} | {verdict} |")
+        h4_cell = h4_compute_cell(treatment_cards, control_cards) if h.id.startswith("H4") else "-"
+        h5_cell = h5_gamma_cell(treatment_cards, control_cards) if h.id.startswith("H5") else "-"
+        lines.append(
+            f"| {h.id} | {claim} | {arms} | {metric_display} | {seeds_and_test} | {delta_str} | {verdict} "
+            f"| {h4_cell} | {h5_cell} |"
+        )
     lines += build_deferred_hypothesis_rows(train_cards)
     lines.append("")
     return lines
@@ -826,8 +944,8 @@ def build_statistics_section() -> list[str]:
         "Intervals and bootstraps cost 0 GPU-hours (CPU, seconds, from the stored per-prompt verdicts).",
         "",
         "Seed replication is the only compute that buys statistical power: the 2 extra seeds on the "
-        "headline pair cost 48 H100-h of training (2 x (18 + 6)) plus about 7 H100-h of eval and "
-        "retention, about 55 H100-h, about 1.1 days on 2x H100, already inside the total; each further "
+        "headline pair cost 48 H100-h of training (2 x (18 + 6)) plus about 4 H100-h of eval and "
+        "retention, about 52 H100-h, about 1.1 days on 2x H100, already inside the total; each further "
         "seed on the headline pair costs about 27 H100-h (24 training, 3 eval), about 0.6 days on 2x "
         "H100, and narrows the seed-level std only.",
         "",

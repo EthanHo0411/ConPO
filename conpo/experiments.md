@@ -41,7 +41,7 @@ against the locked headline baseline; H2-H5 are unchanged from the paper.
 | H | Claim | Arms compared | Deciding metric |
 |---|---|---|---|
 | H1 | Verifier-dominating counterfactual pairs improve first-pass compliance beyond the RLVR baseline | `full` vs `ifrlvr` (base, untrained, and `solve_only` as reference floors) | IFBench prompt-level loose accuracy (external, the 58 unseen `IFBench_test` families) |
-| H2 | Exact, minimal pairs outperform independent or non-minimal preference pairs | `reverse_only` vs `RUN_NO_EXACTNESS`, `RUN_NO_DISTANCE` | Internal PAcc splits |
+| H2 | Exact, minimal pairs outperform independent or non-minimal preference pairs | `full` vs `full` with `RUN_NO_EXACTNESS=1`, `full` with `RUN_NO_DISTANCE=1`, `vf_dpo` (registry `H2_no_exactness`, `H2_no_distance`, `H2_vf_dpo` on `eval_i` PAcc) | Internal PAcc splits |
 | H3 | Forward repair and reverse corruption provide complementary relevance and coverage | `full` vs `forward_only` vs `reverse_only` | Internal PAcc splits |
 | H4 | Transfer-aware selection is more compute-efficient than uniform or 50%-success sampling | `full` vs `RUN_SELECTION=uniform` vs `RUN_SELECTION=half` | Internal PAcc splits, normalised by generated tokens and by admitted edges |
 | H5 | Prompt counterfactuals improve constraint-conditional preferences | `full` vs `RUN_LAMBDA_P=0` | Internal PAcc splits, alongside the `Gamma_theta` diagnostic |
@@ -60,26 +60,33 @@ operator variants.
 
 ### Implementation status
 
-`conpo/arms.py:HYPOTHESES` is the executable pre-registration for a subset
-of the edges above: `H1` (`full` vs `ifrlvr`) plus two attribution edges
-(`full` vs `solve_only`, `solve_only` vs `ifrlvr`), `H3_forward` /
-`H3_reverse` (`full` vs each single-direction arm), `H4_uniform` /
-`H4_half` (`full` vs each selection override), and `H5_lambda_p_zero`
-(`full` vs the `lambda_p=0` override). Two differences from the table
-above, both open items rather than contradictions: every entry there is
-currently keyed to one metric name, `ifbench_prompt_loose`, since the
-automated harness wiring the internal-PAcc comparisons in `eval_internal.py`
-(H2-H5's deciding metric per this doc) into that registry has not landed
-yet; and `H2` (exactness/minimality) and `H6` are not pre-registered there
-at all -- `H2` has no dedicated arm of its own (it reads `reverse_only`
-against the `RUN_NO_EXACTNESS`/`RUN_NO_DISTANCE` overrides, both of which
-exist as knobs but not yet as a registered comparison), and `H6`'s own
-mechanism (`Overrides.multi`, `conpo/compositor.py`, the `RUN_MULTI=1`
-reverse/trainer wiring) is fully built but deliberately kept out of
-`HYPOTHESES`: `scripts/dashboard.py` synthesizes the H6 dashboard row itself
-precisely because no `"H6*"` id exists in that tuple (its own
-`covered_hypothesis_numbers`/`build_deferred_hypothesis_rows`), and that
-script and its tests are a separate workflow's files.
+`conpo/arms.py:HYPOTHESES` is the executable pre-registration for every edge
+in the table above. `H1` (`full` vs `ifrlvr`) plus two attribution edges
+(`full` vs `solve_only`, `solve_only` vs `ifrlvr`) read IFBench prompt-level
+loose accuracy (`ifbench_prompt_loose`); `H3_forward` / `H3_reverse` (`full`
+vs each single-direction arm), `H4_uniform` / `H4_half` (`full` vs each
+selection override), and `H5_lambda_p_zero` (`full` vs the `lambda_p=0`
+override) read internal PAcc on the `eval_i` split (`eval_i_prompt_loose`).
+
+`H2` (exactness/minimality) is registered as three rows against internal
+`eval_i` PAcc: `H2_no_exactness` and `H2_no_distance` (`full` vs `full`
+with the `RUN_NO_EXACTNESS=1` / `RUN_NO_DISTANCE=1` override, matching
+`scripts/run_card.py`'s `PLANNED_RUNS` block `"H2"` -- treatment and
+control follow the run cards' arm (`full` with the gate off), not this
+doc's earlier "`reverse_only` vs the override" framing, since no run card
+trains `reverse_only` with those overrides), and `H2_vf_dpo` (`full` vs the
+verifier-filtered independent-pairs DPO baseline, locked decision
+2026-09-02(c)). `objective_isolation_edge_dpo` (`full` vs `edge_dpo`) also
+reads `eval_i_prompt_loose`.
+
+`H6` is registered too, as `H6_multi` (`full:multi=1` vs `full`): its
+`metric` field stays a compound placeholder string
+(`pacc_eval_ii_and_pacc_eval_iii_prompt_loose`, see that row's own comment
+in `arms.py`) since it reports on two PAcc splits at once and
+`scripts/dashboard.py` derives the real per-split metric from the id's
+`H6` prefix rather than parsing `metric` directly -- the same pattern that
+script already used for H2-H5 before this file gave them real metric
+strings.
 
 ## Seeds
 

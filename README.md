@@ -62,6 +62,7 @@ export env only and never retype a value `scripts/train.py` can read from
 | `RUN_NUM_GENERATIONS` | integer, default `config.NUM_GENERATIONS` (8) | `scripts/train.py`, also written to `run_metadata.json` as `num_generations`. Smoke and shape tests only -- cluster runs never set this. |
 | `RUN_MAX_COMPLETION_TOKENS` | integer, default `config.MAX_COMPLETION_TOKENS` (1024) | `scripts/train.py`, also written to `run_metadata.json` as `max_completion_tokens`. Smoke and shape tests only -- cluster runs never set this. |
 | `RUN_EFFECTIVE_BATCH` | integer, default `config.EFFECTIVE_BATCH` (128) | `scripts/train.py`, also written to `run_metadata.json` as `effective_batch`. Smoke and shape tests only -- cluster runs never set this. |
+| `RUN_FULL_FT` | `1` | `scripts/train.py`, default `0` there: `1` trains every weight (`peft_config=None`) instead of a LoRA adapter, for the full-FT point-check (`slurm/train_fullft.sbatch`); recorded as `run_metadata.json`'s `full_ft`. Reference scoring runs under TRL's own `self.ref_model` instead of a disabled adapter (`conpo/trainer.py`'s `_reference_model`); see "What is untested" for what still isn't. |
 
 `conpo/arms.py:resolve_arm` and the `ConPOTrainer` it configures are
 exercised on CPU by `tests/test_trainer_tiny.py`, which constructs the
@@ -137,11 +138,62 @@ unverified on the cluster.
    `RUN_ARM=full RUN_SEED=42 RUN_JUDGE_MODE=http sbatch --export=ALL,RUN_ARM,RUN_SEED,RUN_JUDGE_MODE slurm/train.sbatch`
    (`slurm/train.sbatch` waits for the judge endpoint only in this mode).
 
-4. **Evaluate a finished run**:
+4. **DPO baseline launch** (one H100, `vf_dpo` | `edge_dpo`, USER DECISIONS
+   2026-09-02(c)): `slurm/train_dpo.sbatch` builds `RUN_PAIRS` with
+   `scripts/build_pairs.py` first (skipped when a pairs file already
+   exists), then trains with `scripts/train_dpo.py`.
+   ```bash
+   RUN_ARM=vf_dpo RUN_SEED=42 \
+     sbatch --export=ALL,RUN_ARM,RUN_SEED slurm/train_dpo.sbatch
+   RUN_ARM=edge_dpo RUN_SEED=42 RUN_EDGES=runs/full_s42/edges.jsonl \
+     sbatch --export=ALL,RUN_ARM,RUN_SEED,RUN_EDGES slurm/train_dpo.sbatch
+   ```
+   `edge_dpo` needs a finished `full` run's `edges.jsonl` (default
+   `runs/full_s${RUN_SEED}/edges.jsonl`) and fails loud when it is missing.
+
+5. **Full fine-tune point-check** (two H100s, `slurm/train_fullft.sbatch`):
+   `RUN_FULL_FT=1` (`scripts/train.py`, `peft_config=None`) under an
+   `accelerate launch --config_file slurm/accelerate_fullft.yaml
+   --num_processes 2` ZeRO-2 launch, sharding the full optimizer state
+   across both cards. `RUN_OUT_DIR` is explicit (a plain
+   `runs/${RUN_ARM}_s${RUN_SEED}` default would collide with the LoRA
+   `full_s42` run):
+   ```bash
+   sbatch --export=ALL,RUN_ARM,RUN_SEED,RUN_FULL_FT,RUN_OUT_DIR \
+     slurm/train_fullft.sbatch
+   ```
+   (`RUN_ARM=full RUN_SEED=42 RUN_FULL_FT=1 RUN_OUT_DIR=runs/full_fullft_s42`
+   -- the `full_fullft_s42` card's own launch line.) See "What is untested"
+   for the two open questions this script has never run against.
+
+6. **Model-axis replications** (one H100, `RUN_ARM=full` only, `RUN_MODEL`
+   overriding `config.POLICY_MODEL`):
+   ```bash
+   RUN_ARM=full RUN_SEED=42 RUN_MODEL=Qwen/Qwen3-8B RUN_OUT_DIR=runs/full_qwen3_8b_s42 \
+     sbatch --export=ALL,RUN_ARM,RUN_SEED,RUN_MODEL,RUN_OUT_DIR slurm/train.sbatch
+   RUN_ARM=full RUN_SEED=42 RUN_MODEL=allenai/Olmo-3-7B-Instruct-SFT RUN_OUT_DIR=runs/full_olmo3_7b_sft_s42 \
+     sbatch --export=ALL,RUN_ARM,RUN_SEED,RUN_MODEL,RUN_OUT_DIR slurm/train.sbatch
+   ```
+
+7. **Evaluate a finished run**:
    ```bash
    sbatch slurm/eval.sbatch runs/full_s42/adapter
    ```
    Omit the adapter argument to evaluate the base model.
+
+   **Evaluate every run in one sweep** (`slurm/eval_sweep.sh`, plain bash,
+   not an sbatch script -- run it from a login/head node):
+   ```bash
+   bash slurm/eval_sweep.sh                     # eval.sbatch: base + every runs/*/adapter
+   RETENTION=1 bash slurm/eval_sweep.sh          # + retention.sbatch (GSM8K/MMLU/BBH, USER DECISIONS)
+   DRY_RUN=1 bash slurm/eval_sweep.sh            # print the sbatch lines instead of submitting
+   ```
+   `RETENTION=1` submits `slurm/retention.sbatch` for the base model and for
+   the run ids in `RETENTION_RUNS` (default `full_s42 full_s43 full_s44
+   ifrlvr_s42 ifrlvr_s43 ifrlvr_s44`), e.g. `sbatch slurm/retention.sbatch
+   runs/full_s42/adapter`. `slurm/retention.sbatch` itself is being written
+   by another builder in parallel -- this is its assumed CLI shape, mirroring
+   `slurm/eval.sbatch`'s own "positional adapter dir, omit for base model".
 
 ## What is untested
 
@@ -195,3 +247,20 @@ even though the surrounding Python modules now exist and are CPU-tested:
   The ablation overrides are unit-tested at the mechanism level (e.g. the
   `selection` modes in `tests/test_reverse.py`), not end to end through
   `ConPOTrainer`.
+- `slurm/train_dpo.sbatch` -- never submitted; the `build_pairs.py --engine
+  vllm` step and `train_dpo.py`'s real-model path are unverified, same
+  caveats as `slurm/train.sbatch`'s own header.
+- `slurm/train_fullft.sbatch` / `slurm/accelerate_fullft.yaml` -- never
+  submitted; the ZeRO-2 ("no offload") config is a guess at fitting full
+  fp32 AdamW state across two H100s, and TRL's `vllm_mode="colocate"`
+  generation under a two-process accelerate/deepspeed launch has never been
+  exercised. `RUN_FULL_FT=1`'s reference scoring is a real, tested path
+  (`conpo/trainer.py`'s `_reference_model` scores under TRL's own
+  `self.ref_model` when there is no adapter to disable, see
+  `tests/test_train_knobs.py`'s full-FT test) -- only the two-process launch
+  above remains unverified.
+- `slurm/eval_sweep.sh` -- `bash -n` and one `DRY_RUN=1` run are checked on
+  this machine (no `runs/` directories to iterate); submitting it to Slurm
+  itself is untested. Its assumption about `slurm/retention.sbatch`'s CLI
+  (positional adapter dir, omit for base model) was confirmed by reading the
+  landed `slurm/retention.sbatch`, written by another builder.

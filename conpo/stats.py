@@ -127,6 +127,23 @@ def mcnemar(a: Sequence[bool], b: Sequence[bool]) -> McNemarResult:
     return McNemarResult(n01=n01, n10=n10, p_value=min(1.0, 2 * tail))
 
 
+def verdict_from_ci(lo: float, hi: float, expected_sign: str) -> str:
+    """"supports" when the interval excludes zero on the expected side,
+    "null (opposite sign)" when it excludes zero on the other side, else
+    "null" (the interval includes zero).
+
+    Same logic and return strings as scripts/dashboard.py's
+    ``_verdict_from_ci`` (design choice, builder, 2026-09-04: the shared
+    home for both callers -- scripts/analyze.py's hypothesis_table treats
+    "no matched seed pairs" as a fourth state, "pending", on top of this).
+    """
+    if lo > 0:
+        return "supports" if expected_sign == ">" else "null (opposite sign)"
+    if hi < 0:
+        return "supports" if expected_sign == "<" else "null (opposite sign)"
+    return "null"
+
+
 def holm(pvalues: Sequence[float]) -> list[float]:
     """Holm-Bonferroni step-down adjusted p-values, returned in the same
     order as `pvalues` (not sorted).

@@ -2,7 +2,9 @@
 
 import random
 
+from conpo import config
 from conpo.data import PoolRow, TokenMeter
+from conpo.distance import token_distance
 from conpo.engine import FakeEngine
 from conpo.forward import (
     RepairResult,
@@ -38,6 +40,13 @@ def test_monotone_admit_distance() -> None:
 
 def test_monotone_admit_admitted() -> None:
     ok, reason = monotone_admit((_A, _B), (False, True), (True, True), d=0.1, delta=0.3)
+    assert ok and reason == "admitted"
+
+
+def test_monotone_admit_distance_gate_off_admits_despite_distance() -> None:
+    # RUN_NO_DISTANCE (Overrides.no_distance): the same over-bound candidate
+    # test_monotone_admit_distance rejects is admitted once distance_gate=False.
+    ok, reason = monotone_admit((_A, _B), (False, True), (True, True), d=0.5, delta=0.3, distance_gate=False)
     assert ok and reason == "admitted"
 
 
@@ -185,6 +194,65 @@ def test_repair_trajectory_already_feasible_response_needs_no_engine_call() -> N
     assert result == RepairResult(feasible_endpoints=[feasible_response], endpoint_sources=[[]])
     assert engine.calls == []
     assert meter.total == 0
+
+
+# ---------------------------------------------------------------------------
+# repair_trajectory: distance_gate (RUN_NO_DISTANCE) threading, section 2.2
+# ---------------------------------------------------------------------------
+
+FAR_Y0 = "The platform, rotates at a constant velocity."
+# Fixes NO_COMMA but is a near-total rewrite: well past DELTA's 0.3 bound.
+FAR_PROPOSAL = "A totally different machine spins forever without pause today."
+
+
+def _far_row(key: str = "row-far") -> PoolRow:
+    return PoolRow(
+        key=key,
+        base_prompt=FAR_Y0,
+        prompt=FAR_Y0,
+        sentences=(),
+        constraints=(NO_COMMA,),
+        english=True,
+        num_constraints=1,
+    )
+
+
+def test_repair_trajectory_distance_gate_rejects_then_admits_when_disabled() -> None:
+    row = _far_row()
+    judge = StaticJudge(keep=True)
+
+    d = token_distance(FAR_Y0, FAR_PROPOSAL)
+    assert d > config.DELTA  # sanity: the scenario exceeds the bound
+
+    gated = repair_trajectory(
+        row,
+        FAR_Y0,
+        FakeEngine([FAR_PROPOSAL]),
+        judge,
+        random.Random(0),
+        TokenMeter(budget=0),
+        current_update=0,
+        max_steps=1,
+        max_candidates=1,
+        distance_gate=True,
+    )
+    assert gated.edges == []
+    assert gated.reasons["distance"] == 1
+
+    ungated = repair_trajectory(
+        row,
+        FAR_Y0,
+        FakeEngine([FAR_PROPOSAL]),
+        judge,
+        random.Random(0),
+        TokenMeter(budget=0),
+        current_update=0,
+        max_steps=1,
+        max_candidates=1,
+        distance_gate=False,
+    )
+    assert len(ungated.edges) == 1
+    assert ungated.edges[0].y_plus == FAR_PROPOSAL
 
 
 # ---------------------------------------------------------------------------

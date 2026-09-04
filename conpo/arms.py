@@ -4,11 +4,21 @@ An ArmSpec is a static recipe: which reward function trains the policy and
 which counterfactual-construction mechanisms are switched on. Overrides layer
 the RUN_* ablation knobs (selection rule, veto/exactness/distance-gate
 disables, lambda_P override) on top of whichever arm is running.
+
+HYPOTHESES.metric (design choice, builder, 2026-09-04): most rows now carry
+the real metric string scripts/analyze.py's hypothesis_table computes on --
+"ifbench_prompt_loose" for the H1 rows, "eval_i_prompt_loose" for the H2-H5
+and objective_isolation_edge_dpo rows (internal PAcc on the eval_i split;
+_parse_metric strips the "_prompt_loose" suffix to source="eval_i", which
+conpo/data.py's split naming and scripts/eval_internal.py's verdicts.jsonl
+both use). H6_multi is the one row that still carries a compound placeholder
+string instead (see its own comment below) since it reports on two splits at
+once and scripts/dashboard.py derives its real per-split metric separately.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import NamedTuple
 
 from conpo import config
@@ -119,9 +129,30 @@ class Overrides:
     multi: bool = False
 
 
+_BOOL_OVERRIDE_FIELDS = frozenset({"no_veto", "no_exactness", "no_distance", "multi"})
+
+
+def _parse_arm_identifier(name: str) -> tuple[str, str | None, str | None]:
+    """"full" -> ("full", None, None); "full:no_exactness=1" -> ("full",
+    "no_exactness", "1") -- the same "arm:field=value" syntax
+    scripts/dashboard.py's resolve_identifier_cards parses for card lookups
+    (design choice, builder, 2026-09-04: kept in sync so a HYPOTHESES
+    treatment/control identifier resolves the same way through either
+    path)."""
+    if ":" not in name:
+        return name, None, None
+    arm_name, override_expr = name.split(":", 1)
+    override_field, override_value = override_expr.split("=", 1)
+    return arm_name, override_field, override_value
+
+
 def resolve_arm(name: str) -> tuple[ArmSpec, Overrides]:
-    """The named ArmSpec plus Overrides read from the RUN_* environment."""
-    validate(name)
+    """The named ArmSpec plus Overrides read from the RUN_* environment, with
+    an "arm:field=value" identifier's override (e.g. "full:no_exactness=1",
+    "full:selection=uniform") applied on top of the environment-derived
+    Overrides."""
+    arm_name, override_field, override_value = _parse_arm_identifier(name)
+    validate(arm_name)
     overrides = Overrides(
         selection=config.env("RUN_SELECTION", "transfer"),
         no_veto=config.env("RUN_NO_VETO", "0") == "1",
@@ -130,7 +161,16 @@ def resolve_arm(name: str) -> tuple[ArmSpec, Overrides]:
         lambda_p=float(config.env("RUN_LAMBDA_P", str(config.LAMBDA_P))),
         multi=config.env("RUN_MULTI", "0") == "1",
     )
-    return ARMS[name], overrides
+    if override_field is not None:
+        if override_field == "selection":
+            overrides = replace(overrides, selection=override_value)
+        elif override_field == "lambda_p":
+            overrides = replace(overrides, lambda_p=float(override_value))
+        elif override_field in _BOOL_OVERRIDE_FIELDS:
+            overrides = replace(overrides, **{override_field: override_value == "1"})
+        else:
+            raise ValueError(f"unknown override field: {override_field!r} in identifier {name!r}")
+    return ARMS[arm_name], overrides
 
 
 class Hypothesis(NamedTuple):
@@ -138,10 +178,10 @@ class Hypothesis(NamedTuple):
 
     treatment/control name an arm in ARMS, or an arm plus the Overrides
     field that ablates it (e.g. "full:selection=uniform",
-    "full:lambda_p=0") for the H4/H5 rows, which compare `full` against
-    itself under one disabled mechanism rather than against a different arm.
-    expected_sign is ">" when treatment's metric is expected to exceed
-    control's under the hypothesis.
+    "full:lambda_p=0", "full:no_exactness=1") for the H2/H4/H5 rows, which
+    compare `full` against itself under one disabled mechanism rather than
+    against a different arm. expected_sign is ">" when treatment's metric
+    is expected to exceed control's under the hypothesis.
     """
 
     id: str
@@ -155,33 +195,45 @@ HYPOTHESES: tuple[Hypothesis, ...] = (
     Hypothesis("H1", "full", "ifrlvr", "ifbench_prompt_loose", ">"),
     Hypothesis("H1_attribution_full_vs_solve_only", "full", "solve_only", "ifbench_prompt_loose", ">"),
     Hypothesis("H1_attribution_solve_only_vs_ifrlvr", "solve_only", "ifrlvr", "ifbench_prompt_loose", ">"),
-    Hypothesis("H3_forward", "full", "forward_only", "ifbench_prompt_loose", ">"),
-    Hypothesis("H3_reverse", "full", "reverse_only", "ifbench_prompt_loose", ">"),
-    Hypothesis("H4_uniform", "full", "full:selection=uniform", "ifbench_prompt_loose", ">"),
-    Hypothesis("H4_half", "full", "full:selection=half", "ifbench_prompt_loose", ">"),
-    Hypothesis("H5_lambda_p_zero", "full", "full:lambda_p=0", "ifbench_prompt_loose", ">"),
+    Hypothesis("H3_forward", "full", "forward_only", "eval_i_prompt_loose", ">"),
+    Hypothesis("H3_reverse", "full", "reverse_only", "eval_i_prompt_loose", ">"),
+    Hypothesis("H4_uniform", "full", "full:selection=uniform", "eval_i_prompt_loose", ">"),
+    Hypothesis("H4_half", "full", "full:selection=half", "eval_i_prompt_loose", ">"),
+    Hypothesis("H5_lambda_p_zero", "full", "full:lambda_p=0", "eval_i_prompt_loose", ">"),
+    # H2 (exactness/minimality): full (both admission gates on) against
+    # itself with one gate disabled, on internal eval_i PAcc. Treatment and
+    # control follow scripts/run_card.py's PLANNED_RUNS ("full" with
+    # RUN_NO_EXACTNESS=1 / RUN_NO_DISTANCE=1, block "H2"), not
+    # experiments.md's older "reverse_only vs the RUN_NO_*/RUN_NO_DISTANCE
+    # overrides" wording (design choice, builder, 2026-09-04) -- no run card
+    # trains reverse_only with those overrides, so there is nothing for that
+    # comparison to read.
+    Hypothesis("H2_no_exactness", "full", "full:no_exactness=1", "eval_i_prompt_loose", ">"),
+    Hypothesis("H2_no_distance", "full", "full:no_distance=1", "eval_i_prompt_loose", ">"),
     # H2 proxy (locked decision 2026-09-02(c)): full vs the verifier-filtered
-    # independent-pairs DPO baseline, on the one metric this registry wires
-    # today (see the module docstring's ifbench_prompt_loose note above).
-    Hypothesis("H2_vf_dpo", "full", "vf_dpo", "ifbench_prompt_loose", ">"),
+    # independent-pairs DPO baseline, on internal eval_i PAcc.
+    Hypothesis("H2_vf_dpo", "full", "vf_dpo", "eval_i_prompt_loose", ">"),
     # Objective-isolation row: full vs plain DPO on full's own dumped edge
     # buffer, isolating ConPO's contrastive objective from its
     # counterfactual-construction machinery (same edges, different training).
-    Hypothesis("objective_isolation_edge_dpo", "full", "edge_dpo", "ifbench_prompt_loose", ">"),
+    Hypothesis("objective_isolation_edge_dpo", "full", "edge_dpo", "eval_i_prompt_loose", ">"),
     # H6 (multi-constraint compositional generalisation, design 2026-09-03:
     # H6 is a built arm): full with RUN_MULTI=1 (Overrides.multi, this
     # module's resolve_arm; conpo/compositor.py, conpo/reverse.py,
     # conpo/trainer.py) vs full, no overrides. "full:multi=1" is the same
-    # "arm:field=value" identifier convention H4/H5 use against `full`
+    # "arm:field=value" identifier convention H2/H4/H5 use against `full`
     # itself (see resolve_arm's Overrides field names). The metric string
     # names both PAcc splits the plan's H6 row reads (eval_ii and eval_iii)
     # while staying parseable by scripts/analyze.py's _parse_metric (a
-    # "<source>_prompt_strict"/"<source>_prompt_loose" suffix, same as
-    # every other row's placeholder metric field) -- scripts/dashboard.py
-    # derives the real per-split metric from the id's H6 prefix instead
-    # (pacc_eval_iii for the Delta/Verdict cells, eval_iii being the harder
-    # split; "PAcc eval_ii, eval_iii" for the Metric column), the same
-    # pattern it already uses for H2-H5 (see dashboard.py's
-    # hypothesis_metric/hypothesis_metric_display).
+    # "<source>_prompt_strict"/"<source>_prompt_loose" suffix) -- unlike
+    # every other row above, this one is still a placeholder rather than a
+    # metric analyze.py's hypothesis_table can act on directly (no single
+    # verdicts source is keyed "pacc_eval_ii_and_pacc_eval_iii"), because it
+    # reports on two splits at once; scripts/dashboard.py derives the real
+    # per-split metric from the id's H6 prefix instead (pacc_eval_iii for
+    # the Delta/Verdict cells, eval_iii being the harder split; "PAcc
+    # eval_ii, eval_iii" for the Metric column), the same pattern it already
+    # used for H2-H5 before this module carried their real metric strings
+    # (see dashboard.py's hypothesis_metric/hypothesis_metric_display).
     Hypothesis("H6_multi", "full:multi=1", "full", "pacc_eval_ii_and_pacc_eval_iii_prompt_loose", ">"),
 )

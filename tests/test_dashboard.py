@@ -56,7 +56,6 @@ _TRAIN_KEYS = (
     "retention_gsm8k",
     "retention_mmlu",
     "retention_bbh",
-    "retention_alpacaeval2",
     "eval_dir",
     "updated",
 )
@@ -107,7 +106,6 @@ def _write_cards(cards_dir: Path) -> None:
             retention_gsm8k="not wired",
             retention_mmlu="not wired",
             retention_bbh="not wired",
-            retention_alpacaeval2="not wired",
             updated="2026-09-03",
         ),
         encoding="utf-8",
@@ -140,7 +138,6 @@ def _write_cards(cards_dir: Path) -> None:
             retention_gsm8k="not wired",
             retention_mmlu="not wired",
             retention_bbh="not wired",
-            retention_alpacaeval2="not wired",
             updated="2026-09-03",
         ),
         encoding="utf-8",
@@ -204,15 +201,15 @@ def _write_cards(cards_dir: Path) -> None:
         _card(
             run_id="eval_retention",
             kind="eval",
-            arm="GSM8K, MMLU, BBH, AlpacaEval 2",
+            arm="GSM8K, MMLU, BBH",
             overrides="none",
             block="7 checkpoints: full x3, ifrlvr token-matched x3, untrained",
             hypotheses="none",
             model="none",
             seed="none",
             status="planned",
-            est_h100h="7",
-            est_days_2xh100="0.1458",
+            est_h100h="4",
+            est_days_2xh100="0.0833",
             updated="2026-09-03",
         ),
         encoding="utf-8",
@@ -237,6 +234,31 @@ def test_blocks_appear_in_order(cards_dir: Path) -> None:
     order = ["### hub", "### H1", "### H1 attribution", "### H6"]
     positions = [out.index(marker) for marker in order]
     assert positions == sorted(positions)
+
+
+def test_floor_block_between_hub_and_h1(cards_dir: Path) -> None:
+    (cards_dir / "untrained.md").write_text(
+        _card(
+            run_id="untrained",
+            kind="train",
+            arm="untrained",
+            overrides="none",
+            block="floor",
+            hypotheses="none",
+            model="Qwen/Qwen3-4B",
+            seed="none",
+            status="done",
+            updated="2026-09-03",
+        ),
+        encoding="utf-8",
+    )
+    cards = dashboard.load_cards(cards_dir)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    order = ["### hub", "### floor", "### H1"]
+    positions = [out.index(marker) for marker in order]
+    assert positions == sorted(positions)
+    floor_section = out.split("### floor", 1)[1].split("### H1", 1)[0]
+    assert "| untrained | untrained |" in floor_section
 
 
 # --- ## 0. Shared configuration -----------------------------------------------
@@ -401,7 +423,8 @@ def test_h1_delta_pending_when_one_arm_has_no_verdicts_yet(tmp_path: Path) -> No
     cards = dashboard.load_cards(cards_root)
     out = dashboard.render_dashboard(cards, "2026-09-03")
     row = next(line for line in out.splitlines() if line.startswith("| H1 |"))
-    assert row.endswith("| pending | pending |")
+    # Delta/Verdict pending; the trailing H4/H5-only columns stay "-" for H1.
+    assert row.endswith("| pending | pending | - | - |")
     assert "supports" not in row
 
 
@@ -623,7 +646,7 @@ def test_h6_row_uses_the_real_hypotheses_entry(cards_dir: Path) -> None:
     assert "Interaction-selected multi-constraint edges improve compositional generalisation" in h6_row
     assert "full:multi=1 vs full" in h6_row
     assert "PAcc eval_ii, eval_iii" in h6_row
-    assert h6_row.endswith("| pending | pending |")
+    assert h6_row.endswith("| pending | pending | - | - |")
     assert "being built" not in h6_row
     assert "deferred" not in h6_row
 
@@ -704,6 +727,183 @@ def test_h6_delta_computed_from_pacc_eval_iii_per_prompt_verdicts(tmp_path: Path
     assert "+0.500" in row
     assert "supports" in row
     assert "pending" not in row
+
+
+# --- Retention: fourth benchmark dropped, Wilson half-width cell (design choice, builder, 2026-09-04) --
+
+
+def test_shared_configuration_drops_fourth_retention_benchmark(cards_dir: Path) -> None:
+    cards = dashboard.load_cards(cards_dir)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    # Three benchmarks named, directly followed by "on the headline pair" --
+    # a fourth item would sit between "BBH" and "on".
+    assert "GSM8K, MMLU, BBH on the headline pair" in out
+
+
+def test_retention_cell_shows_half_width_like_accuracy_cell() -> None:
+    from conpo.stats import wilson_interval
+
+    card = {"retention_gsm8k": "0.5", "retention_mmlu": "0.6", "retention_bbh": "0.7"}
+    cell = dashboard.retention_cell(card)
+
+    n = cfg.RETENTION_SIZES["gsm8k"]
+    lo, hi = wilson_interval(round(0.5 * n), n)
+    expected_gsm8k = f"gsm8k={dashboard._fmt_num(0.5)} +/- {dashboard._fmt_num((hi - lo) / 2)}"
+    assert expected_gsm8k in cell
+
+
+def test_retention_cell_not_wired_and_pending_still_short_circuit() -> None:
+    not_wired = {f"retention_{k}": "not wired" for k in ("gsm8k", "mmlu", "bbh")}
+    assert dashboard.retention_cell(not_wired) == "not wired"
+    pending = {f"retention_{k}": "pending" for k in ("gsm8k", "mmlu", "bbh")}
+    assert dashboard.retention_cell(pending) == "pending"
+
+
+# --- H4 row extras: tokens/edges/rates (design choice, builder, 2026-09-04) -------
+
+
+def test_rate_per_unit_pending_when_denom_missing_or_zero() -> None:
+    assert dashboard.rate_per_unit(0.5, None, 1e6) == "pending"
+    assert dashboard.rate_per_unit(0.5, 0, 1e6) == "pending"
+    assert dashboard.rate_per_unit(None, 100, 1e6) == "pending"
+
+
+def test_rate_per_unit_computes_scaled_ratio() -> None:
+    assert dashboard.rate_per_unit(0.5, 500000, 1e6) == "1"
+    assert dashboard.rate_per_unit(0.6, 300, 1e3) == "2"
+
+
+def test_admitted_edges_for_card_reads_run_dir_mechanism_jsonl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dashboard, "_CONPO_REPO_ROOT", tmp_path)
+    run_dir = tmp_path / "runs" / "full_s42"
+    run_dir.mkdir(parents=True)
+    records = [{"step": 1, "cumulative_admitted_edges": 5}, {"step": 2, "cumulative_admitted_edges": 12}]
+    with (run_dir / "mechanism.jsonl").open("w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+    assert dashboard.admitted_edges_for_card({"run_id": "full_s42"}) == 12
+
+
+def test_admitted_edges_for_card_none_when_no_mechanism_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dashboard, "_CONPO_REPO_ROOT", tmp_path)
+    assert dashboard.admitted_edges_for_card({"run_id": "never_run"}) is None
+
+
+def test_h4_compute_cell_combines_tokens_edges_and_rates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dashboard, "_CONPO_REPO_ROOT", tmp_path)
+    for run_id, edges in (("full_uniform_s42", 2000), ("full_s42", 1000)):
+        run_dir = tmp_path / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "mechanism.jsonl").write_text(
+            json.dumps({"step": 1, "cumulative_admitted_edges": edges}) + "\n", encoding="utf-8"
+        )
+    treatment = [{"run_id": "full_uniform_s42", "status": "done", "tokens_generated": "500000", "pacc_eval_i": "0.5"}]
+    control = [{"run_id": "full_s42", "status": "done", "tokens_generated": "1000000", "pacc_eval_i": "0.4"}]
+    cell = dashboard.h4_compute_cell(treatment, control)
+    assert cell == "tok 500000/1000000 edges 2000/1000 PAcc/1e6tok 1/0.4 PAcc/1e3edges 0.25/0.4"
+
+
+def test_h4_compute_cell_dash_when_no_card() -> None:
+    assert dashboard.h4_compute_cell([], []) == "-"
+
+
+def test_h4_extra_columns_only_populated_for_h4_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Full end-to-end check via a real cards_dir: the H4_uniform row's
+    extra column is populated, every other row's stays "-"."""
+    monkeypatch.setattr(dashboard, "_CONPO_REPO_ROOT", tmp_path)
+    cards_root = tmp_path / "runs"
+    cards_root.mkdir()
+    # admitted_edges_for_card reads from _CONPO_REPO_ROOT / "runs" / run_id;
+    # cards_root is that same tmp_path/"runs" subtree, so cards and their
+    # mechanism.jsonl live side by side, as the run_id/RUN_OUT_DIR convention
+    # implies.
+    for run_id, edges in (("full_uniform_s42", 2000), ("full_s42", 1000)):
+        run_dir = cards_root / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "mechanism.jsonl").write_text(
+            json.dumps({"step": 1, "cumulative_admitted_edges": edges}) + "\n", encoding="utf-8"
+        )
+    (cards_root / "full_uniform_s42.md").write_text(
+        _card(
+            run_id="full_uniform_s42", kind="train", arm="full", overrides="RUN_SELECTION=uniform", block="H4",
+            hypotheses="H4_uniform", model="Qwen/Qwen3-4B", seed="42", status="done",
+            tokens_generated="500000", pacc_eval_i="0.5",
+        ),
+        encoding="utf-8",
+    )
+    (cards_root / "full_s42.md").write_text(
+        _card(
+            run_id="full_s42", kind="train", arm="full", overrides="none", block="hub",
+            hypotheses="H1,H3,H4,H5", model="Qwen/Qwen3-4B", seed="42", status="done",
+            tokens_generated="1000000", pacc_eval_i="0.4",
+        ),
+        encoding="utf-8",
+    )
+    cards = dashboard.load_cards(cards_root)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    # H4_uniform's HYPOTHESES entry is ("full", "full:selection=uniform"):
+    # treatment=full_s42 (1000000 tok/1000 edges), control=full_uniform_s42
+    # (500000 tok/2000 edges).
+    h4_row = next(line for line in out.splitlines() if line.startswith("| H4_uniform |"))
+    assert "tok 1000000/500000 edges 1000/2000" in h4_row
+    h1_row = next(line for line in out.splitlines() if line.startswith("| H1 |"))
+    assert h1_row.endswith("| - | - |")
+
+
+# --- H5 row extra: mean prompt_gamma_theta (design choice, builder, 2026-09-04) ---
+
+
+def test_h5_gamma_cell_computes_mean_prompt_gamma_theta(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dashboard, "_CONPO_REPO_ROOT", tmp_path)
+    for run_id, values in (("full_lambda_p0_s42", [1.0, 2.0, 3.0]), ("full_s42", [4.0, 6.0])):
+        run_dir = tmp_path / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        with (run_dir / "mechanism.jsonl").open("w", encoding="utf-8") as f:
+            for v in values:
+                f.write(json.dumps({"prompt_gamma_theta": v}) + "\n")
+    treatment = [{"run_id": "full_lambda_p0_s42", "status": "done"}]
+    control = [{"run_id": "full_s42", "status": "done"}]
+    assert dashboard.h5_gamma_cell(treatment, control) == "2/5"
+
+
+def test_h5_gamma_cell_dash_when_no_card() -> None:
+    assert dashboard.h5_gamma_cell([], []) == "-"
+
+
+def test_h5_row_extra_column_populated_only_for_h5(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dashboard, "_CONPO_REPO_ROOT", tmp_path)
+    cards_root = tmp_path / "runs"
+    cards_root.mkdir()
+    for run_id, values in (("full_lambda_p0_s42", [1.0, 3.0]), ("full_s42", [4.0, 6.0])):
+        run_dir = cards_root / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with (run_dir / "mechanism.jsonl").open("w", encoding="utf-8") as f:
+            for v in values:
+                f.write(json.dumps({"prompt_gamma_theta": v}) + "\n")
+    (cards_root / "full_lambda_p0_s42.md").write_text(
+        _card(
+            run_id="full_lambda_p0_s42", kind="train", arm="full", overrides="RUN_LAMBDA_P=0", block="H5",
+            hypotheses="H5_lambda_p_zero", model="Qwen/Qwen3-4B", seed="42", status="done",
+        ),
+        encoding="utf-8",
+    )
+    (cards_root / "full_s42.md").write_text(
+        _card(
+            run_id="full_s42", kind="train", arm="full", overrides="none", block="hub",
+            hypotheses="H1,H3,H4,H5", model="Qwen/Qwen3-4B", seed="42", status="done",
+        ),
+        encoding="utf-8",
+    )
+    cards = dashboard.load_cards(cards_root)
+    out = dashboard.render_dashboard(cards, "2026-09-03")
+    # H5_lambda_p_zero's HYPOTHESES entry is ("full", "full:lambda_p=0"):
+    # treatment=full_s42 (mean 5.0), control=full_lambda_p0_s42 (mean 2.0).
+    h5_row = next(line for line in out.splitlines() if line.startswith("| H5_lambda_p_zero |"))
+    assert h5_row.endswith("| - | 5/2 |")
 
 
 def test_cli_writes_readme(cards_dir: Path) -> None:

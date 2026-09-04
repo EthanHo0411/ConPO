@@ -228,14 +228,13 @@ def hypothesis_table(runs: Sequence[RunData], hypotheses: Sequence[Hypothesis] =
 
         n_pairs = len(pairs)
         if n_pairs == 0:
-            verdict, note = "INCONCLUSIVE", "no matched seed pairs"
+            verdict, note = "pending", "no matched seed pairs"
             bootstrap_diff = ci_lo = ci_hi = 0.0
         else:
             bootstrap_diff = sum(pair_diffs) / n_pairs
             ci_lo = sum(pair_los) / n_pairs
             ci_hi = sum(pair_his) / n_pairs
-            excludes_zero_in_direction = ci_lo > 0.0 if hyp.expected_sign == ">" else ci_hi < 0.0
-            verdict = "PASS" if excludes_zero_in_direction else "INCONCLUSIVE"
+            verdict = stats.verdict_from_ci(ci_lo, ci_hi, hyp.expected_sign)
             note = "only one seed" if n_pairs == 1 else None
 
         rows.append(

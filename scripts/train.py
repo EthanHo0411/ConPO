@@ -1,11 +1,20 @@
-"""ConPO training entrypoint. See conpo/trainer.py (ConPOTrainer) and conpo/arms.py (ArmSpec)."""
+"""ConPO training entrypoint. See conpo/trainer.py (ConPOTrainer) and conpo/arms.py (ArmSpec).
+
+RUN_FULL_FT=1 (design choice, builder, 2026-09-04, read via config.env
+inside main()): trains every weight instead of a LoRA adapter (peft_config=
+None), for the full-FT point-check (slurm/train_fullft.sbatch). Default "0"
+(LoRA, every other run). Recorded as run_metadata.json's "full_ft" field.
+"""
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import math
 import random
+import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -124,7 +133,7 @@ def _check_dataset_size(dataset_size: int, prompts_per_update: int) -> None:
         )
 
 
-def _tiny_model_and_tokenizer() -> tuple[torch.nn.Module, AutoTokenizer]:
+def _tiny_model_and_tokenizer(full_ft: bool) -> tuple[torch.nn.Module, AutoTokenizer]:
     tokenizer = AutoTokenizer.from_pretrained(config.POLICY_MODEL)
     cfg = Qwen3Config(
         vocab_size=151936,
@@ -135,7 +144,24 @@ def _tiny_model_and_tokenizer() -> tuple[torch.nn.Module, AutoTokenizer]:
         intermediate_size=64,
         max_position_embeddings=512,
     )
-    return Qwen3ForCausalLM(cfg), tokenizer
+    model = Qwen3ForCausalLM(cfg)
+    if not full_ft:
+        return model, tokenizer
+    # RUN_FULL_FT=1 only: its reference-model path (trl.GRPOTrainer, beta !=
+    # 0, no PEFT adapter to disable) reloads the policy model from
+    # model.config._name_or_path (trl.trainer.utils.create_model_from_path);
+    # a bare Qwen3ForCausalLM(cfg) leaves that field "". Saving to and
+    # reloading from a throwaway local directory gives it a resolvable path
+    # (design choice, builder, 2026-09-04) without changing the weights. The
+    # LoRA path never touches self.ref_model, so it skips this save/reload.
+    # ponytail: atexit.register(shutil.rmtree, ...) accumulates one handler
+    # and one temp dir per full-FT --tiny run for the life of the process
+    # (harmless, ignore_errors=True); explicit cleanup right after
+    # GRPOTrainer.__init__ if this ever runs enough full-FT tests to matter.
+    tmp_dir = tempfile.mkdtemp(prefix="conpo_tiny_model_")
+    atexit.register(shutil.rmtree, tmp_dir, ignore_errors=True)
+    model.save_pretrained(tmp_dir)
+    return Qwen3ForCausalLM.from_pretrained(tmp_dir), tokenizer
 
 
 def _vllm_sleep_mode(use_vllm: bool, judge_mode: str) -> bool:
@@ -267,8 +293,14 @@ def main() -> None:
             f"-> {prompts_per_update} prompt(s) per optimizer update"
         )
 
-    model, tokenizer = _tiny_model_and_tokenizer() if args.tiny else _real_model_and_tokenizer(model_name)
-    lora_config = LoraConfig(
+    # RUN_FULL_FT=1 (design choice, builder, 2026-09-04): trains every weight
+    # (peft_config=None below, no adapter_config.json under out_dir/adapter).
+    # Reference scoring then runs under TRL's own self.ref_model instead of a
+    # disabled adapter (see conpo/trainer.py's _reference_model), populated
+    # automatically since config.KL_BETA != 0 and the model isn't PEFT-wrapped.
+    full_ft = config.env("RUN_FULL_FT", "0") == "1"
+    model, tokenizer = _tiny_model_and_tokenizer(full_ft) if args.tiny else _real_model_and_tokenizer(model_name)
+    lora_config = None if full_ft else LoraConfig(
         r=config.LORA_R,
         lora_alpha=config.LORA_ALPHA,
         lora_dropout=config.LORA_DROPOUT,
@@ -424,6 +456,10 @@ def main() -> None:
         "effective_batch": effective_batch,
         # H6 part B: whether this run attempted multi-family reverse edges.
         "multi": overrides.multi,
+        # RUN_FULL_FT (design choice, builder, 2026-09-04): True when this
+        # run trained every weight (peft_config=None above) instead of a
+        # LoRA adapter.
+        "full_ft": full_ft,
     }
     (out_dir / "run_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
 
