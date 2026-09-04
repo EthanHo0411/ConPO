@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import torch
@@ -79,6 +80,7 @@ def main() -> None:
     parser.add_argument("--tiny", action="store_true", help="tiny random model + 4 pairs, for smoke tests")
     args = parser.parse_args()
 
+    run_start = time.monotonic()
     arm_name = config.env("RUN_ARM", "vf_dpo")
     arm, _overrides = resolve_arm(arm_name)
     if arm.trainer != "dpo":
@@ -153,6 +155,7 @@ def main() -> None:
     if manifest_path.is_file():
         pair_build_tokens = json.loads(manifest_path.read_text(encoding="utf-8")).get("tokens_spent", 0)
 
+    wall_hours = (time.monotonic() - run_start) / 3600
     metadata = {
         "arm": arm_name,
         "pairs_path": str(pairs_path),
@@ -162,6 +165,7 @@ def main() -> None:
         "beta": config.DPO_BETA,
         "learning_rate": config.LR,
         "pair_build_tokens": pair_build_tokens,
+        "actual_h100h": wall_hours,
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 

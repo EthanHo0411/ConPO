@@ -22,7 +22,7 @@ from conpo.arms import resolve_arm
 from conpo.data import PoolRow, TokenMeter, keys_digest, load_subset
 from conpo.edges import EdgeBuffer, FeasibleBuffer
 from conpo.engine import HFEngine, VLLMColocateEngine
-from conpo.judge import HttpJudge, StaticJudge, resolve_endpoint
+from conpo.judge import build_judge
 from conpo.selection import FamilyStats
 from conpo.trainer import ConPOTrainer
 from conpo.verifiers import Constraint
@@ -103,11 +103,26 @@ def _tiny_model_and_tokenizer() -> tuple[torch.nn.Module, AutoTokenizer]:
     return Qwen3ForCausalLM(cfg), tokenizer
 
 
-def _real_model_and_tokenizer() -> tuple[torch.nn.Module, AutoTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(config.POLICY_MODEL)
+def _vllm_sleep_mode(use_vllm: bool, judge_mode: str) -> bool:
+    """Whether GRPOConfig's vllm_enable_sleep_mode should be on.
+
+    Only worth the sleep/wake round trip TRL pays on every generate() call
+    (trl/generation/vllm_generation.py) when the colocated vLLM engine and
+    the batched-veto judge contend for the same local GPU memory:
+    RUN_USE_VLLM=1 (a colocated engine exists at all) AND RUN_JUDGE_MODE ==
+    "batched" (build_judge loads its model locally between bursts). Under
+    RUN_JUDGE_MODE == "http" the judge runs on a separate GPU/process over
+    HTTP and never competes with the training engine, so there is nothing
+    for the sleep/wake dance to protect against.
+    """
+    return use_vllm and judge_mode == "batched"
+
+
+def _real_model_and_tokenizer(model_name: str) -> tuple[torch.nn.Module, AutoTokenizer]:
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     # UNTESTED: no GPU in this environment, see engine.py's VLLMColocateEngine docstring
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(config.POLICY_MODEL, dtype=dtype)
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype)
     return model, tokenizer
 
 
@@ -152,10 +167,13 @@ def main() -> None:
     parser.add_argument("--tiny", action="store_true", help="tiny random model + 4 rows, for smoke tests")
     args = parser.parse_args()
 
+    run_start = time.monotonic()
     arm_name = config.env("RUN_ARM", "full")
     seed = int(config.env("RUN_SEED", "0"))
     steps = int(config.env("RUN_STEPS", "1"))
     use_vllm = config.env("RUN_USE_VLLM", "0") == "1"
+    model_name = config.env("RUN_MODEL", config.POLICY_MODEL)
+    veto_period_k = int(config.env("RUN_VETO_PERIOD", str(config.VETO_PERIOD_K)))
     out_dir = Path(config.env("RUN_OUT_DIR", "runs/tmp"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -166,11 +184,16 @@ def main() -> None:
 
     subset_path = config.env("RUN_SUBSET", "")
     rows = _load_training_rows(DATA_DIR / "train.jsonl", subset_path, args.tiny)
+    # RUN_LIMIT: applied after RUN_SUBSET/--tiny, for a smoke run on a small
+    # GPU that wants real data shape without the full row count.
+    row_limit = int(config.env("RUN_LIMIT", "0"))
+    if row_limit:
+        rows = rows[:row_limit]
     subset_sha256 = keys_digest(subset_path) if subset_path else None
     rows_by_key = {r.key: r for r in rows}
     dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
 
-    model, tokenizer = _tiny_model_and_tokenizer() if args.tiny else _real_model_and_tokenizer()
+    model, tokenizer = _tiny_model_and_tokenizer() if args.tiny else _real_model_and_tokenizer(model_name)
     lora_config = LoraConfig(
         r=config.LORA_R,
         lora_alpha=config.LORA_ALPHA,
@@ -193,7 +216,7 @@ def main() -> None:
     # update; left at the trainer default (1) this silently trained at 1
     # prompt/update instead. --tiny only ever runs a smoke test on 1 device,
     # so it stays at accumulation 1.
-    # num_processes fetched unconditionally (not just in the non-tiny branch
+    # num_processes fetched unconditionally (not only in the non-tiny branch
     # below) so prompts_per_update -- how many dataset rows one optimiser
     # update consumes -- is defined for --tiny too, for Pass1CheckpointCallback.
     num_processes = PartialState().num_processes
@@ -215,6 +238,13 @@ def main() -> None:
             f"-> {prompts_per_update} prompt(s) per optimizer update"
         )
 
+    judge_mode = config.env("RUN_JUDGE_MODE", getattr(config, "JUDGE_MODE_DEFAULT", "batched"))
+    # Same resolution formula as conpo/judge.py:build_judge itself, only for
+    # run_metadata.json's own record of the run -- build_judge re-reads
+    # RUN_JUDGE_MODEL from the environment independently, so this never
+    # drives which judge gets built, only what gets written down.
+    judge_model = config.env("RUN_JUDGE_MODEL", "") or config.JUDGE_MODEL
+
     grpo_config = GRPOConfig(
         output_dir=str(out_dir),
         num_generations=num_generations,
@@ -235,6 +265,14 @@ def main() -> None:
         vllm_mode="colocate",
         vllm_gpu_memory_utilization=0.25,
         vllm_max_model_length=config.MAX_MODEL_LEN,
+        # Batched veto (USER DECISIONS 2026-09-02): sleep the colocated vLLM
+        # engine around each veto burst (ConPOTrainer.flush_pending_veto)
+        # rather than keep its KV cache resident while the judge scores.
+        # Only on when the judge loads locally (RUN_JUDGE_MODE=
+        # "batched"): under "http" the judge runs on a separate GPU/process
+        # over HTTP, so the sleep/wake round trip would be pure overhead
+        # (see _vllm_sleep_mode). UNTESTED: no GPU in this environment.
+        vllm_enable_sleep_mode=_vllm_sleep_mode(use_vllm, judge_mode),
         max_steps=steps,
         seed=seed,
         report_to=[],
@@ -250,7 +288,14 @@ def main() -> None:
         fp16=False,
     )
 
-    judge = StaticJudge(keep=True) if config.env("RUN_NO_VETO", "0") == "1" else HttpJudge(resolve_endpoint(""))
+    # before_load/after_unload are left unset: build_judge runs before the
+    # trainer exists, so there is no engine handle to hand it yet.
+    # ConPOTrainer.flush_pending_veto sleeps/wakes the colocated vLLM engine
+    # around the burst itself instead (_sleep_engine_if_enabled/_wake_engine).
+    judge = build_judge(
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        dtype=torch.bfloat16 if torch.cuda.is_available() else None,
+    )
 
     def engine_factory(trainer: ConPOTrainer):
         if use_vllm:
@@ -285,12 +330,18 @@ def main() -> None:
         mechanism_log_path=mechanism_log_path,
         seed=seed,
         overrides=overrides,
+        veto_period_k=veto_period_k,
         peft_config=lora_config,
         callbacks=[pass1_callback],
     )
     pass1_callback.trainer = trainer
 
     trainer.train()
+    # The fourth flush condition (USER DECISIONS 2026-09-02): end of
+    # training, so nothing sits unscored in trainer.pending_queue when the
+    # run finishes normally (the other three -- period, queue size, and
+    # before a checkpoint save -- run inside ConPOTrainer itself).
+    trainer.flush_pending_veto()
 
     trainer.save_model(str(out_dir / "adapter"))
     edge_buffer.save(out_dir / "edges.jsonl")
@@ -301,14 +352,28 @@ def main() -> None:
         # Token budget stopped the run before the first full pass: record
         # how much of it completed instead of the (never-written) pass1.json.
         pass1_info["fraction_completed"] = min(1.0, trainer.state.global_step / pass1_callback.pass1_step)
+    wall_hours = (time.monotonic() - run_start) / 3600
     run_metadata = {
         "arm": arm_name,
         "seed": seed,
+        "model": model_name,
         "dataset_size": len(rows),
         "prompts_per_update": prompts_per_update,
         "subset_path": subset_path or None,
         "subset_sha256": subset_sha256,
         "pass1": pass1_info,
+        "token_budget": meter.budget,
+        "tokens_generated": meter.total,
+        "actual_h100h": wall_hours * num_processes,
+        # Judge placement/model, veto period, and row cap: without these a
+        # finished run's artefacts alone cannot say which judge placement it
+        # used, what veto period it ran with, whether RUN_JUDGE_MODEL
+        # overrode the default judge, or whether RUN_LIMIT truncated its
+        # training rows (review4/round2 finding 3).
+        "judge_mode": judge_mode,
+        "judge_model": judge_model,
+        "veto_period_k": veto_period_k,
+        "row_limit": row_limit or None,
     }
     (out_dir / "run_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
 

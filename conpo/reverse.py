@@ -13,17 +13,26 @@ import math
 import random
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Protocol
 
 from conpo import config
 from conpo.data import PoolRow
 from conpo.distance import token_distance, within_delta
 from conpo.edges import Edge, FeasibleBuffer
-from conpo.judge import HttpJudge, StaticJudge, VetoRequest
+from conpo.judge import Verdict, VetoRequest
 from conpo.operators import registry
 from conpo.selection import FamilyStats, sample_family
 from conpo.verifiers import Constraint, check, description
 
-Judge = HttpJudge | StaticJudge
+
+class Judge(Protocol):
+    """Structural contract shared by `judge.HttpJudge`, `judge.StaticJudge`,
+    and the batched-veto `_QueueingVetoCollector` (conpo/trainer.py) --
+    matches forward.py's own local `Judge` Protocol so both modules accept
+    the same set of callers without a nominal `HttpJudge | StaticJudge`
+    union excluding anything structurally compatible."""
+
+    def veto(self, req: VetoRequest) -> Verdict: ...
 
 
 @dataclass(frozen=True)

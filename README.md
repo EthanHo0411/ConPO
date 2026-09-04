@@ -46,18 +46,24 @@ export env only and never retype a value `scripts/train.py` can read from
 | `RUN_STEPS` | integer, optimiser-step budget | `scripts/train.py`, default `1` there (`slurm/train.sbatch` defaults it to `500`) |
 | `RUN_TOKEN_BUDGET` | integer, generated-token budget, `0` = no cap | `conpo/data.py:TokenMeter` |
 | `RUN_USE_VLLM` | `1` sample through vLLM, `0` HF generate | `scripts/train.py`, default `0` there (`slurm/train.sbatch` always sets `1`) |
-| `RUN_JUDGE_ENDPOINT` | base URL, used verbatim | `conpo/judge.py:resolve_endpoint` |
+| `RUN_JUDGE_ENDPOINT` | base URL, used verbatim | `conpo/judge.py:resolve_endpoint` (`RUN_JUDGE_MODE=http` only) |
+| `RUN_JUDGE_MODE` | `batched` (default, `config.JUDGE_MODE_DEFAULT`) \| `http` | `scripts/train.py:build_judge`, also written to `run_metadata.json` |
+| `RUN_JUDGE_MODEL` | model name, default `config.JUDGE_MODEL` | `scripts/train.py:build_judge`, also written to `run_metadata.json` |
+| `RUN_VETO_PERIOD` | integer, default `config.VETO_PERIOD_K` (25) | `scripts/train.py` -> `ConPOTrainer(veto_period_k=...)`, also written to `run_metadata.json` |
+| `RUN_MODEL` | model name, default `config.POLICY_MODEL` | `scripts/train.py`, also written to `run_metadata.json` |
+| `RUN_LIMIT` | integer, `0` (default) = no cap | `scripts/train.py`, caps training rows after `RUN_SUBSET`/`--tiny`, also written to `run_metadata.json` |
 | `RUN_OUT_DIR` | output directory | `scripts/train.py`, default `runs/tmp` there |
 | `RUN_SELECTION` | `uniform` \| `half` (default `transfer`, the paper's active selection) | `conpo/arms.py:resolve_arm` -> `Overrides.selection` |
-| `RUN_NO_VETO` | `1` | `conpo/arms.py:resolve_arm` -> `Overrides.no_veto`; `scripts/train.py` swaps `HttpJudge` for `StaticJudge(keep=True)` |
+| `RUN_NO_VETO` | `1` | `conpo/arms.py:resolve_arm` -> `Overrides.no_veto`; `scripts/train.py:build_judge` returns `StaticJudge(keep=True)` |
 | `RUN_NO_EXACTNESS` | `1` | `conpo/arms.py:resolve_arm` -> `Overrides.no_exactness` |
 | `RUN_NO_DISTANCE` | `1` | `conpo/arms.py:resolve_arm` -> `Overrides.no_distance` |
 | `RUN_LAMBDA_P` | float, default `config.LAMBDA_P` (1.0) | `conpo/arms.py:resolve_arm` -> `Overrides.lambda_p` |
 
-`scripts/train.py` itself has no direct test (it is the SLURM entrypoint);
 `conpo/arms.py:resolve_arm` and the `ConPOTrainer` it configures are
 exercised on CPU by `tests/test_trainer_tiny.py`, which constructs the
-trainer directly rather than through the script.
+trainer directly rather than through the script; `scripts/train.py`'s own
+`main()` (SLURM entrypoint) has one direct `--tiny` test in
+`tests/test_subset.py`, covering `run_metadata.json`'s RUN_* fields.
 
 ## Local test commands
 
@@ -74,7 +80,7 @@ conda run -n conpo --no-capture-output python -m pytest tests/test_verifiers.py 
 conda run -n conpo --no-capture-output python scripts/build_corpus.py
 ```
 
-As of 2026-09-02: 536 passed, 14 skipped, 0 failed.
+As of 2026-09-03: 673 passed, 14 skipped, 0 failed.
 
 ## Cluster launch sequence
 
@@ -102,26 +108,32 @@ unverified on the cluster.
    Writes `data/{train,dev,eval_i,eval_ii,eval_iii}.jsonl` and
    `data/manifest.json`.
 
-3. **Start the judge server** (second H100; needed until the batched veto lands):
-   ```bash
-   sbatch slurm/judge_server.sbatch
-   ```
-   Wait for `runs/serve/judge.endpoint` to appear (the job also polls its
-   own `/health` before writing it).
-
-4. **Launch a training run** (one H100; `RUN_SUBSET` defaults to
-   `subsets/train_15000_seed42.keys` in the launcher):
+3. **Launch a training run** (one H100; `RUN_SUBSET` defaults to
+   `subsets/train_15000_seed42.keys` in the launcher). The default judge
+   placement is the batched veto (USER DECISIONS 2026-09-02): no judge
+   server needed, so this is the whole sequence for a normal run:
    ```bash
    RUN_ARM=full RUN_SEED=42 \
      sbatch --export=ALL,RUN_ARM,RUN_SEED slurm/train.sbatch
    ```
-   Waits for the judge endpoint, then writes to `runs/full_s42/`. Add
-   ablation overrides the same way, e.g.
-   `RUN_ARM=full RUN_NO_VETO=1 sbatch --export=ALL,RUN_ARM,RUN_NO_VETO slurm/train.sbatch`
-   (the judge server is not needed there; `slurm/train.sbatch` detects
-   `RUN_NO_VETO=1` and skips the wait).
+   `scripts/train.py`'s `build_judge` loads/unloads a `VLLMBatchedJudge`/
+   `HFBatchedJudge` on the same card, in bursts, every `RUN_VETO_PERIOD`
+   optimiser steps (`ConPOTrainer.flush_pending_veto`); writes to
+   `runs/full_s42/`. Add ablation overrides the same way, e.g.
+   `RUN_ARM=full RUN_NO_VETO=1 sbatch --export=ALL,RUN_ARM,RUN_NO_VETO slurm/train.sbatch`.
 
-5. **Evaluate a finished run**:
+   **`RUN_JUDGE_MODE=http` fallback** (a resident judge server on the second
+   H100, serialising every training run against it -- for comparison or
+   debugging the batched path):
+   ```bash
+   sbatch slurm/judge_server.sbatch
+   ```
+   Wait for `runs/serve/judge.endpoint` to appear (the job also polls its
+   own `/health` before writing it), then
+   `RUN_ARM=full RUN_SEED=42 RUN_JUDGE_MODE=http sbatch --export=ALL,RUN_ARM,RUN_SEED,RUN_JUDGE_MODE slurm/train.sbatch`
+   (`slurm/train.sbatch` waits for the judge endpoint only in this mode).
+
+4. **Evaluate a finished run**:
    ```bash
    sbatch slurm/eval.sbatch runs/full_s42/adapter
    ```
@@ -137,9 +149,9 @@ even though the surrounding Python modules now exist and are CPU-tested:
 - `slurm/judge_server.sbatch` -- never submitted; the vLLM OpenAI-server
   invocation, the `--gres=gpu:h100:1` line, and the health-poll
   timing are unverified.
-- `slurm/train.sbatch` -- never submitted; the judge-endpoint wait loop,
-  the `RUN_OUT_DIR` layout, and the two-GPU full-FT comment variant are
-  unverified.
+- `slurm/train.sbatch` -- never submitted; the `RUN_JUDGE_MODE=http`
+  judge-endpoint wait loop, the `RUN_OUT_DIR` layout, and the two-GPU
+  full-FT comment variant are unverified.
 - `slurm/eval.sbatch` -- never submitted; the `--out` file paths it builds
   are checked against `scripts/eval_external.py`/`scripts/eval_internal.py`'s
   real `argparse` contract, but only their `--score-only` path (no
@@ -157,6 +169,17 @@ even though the surrounding Python modules now exist and are CPU-tested:
 - `conpo/judge.py:HttpJudge` -- the real HTTP path against a live vLLM
   server. Only `StaticJudge`, `parse_verdict`, and `build_veto_prompt` are
   exercised by `tests/test_judge.py`.
+- `conpo/judge.py:VLLMBatchedJudge` -- the batched veto's default judge
+  (loads/unloads a colocated `vllm.LLM` per burst). No vLLM install on this
+  machine; only `HFBatchedJudge` and `PendingQueue` are CPU-tested
+  (`tests/test_batched_veto.py`), and `ConPOTrainer.flush_pending_veto`'s
+  wiring is tested against a recording fake judge, not a real batched one
+  (`tests/test_batched_veto_trainer.py`).
+- `ConPOTrainer._sleep_engine_if_enabled`/`_wake_engine` -- the
+  `vllm_enable_sleep_mode` sleep-before/wake-after path around a veto
+  burst, verified only by reading `trl/generation/vllm_generation.py`'s own
+  `sleep(level=2)`/`wake_up(tags=...)` calls; never run against a live
+  colocated vLLM engine.
 - `conpo/engine.py:VLLMColocateEngine` -- wraps a live TRL `GRPOTrainer`'s
   colocated vLLM generation. Only `HFEngine` and `FakeEngine` are
   exercised by tests.

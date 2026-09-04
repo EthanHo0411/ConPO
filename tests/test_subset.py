@@ -441,3 +441,100 @@ def test_load_training_rows_tiny_without_subset_unchanged(tmp_path: Path) -> Non
     rows = train_script._load_training_rows(pool_path, "", tiny=True)
 
     assert [r.key for r in rows] == [f"row-{i}" for i in range(4)]
+
+
+# ---------------------------------------------------------------------------
+# scripts/train.py: _vllm_sleep_mode (review fix -- vllm_enable_sleep_mode
+# must not turn on for RUN_JUDGE_MODE=http, where the judge never contends
+# with the colocated engine for local GPU memory)
+# ---------------------------------------------------------------------------
+
+
+def test_vllm_sleep_mode_off_without_vllm() -> None:
+    assert train_script._vllm_sleep_mode(use_vllm=False, judge_mode="batched") is False
+    assert train_script._vllm_sleep_mode(use_vllm=False, judge_mode="http") is False
+
+
+def test_vllm_sleep_mode_on_only_for_batched_judge() -> None:
+    assert train_script._vllm_sleep_mode(use_vllm=True, judge_mode="batched") is True
+    assert train_script._vllm_sleep_mode(use_vllm=True, judge_mode="http") is False
+
+
+# ---------------------------------------------------------------------------
+# scripts/train.py: main() --tiny writes RUN_JUDGE_MODE/RUN_JUDGE_MODEL/
+# RUN_VETO_PERIOD/RUN_LIMIT into run_metadata.json (review4/round2 finding 3).
+# CPU, tiny random model, RUN_NO_VETO=1 so no judge model is ever loaded.
+# ---------------------------------------------------------------------------
+
+
+def _write_synthetic_pool_rows(path: Path, n: int) -> None:
+    sentence = "Do not use any commas."
+    constraint = {"iid": "punctuation:no_comma", "kwargs": {}}
+    with path.open("w", encoding="utf-8") as f:
+        for i in range(n):
+            base = f"Explain topic number {i}."
+            row = {
+                "key": f"row-{i}",
+                "base_prompt": base,
+                "prompt": f"{base} {sentence}",
+                "sentences": [sentence],
+                "constraints": [constraint],
+                "english": True,
+                "num_constraints": 1,
+            }
+            f.write(json.dumps(row) + "\n")
+
+
+def test_main_tiny_writes_judge_and_veto_run_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    # RUN_NO_VETO=1 wins over RUN_JUDGE_MODE/RUN_JUDGE_MODEL in build_judge
+    # (StaticJudge, no model load), but scripts/train.py still records what
+    # was asked for -- exactly the gap this test closes.
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setenv("RUN_JUDGE_MODE", "http")
+    monkeypatch.setenv("RUN_JUDGE_MODEL", "some/test-judge-model")
+    monkeypatch.setenv("RUN_VETO_PERIOD", "7")
+    monkeypatch.setenv("RUN_LIMIT", "2")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["judge_mode"] == "http"
+    assert metadata["judge_model"] == "some/test-judge-model"
+    assert metadata["veto_period_k"] == 7
+    assert metadata["row_limit"] == 2
+    assert metadata["dataset_size"] == 2  # RUN_LIMIT applied after --tiny's 4-row cap
+
+
+def test_main_tiny_row_limit_zero_writes_null_row_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["row_limit"] is None  # RUN_LIMIT unset (0 = no cap), not written as 0
+    assert metadata["judge_mode"] == "batched"  # config.JUDGE_MODE_DEFAULT
+    assert metadata["veto_period_k"] == config.VETO_PERIOD_K

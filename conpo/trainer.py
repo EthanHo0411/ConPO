@@ -2,9 +2,18 @@
 
 `_generate_and_score_completions` runs the stock GRPO clean-group generation
 via `super()`, then (per `arm`) drives forward repair (conpo/forward.py) and
-reverse corruption (conpo/reverse.py) over that group's completions, caches
-reference log-probs on every newly admitted edge, pushes them into
-`edge_buffer`, and writes one mechanism-log record for the step.
+reverse corruption (conpo/reverse.py) over that group's completions. Under
+the batched veto (USER DECISIONS 2026-09-02, the default judge placement),
+every verifier-admitted pair goes into `pending_queue` instead of straight
+into `edge_buffer`; `flush_pending_veto` scores the whole queue in one judge
+burst every `veto_period_k` steps, before a checkpoint save, or on an
+explicit call, caching reference log-probs and pushing only kept edges. A
+forward trajectory's feasible endpoint waits the same way (`_PendingFeasible`,
+`_defer_feasible_endpoint`/`_resolve_feasible_tracker`): it only reaches
+`feasible_buffer` once every edge its trajectory built is confirmed kept, so
+`reverse.reverse_batch`'s same-step sampling of `feasible_buffer` never draws
+a response the real judge has not yet approved. Both paths write one
+mechanism-log record per step or per burst.
 `compute_loss` adds L_resp and L_prompt (conpo/losses.py) on top of TRL's own
 GRPO objective, sampled from `edge_buffer`, plus an optional gradient-alignment
 probe (conpo/selection.py section 2.6).
@@ -16,6 +25,8 @@ import dataclasses
 import json
 import math
 import random
+import time
+import warnings
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -28,9 +39,74 @@ from conpo.arms import ArmSpec, Overrides
 from conpo.data import PoolRow, TokenMeter
 from conpo.edges import Edge, EdgeBuffer, FeasibleBuffer
 from conpo.engine import Engine
-from conpo.judge import strip_think
+from conpo.judge import PendingPair, PendingQueue, Verdict, VetoRequest, strip_think
 from conpo.selection import FamilyStats
 from conpo.verifiers import feasible, verifier_vector
+
+
+class _QueueingVetoCollector:
+    """Judge-shaped adapter handed to forward.py/reverse.py while the batched
+    veto is active (Judge protocol: veto/veto_many).
+
+    Every call is answered with a tentative keep=True while the VetoRequest
+    is recorded in call order. forward.py/reverse.py append one edge
+    immediately after each veto() call that keeps, so `captured` lines up
+    pairwise, in order, with the edges the caller collects: the trainer zips
+    them back together into PendingPair entries for the real judge to score
+    later, in one burst (ConPOTrainer.flush_pending_veto). This is how
+    "forward and reverse construction stop calling judge.veto inline" is
+    achieved without editing forward.py/reverse.py at all: they still call
+    `judge.veto(...)`, only never on the real judge.
+
+    This is NOT exactly what a same-step immediate admission would have
+    looked like for forward.py's per-step candidate search
+    (`repair_trajectory`'s `for candidate in proposals` loop): with a real
+    judge, a veto reject on the first monotone-admitted candidate lets that
+    loop try the next proposal in the same step; answering every call
+    keep=True means the loop always takes the first monotone-admitted
+    candidate and `break`s before a later, possibly better, candidate is
+    even looked at. The real verdict for that first candidate arrives only
+    later, at flush time, with no fallback to the candidates that were never
+    tried.
+    # ponytail: single-path collection (queue the first monotone-admitted
+    # candidate per step, decide later) instead of deferring the whole
+    # per-step candidate search into the batch; upgrade path is to have
+    # repair_trajectory queue every monotone-admitted candidate for a step
+    # and only commit to one -- and only advance y_t -- once that step's
+    # batch verdicts are back, if the lost retry measurably hurts edge yield
+    # on the real judge.
+    """
+
+    def __init__(self) -> None:
+        self.captured: list[VetoRequest] = []
+
+    def veto(self, req: VetoRequest) -> Verdict:
+        self.captured.append(req)
+        return Verdict(keep=True, reason="pending_veto", raw="")
+
+    def veto_many(self, reqs: Sequence[VetoRequest]) -> list[Verdict]:
+        return [self.veto(r) for r in reqs]
+
+
+@dataclasses.dataclass
+class _PendingFeasible:
+    """One forward trajectory's feasible endpoint, withheld from
+    feasible_buffer until every edge its trajectory built has a real
+    keep=True veto verdict (review4/round2 finding 1): a placeholder
+    keep=True from `_QueueingVetoCollector` let `y_t` advance during
+    construction, so the endpoint text is only as trustworthy as its
+    trajectory's edges turn out to be once the real judge scores them.
+
+    `remaining` starts as `{id(edge) for edge in the trajectory's edges}`;
+    a rejected edge sets `dead` so the endpoint is dropped outright, however
+    many of its siblings turn out kept -- reverse.reverse_batch must never
+    sample a response built on a transition the judge called degenerate.
+    """
+
+    key: str
+    response: str
+    remaining: set[int]
+    dead: bool = False
 
 
 def _completion_text(completion: object) -> str:
@@ -74,8 +150,8 @@ class ConPOTrainer(GRPOTrainer):
 
     TRL folds `beta * KL(pi_theta || pi_ref)` into its own clean-objective
     loss (trl's `GRPOTrainer._compute_loss`), so `compute_loss` below never
-    adds a separate KL term itself: the effective KL weight actually applied
-    is `LAMBDA_G * KL_BETA` (config.py), and the paper's objective
+    adds a separate KL term itself: the effective KL weight applied in
+    practice is `LAMBDA_G * KL_BETA` (config.py), and the paper's objective
     `L = L_resp + lambda_P L_prompt + lambda_G L_clean + beta L_KL` is
     realised exactly only at `LAMBDA_G = 1`.
 
@@ -104,6 +180,8 @@ class ConPOTrainer(GRPOTrainer):
         seed: int = 0,
         overrides: Overrides | None = None,
         probe_enabled: bool = True,
+        veto_period_k: int = config.VETO_PERIOD_K,
+        pending_queue_max: int = config.PENDING_QUEUE_MAX,
         **kwargs: object,
     ) -> None:
         self.arm = arm
@@ -126,6 +204,24 @@ class ConPOTrainer(GRPOTrainer):
         # Lifetime count of edges admitted into edge_buffer, independent of the
         # buffer's own FIFO/age-cap eviction, for the cumulative mechanism-log rate.
         self.cumulative_admitted_edges = 0
+
+        # Batched veto (USER DECISIONS 2026-09-02): edges that pass exactness/
+        # distance wait here, tagged with the VetoRequest that will decide
+        # them, until flush_pending_veto scores the whole queue in one burst
+        # -- every veto_period_k optimiser steps, when the queue reaches
+        # pending_queue_max, or right before a checkpoint save (_save_checkpoint
+        # below). scripts/train.py calls flush_pending_veto() once more after
+        # trainer.train() returns, so nothing is left unscored at run end.
+        self.pending_queue = PendingQueue(pending_queue_max)
+        self.veto_period_k = veto_period_k
+        self._steps_since_flush = 0
+        # Round2 finding 1: forward feasible endpoints wait here (keyed by
+        # id(edge)) until every edge their trajectory built is resolved by
+        # flush_pending_veto -- see _PendingFeasible and _defer_feasible_endpoint.
+        self._pending_feasible_by_edge_id: dict[int, _PendingFeasible] = {}
+        self._sleep_warned = False
+        self._veto_seen_by_direction: Counter[str] = Counter()
+        self._veto_rejected_by_direction: Counter[str] = Counter()
 
         reward_func = self.reward_conjunctive if arm.reward == "conjunctive" else self.reward_additive
         super().__init__(
@@ -213,40 +309,80 @@ class ConPOTrainer(GRPOTrainer):
                 self.stats.update_pass_rates(observations)
 
             if self.arm.forward and failed_responses:
+                veto_flag = not self.overrides.no_veto
+                collector = _QueueingVetoCollector() if veto_flag else None
                 result = forward.repair_failed_group(
                     row,
                     failed_responses,
                     self.engine,
-                    self.judge,
+                    collector if veto_flag else self.judge,
                     self.rng,
                     self.meter,
                     current_update,
-                    veto=not self.overrides.no_veto,
+                    veto=veto_flag,
                 )
-                new_edges.extend(result.edges)
+                if veto_flag:
+                    # Register a tracker for every trajectory-derived endpoint
+                    # BEFORE pushing its edges below (round2 finding 1): a
+                    # push can trigger an early flush when pending_queue is
+                    # already at pending_queue_max, and that flush must find
+                    # the tracker already in place or the edge's verdict
+                    # would resolve nothing. An endpoint with no source
+                    # edges (repair_trajectory's already-feasible-input
+                    # shape) needs no veto and goes straight in.
+                    for endpoint, edges in zip(result.feasible_endpoints, result.endpoint_sources):
+                        if edges:
+                            self._defer_feasible_endpoint(key, endpoint, edges)
+                        else:
+                            self.feasible_buffer.add(key, endpoint)
+                    # 1:1, in order: forward.py calls judge.veto() exactly once
+                    # per admitted candidate, right before appending it (see
+                    # _QueueingVetoCollector's docstring).
+                    for edge, req in zip(result.edges, collector.captured):
+                        self._push_pending(PendingPair(edge=edge, request=req, direction="forward"))
+                else:
+                    new_edges.extend(result.edges)
+                    for endpoint in result.feasible_endpoints:
+                        self.feasible_buffer.add(key, endpoint)
                 forward_reasons.update(result.reasons)
-                for endpoint in result.feasible_endpoints:
-                    self.feasible_buffer.add(key, endpoint)
 
         if self.arm.reverse and len(self.feasible_buffer) > 0:
+            veto_flag = not self.overrides.no_veto
+            collector = _QueueingVetoCollector() if veto_flag else None
             results = reverse.reverse_batch(
                 self.rows_by_key,
                 self.feasible_buffer,
                 config.REVERSE_DRAWS_PER_STEP,
                 self.stats,
-                self.judge,
+                collector if veto_flag else self.judge,
                 self.rng,
                 current_update,
                 selection=self.overrides.selection,
                 exactness=not self.overrides.no_exactness,
                 distance_gate=not self.overrides.no_distance,
-                veto=not self.overrides.no_veto,
+                veto=veto_flag,
             )
-            for r in results:
-                reverse_reasons[r.reason] += 1
-                if r.edge is not None:
-                    new_edges.append(r.edge)
+            if veto_flag:
+                captured_iter = iter(collector.captured)
+                for r in results:
+                    reverse_reasons[r.reason] += 1
+                    if r.edge is not None:
+                        self._push_pending(PendingPair(edge=r.edge, request=next(captured_iter), direction="reverse"))
+            else:
+                for r in results:
+                    reverse_reasons[r.reason] += 1
+                    if r.edge is not None:
+                        new_edges.append(r.edge)
 
+        # new_edges only ever holds edges admitted with the veto off
+        # (Overrides.no_veto): under the batched veto (the default), every
+        # veto-gated edge went into self.pending_queue above instead, and is
+        # scored/pushed later by flush_pending_veto, not here. Round2 finding
+        # 2: this means mean_edit_distance and edges_per_million_tokens_step
+        # below are only ever real per-step statistics under the no-veto
+        # ablation; under the default they are 0.0 every step, indistinguishable
+        # in mechanism.jsonl from "measured zero" -- read burst_mean_edit_distance
+        # on the veto_flush record instead for the batched-path equivalent.
         distances: list[float] = []
         admitted_by_direction: Counter[str] = Counter()
         unwrapped = self.accelerator.unwrap_model(self.model)
@@ -294,10 +430,201 @@ class ConPOTrainer(GRPOTrainer):
         with open(self.mechanism_log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
 
+        # The periodic flush condition (USER DECISIONS 2026-09-02); the
+        # queue-size condition is enforced per-push by _push_pending above
+        # (PendingQueue.push raises past max_size, so a check only here would
+        # be too late); the other two conditions are _save_checkpoint below
+        # (before a checkpoint save) and scripts/train.py's explicit call
+        # after trainer.train() (end of training) -- both outside this
+        # per-step method.
+        self._steps_since_flush += 1
+        if self._steps_since_flush >= self.veto_period_k:
+            self.flush_pending_veto()
+
         if self.meter.exhausted():
             self.control.should_training_stop = True
 
         return output
+
+    # -----------------------------------------------------------------
+    # Batched veto
+    # -----------------------------------------------------------------
+
+    def _defer_feasible_endpoint(self, key: str, response: str, edges: Sequence[Edge]) -> None:
+        """Register `response` as withheld from feasible_buffer until every
+        edge in `edges` is resolved by flush_pending_veto (round2 finding
+        1). `edges` is never empty here -- callers route the empty case
+        straight to feasible_buffer.add instead."""
+        tracker = _PendingFeasible(key=key, response=response, remaining={id(e) for e in edges})
+        for edge in edges:
+            self._pending_feasible_by_edge_id[id(edge)] = tracker
+
+    def _resolve_feasible_tracker(self, edge: Edge, kept: bool) -> None:
+        """Called once per scored pair in flush_pending_veto: checks `edge`
+        off its feasible-endpoint tracker, if it has one. A reject kills the
+        tracker outright (its trajectory built on a transition the real
+        judge called degenerate, so the endpoint is never trustworthy,
+        however many of its other edges are kept); a keep only checks it
+        off, and the endpoint reaches feasible_buffer only once every edge
+        on its trajectory has been checked off with none dead."""
+        tracker = self._pending_feasible_by_edge_id.pop(id(edge), None)
+        if tracker is None:
+            return
+        if not kept:
+            tracker.dead = True
+            return
+        tracker.remaining.discard(id(edge))
+        if not tracker.remaining and not tracker.dead:
+            self.feasible_buffer.add(tracker.key, tracker.response)
+
+    def _push_pending(self, pair: PendingPair) -> None:
+        """Push one pair, flushing first if the queue is already at
+        pending_queue_max (PendingQueue.push raises past that size, since a
+        caller is expected to flush before it fills -- this is that flush)."""
+        if len(self.pending_queue) >= self.pending_queue.max_size:
+            self.flush_pending_veto()
+        self.pending_queue.push(pair)
+
+    def flush_pending_veto(self) -> None:
+        """Score every pending pair in one burst (USER DECISIONS 2026-09-02).
+
+        No-op (nothing scored, no JSONL line) when the queue is empty, so a
+        flush-condition check that finds nothing pending costs nothing and
+        never adds an empty record to mechanism_log_path. Otherwise: confirm
+        the colocated vLLM engine is asleep if configured to
+        (_sleep_engine_if_enabled -- it never calls `.sleep()` itself, only
+        reports the invariant TRL's own generate() already establishes),
+        score the whole drained queue with one self.judge.veto_many call,
+        wake the engine back up, then score reference log-probs and push
+        every kept edge into edge_buffer exactly as the old inline path did
+        -- rejected pairs are dropped, nothing more. Always resets the
+        veto_period_k step counter, flushed or not.
+        """
+        self._steps_since_flush = 0
+        pending_size_before = len(self.pending_queue)
+        if pending_size_before == 0:
+            return
+
+        pairs = self.pending_queue.drain()
+        requests = [p.request for p in pairs]
+
+        t0 = time.perf_counter()
+        slept = self._sleep_engine_if_enabled()
+        verdicts = self.judge.veto_many(requests)
+        if slept:
+            self._wake_engine()
+        burst_seconds = time.perf_counter() - t0
+
+        kept: Counter[str] = Counter()
+        rejected: Counter[str] = Counter()
+        kept_distances: list[float] = []
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        with torch.no_grad(), unwrapped.disable_adapter():
+            for pair, verdict in zip(pairs, verdicts):
+                # Round2 finding 1: check this edge off its feasible-endpoint
+                # tracker (if any) whichever way the verdict fell, before the
+                # early-continue below -- a reject must kill the tracker too.
+                self._resolve_feasible_tracker(pair.edge, verdict.keep)
+                if not verdict.keep:
+                    rejected[pair.direction] += 1
+                    continue
+                kept[pair.direction] += 1
+                edge = pair.edge
+                kept_distances.append(float(edge.meta.get("distance", 0.0)))
+                logp_plus, len_plus = score_response(unwrapped, self.processing_class, edge.prompt, edge.y_plus)
+                logp_minus, len_minus = score_response(unwrapped, self.processing_class, edge.prompt, edge.y_minus)
+                scored_edge = dataclasses.replace(
+                    edge,
+                    logp_ref_plus=logp_plus.item(),
+                    logp_ref_minus=logp_minus.item(),
+                    len_plus=len_plus,
+                    len_minus=len_minus,
+                )
+                self.edge_buffer.push(scored_edge)
+                self.cumulative_admitted_edges += 1
+
+        for direction in ("forward", "reverse"):
+            self._veto_seen_by_direction[direction] += kept[direction] + rejected[direction]
+            self._veto_rejected_by_direction[direction] += rejected[direction]
+
+        def veto_rate(direction: str) -> float:
+            seen = self._veto_seen_by_direction[direction]
+            return (self._veto_rejected_by_direction[direction] / seen) if seen else 0.0
+
+        record = {
+            "event": "veto_flush",
+            "step": self.state.global_step,
+            "pending_size_before": pending_size_before,
+            "burst_seconds": burst_seconds,
+            "burst_kept_forward": kept["forward"],
+            "burst_kept_reverse": kept["reverse"],
+            "burst_rejected_forward": rejected["forward"],
+            "burst_rejected_reverse": rejected["reverse"],
+            "veto_rate_forward": veto_rate("forward"),
+            "veto_rate_reverse": veto_rate("reverse"),
+            # Round2 finding 2: the per-step record's mean_edit_distance is
+            # only ever real under the no-veto ablation (see the comment in
+            # _generate_and_score_completions); this is its batched-path
+            # equivalent, computed from the same edge.meta["distance"] the
+            # per-step version reads, over this burst's kept edges alone.
+            "burst_mean_edit_distance": (sum(kept_distances) / len(kept_distances)) if kept_distances else 0.0,
+        }
+        with open(self.mechanism_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def _sleep_engine_if_enabled(self) -> bool:
+        """True iff RUN_USE_VLLM=1, args.vllm_enable_sleep_mode is on, and
+        the trainer has a colocated vLLM engine handle (USER DECISIONS
+        2026-09-02): confirms the engine's KV cache is already free for the
+        judge to use during the burst, so flush_pending_veto knows to call
+        _wake_engine() afterwards -- it does NOT call `.sleep()` itself.
+
+        Every flush only ever runs after this step's `super().
+        _generate_and_score_completions()` call has already run
+        (_generate_and_score_completions calls flush directly or indirectly
+        for every trigger: the periodic check below, _save_checkpoint, and
+        scripts/train.py's end-of-training call all fire after that point in
+        the same step), and TRL's own `VLLMGeneration.generate()`
+        (trl/generation/vllm_generation.py) already puts the colocated
+        engine to `sleep(level=2)` unconditionally at the end of every call
+        when `vllm_enable_sleep_mode` is on -- so by the time a burst starts
+        the engine is already asleep. Calling `.sleep()` again here would be
+        a second sleep with no intervening wake, which vllm's sleep/wake
+        pair does not support (a state transition, not idempotent).
+
+        UNTESTED: no GPU in this environment, verified only by reading
+        trl/generation/vllm_generation.py's own wake_up(tags=...)/
+        sleep(level=2) calls (conpo/engine.py's VLLMColocateEngine
+        docstring names the same source). False with no warning for
+        HFEngine/FakeEngine runs (RUN_USE_VLLM=0), since there is no
+        colocated engine to protect; False with a once-only warning when
+        RUN_USE_VLLM=1 but vllm_enable_sleep_mode is off, since the judge
+        then contends with the awake engine for GPU memory during the burst.
+        """
+        if config.env("RUN_USE_VLLM", "0") != "1":
+            return False
+        if not getattr(self.args, "vllm_enable_sleep_mode", False):
+            if not self._sleep_warned:
+                warnings.warn(
+                    "veto burst running with the colocated vLLM engine awake: set "
+                    "vllm_enable_sleep_mode=True (GRPOConfig) to free GPU memory for "
+                    "the judge during the burst.",
+                    stacklevel=2,
+                )
+                self._sleep_warned = True
+            return False
+        llm = getattr(getattr(self.engine, "trainer", None), "vllm_generation", None)
+        llm = getattr(llm, "llm", None)
+        return llm is not None
+
+    def _wake_engine(self) -> None:
+        self.engine.trainer.vllm_generation.llm.wake_up()  # type: ignore[attr-defined]
+
+    def _save_checkpoint(self, model: torch.nn.Module, trial: object) -> None:
+        """Flush before every checkpoint save (USER DECISIONS 2026-09-02),
+        so a saved edges.jsonl / resumed run never carries unscored pairs."""
+        self.flush_pending_veto()
+        super()._save_checkpoint(model, trial)
 
     # -----------------------------------------------------------------
     # Losses

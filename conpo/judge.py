@@ -25,13 +25,14 @@ import re
 import time
 import urllib.request
 import zlib
-from collections import Counter
-from collections.abc import Sequence
+from collections import Counter, deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from conpo import config
+from conpo.edges import Edge
 
 # Bypass the site proxy explicitly (serve_client.py:35-40): a request to an
 # internal compute node handed to an institutional proxy gets a 503, since
@@ -303,6 +304,19 @@ class HttpJudge:
         return [self.veto(req) for req in reqs]
 
 
+class Judge(Protocol):
+    """Structural contract every judge implements.
+
+    veto is defined in terms of veto_many on every judge in this module
+    (veto(req) == veto_many([req])[0]), so a caller that only has one
+    request still goes through the same code path as a batch of one.
+    """
+
+    def veto(self, req: VetoRequest) -> Verdict: ...
+
+    def veto_many(self, reqs: Sequence[VetoRequest]) -> list[Verdict]: ...
+
+
 class StaticJudge:
     """Fixed-verdict judge for tests and the no-veto ablation."""
 
@@ -317,3 +331,260 @@ class StaticJudge:
 
     def veto_many(self, reqs: Sequence[VetoRequest]) -> list[Verdict]:
         return [self.veto(req) for req in reqs]
+
+
+# ---------------------------------------------------------------------------
+# Batched veto (user decision 2026-09-02): verifier-admitted pairs wait in a
+# PendingQueue instead of calling judge.veto inline; the trainer flushes the
+# queue in one judge burst every config.VETO_PERIOD_K optimiser steps (or
+# earlier, see conpo/trainer.py). Two H100s, one training run per card, so
+# the judge cannot sit resident beside training: VLLMBatchedJudge and
+# HFBatchedJudge both load their model only for the duration of veto_many
+# and delete it before returning.
+# ---------------------------------------------------------------------------
+
+_DIRECTIONS = frozenset({"forward", "reverse"})
+
+
+@dataclass(frozen=True)
+class PendingPair:
+    """One verifier-admitted (exactness + distance gate) pair awaiting a
+    batched veto verdict. `edge` is stamped with its construction step
+    already, so queueing time does not affect w(e) age decay."""
+
+    edge: Edge
+    request: VetoRequest
+    direction: str
+
+    def __post_init__(self) -> None:
+        if self.direction not in _DIRECTIONS:
+            raise ValueError(f"direction must be one of {sorted(_DIRECTIONS)}, got {self.direction!r}")
+
+
+class PendingQueue:
+    """FIFO queue of PendingPair awaiting one judge burst.
+
+    Bounded by max_size: a caller is expected to flush before the queue
+    reaches it (config.PENDING_QUEUE_MAX), so push() raising past max_size
+    is a fail-fast signal of a missed flush, not a normal code path.
+    """
+
+    def __init__(self, max_size: int) -> None:
+        self.max_size = max_size
+        self._items: deque[PendingPair] = deque()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def push(self, pair: PendingPair) -> None:
+        if len(self._items) >= self.max_size:
+            raise ValueError(f"PendingQueue is full (max_size={self.max_size}); flush before pushing more")
+        self._items.append(pair)
+
+    def drain(self) -> list[PendingPair]:
+        """Return every queued pair and empty the queue."""
+        items = list(self._items)
+        self._items.clear()
+        return items
+
+
+class VLLMBatchedJudge:
+    """Quality-veto judge run locally with vllm.LLM, loaded once per flush burst.
+
+    vllm is imported inside veto_many only: construction never imports it,
+    so build_judge can select this judge on a machine (or in a test) with no
+    vllm install, and the training loop can construct it long before the
+    first flush. before_load/after_unload let the caller sleep and wake a
+    colocated training vLLM engine around the burst (GRPOConfig's
+    vllm_enable_sleep_mode, see conpo/trainer.py) so the two engines never
+    both hold GPU memory at once.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        max_model_len: int = 4096,
+        gpu_memory_utilization: float = 0.35,
+        quantization: str | None = None,
+        before_load: Callable[[], None] | None = None,
+        after_unload: Callable[[], None] | None = None,
+    ) -> None:
+        self.model_name = model
+        self.max_model_len = max_model_len
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.quantization = quantization
+        self.before_load = before_load
+        self.after_unload = after_unload
+        self.counts: Counter[str] = Counter()
+
+    def veto(self, req: VetoRequest) -> Verdict:
+        return self.veto_many([req])[0]
+
+    def veto_many(self, reqs: Sequence[VetoRequest]) -> list[Verdict]:
+        if not reqs:
+            return []
+        import gc
+
+        import torch
+        # ponytail: no GPU in this environment to run vllm against, so the
+        # exact call shape (LLM.chat + SamplingParams(structured_outputs=...))
+        # is unverified here; verify against the real judge model the first
+        # time this path runs on the H100 estate, upgrade if the installed
+        # vllm version's API differs. structured_outputs (not guided_decoding)
+        # confirmed against the installed trl==1.9.2 package's own vLLM
+        # integration, which uses only StructuredOutputsParams/
+        # structured_outputs= (trl/generation/vllm_generation.py,
+        # trl/scripts/vllm_serve.py) -- the vllm version paired with this trl
+        # release has moved past the guided_decoding field name.
+        from vllm import LLM, SamplingParams
+        from vllm.sampling_params import StructuredOutputsParams
+
+        if self.before_load is not None:
+            self.before_load()
+        # llm is constructed inside the try so a failure here (plausible: GPU
+        # memory pressure from a not-yet-fully-freed colocated training
+        # engine is exactly the scenario this class exists to handle) still
+        # runs after_unload() in the finally below, mirroring before_load().
+        llm = None
+        try:
+            llm = LLM(
+                model=self.model_name,
+                max_model_len=self.max_model_len,
+                gpu_memory_utilization=self.gpu_memory_utilization,
+                quantization=self.quantization,
+            )
+            messages_batch = [[{"role": "user", "content": build_veto_prompt(r)}] for r in reqs]
+            sampling = SamplingParams(
+                temperature=0.0,
+                max_tokens=256,
+                structured_outputs=StructuredOutputsParams(json=_VETO_SCHEMA),
+            )
+            outputs = llm.chat(messages_batch, sampling, chat_template_kwargs={"enable_thinking": False})
+            verdicts: list[Verdict] = []
+            for out in outputs:
+                raw = out.outputs[0].text
+                try:
+                    verdict = parse_verdict(raw)
+                except ValueError:
+                    verdict = Verdict(keep=False, reason="judge reply did not parse (fail-closed)", raw=raw)
+                verdicts.append(verdict)
+                self.counts["keep" if verdict.keep else "discard"] += 1
+            return verdicts
+        finally:
+            if llm is not None:
+                del llm
+                gc.collect()
+                torch.cuda.empty_cache()
+            if self.after_unload is not None:
+                self.after_unload()
+
+
+class HFBatchedJudge:
+    """Quality-veto judge run locally with a plain transformers model,
+    loaded once per flush burst (same load-then-delete shape as
+    VLLMBatchedJudge, for a machine or test with no vllm install)."""
+
+    def __init__(
+        self,
+        model: str,
+        device: str = "cpu",
+        dtype: Any = None,
+        max_new_tokens: int = 64,
+        batch_size: int = 8,
+    ) -> None:
+        self.model_name = model
+        self.device = device
+        self.dtype = dtype
+        self.max_new_tokens = max_new_tokens
+        self.batch_size = batch_size
+        self.counts: Counter[str] = Counter()
+
+    def veto(self, req: VetoRequest) -> Verdict:
+        return self.veto_many([req])[0]
+
+    def veto_many(self, reqs: Sequence[VetoRequest]) -> list[Verdict]:
+        if not reqs:
+            return []
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model_kwargs: dict[str, Any] = {} if self.dtype is None else {"dtype": self.dtype}
+        model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
+        model.to(self.device)
+        model.eval()
+
+        verdicts: list[Verdict] = []
+        try:
+            for start in range(0, len(reqs), self.batch_size):
+                batch = reqs[start : start + self.batch_size]
+                prompts = [
+                    tokenizer.apply_chat_template(
+                        [{"role": "user", "content": build_veto_prompt(r)}],
+                        add_generation_prompt=True,
+                        tokenize=False,
+                        enable_thinking=False,
+                    )
+                    for r in batch
+                ]
+                encoded = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=False)
+                encoded = {k: v.to(self.device) for k, v in encoded.items()}
+                with torch.no_grad():
+                    output = model.generate(
+                        **encoded,
+                        max_new_tokens=self.max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                    )
+                prompt_len = encoded["input_ids"].shape[1]
+                replies = tokenizer.batch_decode(output[:, prompt_len:], skip_special_tokens=True)
+                for raw in replies:
+                    raw = strip_think(raw)
+                    try:
+                        verdict = parse_verdict(raw)
+                    except ValueError:
+                        verdict = Verdict(keep=False, reason="judge reply did not parse (fail-closed)", raw=raw)
+                    verdicts.append(verdict)
+                    self.counts["keep" if verdict.keep else "discard"] += 1
+        finally:
+            del model
+            if self.device != "cpu":
+                torch.cuda.empty_cache()
+        return verdicts
+
+
+def build_judge(
+    *,
+    endpoint_path: str | Path = "",
+    device: str = "cpu",
+    dtype: Any = None,
+    before_load: Callable[[], None] | None = None,
+    after_unload: Callable[[], None] | None = None,
+) -> HttpJudge | StaticJudge | VLLMBatchedJudge | HFBatchedJudge:
+    """Select a Judge from the RUN_* environment and config (design 2026-09-03).
+
+    RUN_NO_VETO=1 wins over everything else. Otherwise RUN_JUDGE_MODE picks
+    the placement ("http" for the always-resident judge server, or the
+    default "batched" for the per-flush-burst judge, config.JUDGE_MODE_DEFAULT);
+    RUN_USE_VLLM picks which batched implementation loads the local model;
+    RUN_JUDGE_MODEL overrides config.JUDGE_MODEL for whichever judge is
+    built. `device`/`dtype`/`before_load`/`after_unload` are the trainer's
+    own knobs (unavailable as RUN_* strings) for the batched judges.
+    """
+    if config.env("RUN_NO_VETO", "0") == "1":
+        return StaticJudge(keep=True)
+
+    model = config.env("RUN_JUDGE_MODEL", "") or config.JUDGE_MODEL
+    mode = config.env("RUN_JUDGE_MODE", getattr(config, "JUDGE_MODE_DEFAULT", "batched"))
+    if mode == "http":
+        return HttpJudge(resolve_endpoint(endpoint_path), model=model)
+    if mode != "batched":
+        raise ValueError(f"unknown RUN_JUDGE_MODE: {mode!r} (expected 'http' or 'batched')")
+
+    if config.env("RUN_USE_VLLM", "0") == "1":
+        return VLLMBatchedJudge(model, before_load=before_load, after_unload=after_unload)
+    return HFBatchedJudge(model, device=device, dtype=dtype)

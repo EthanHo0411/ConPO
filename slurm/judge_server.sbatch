@@ -6,10 +6,14 @@
 #
 # Serves config.JUDGE_MODEL (Qwen/Qwen3-14B) as a long-lived OpenAI-compatible
 # vLLM server on the second H100, for conpo/judge.py's HttpJudge (the
-# quality veto of ConPO.pdf section 2.3). Fallback placement until the
-# batched veto lands: while this server holds a card, every training run
-# serializes on the other one. Measured footprint for this judge: 27.5 GB
-# (config.py "Compute notes").
+# quality veto of ConPO.pdf section 2.3). RUN_JUDGE_MODE=http fallback
+# placement only (USER DECISIONS 2026-09-02): the default RUN_JUDGE_MODE=
+# batched needs no server -- scripts/train.py's build_judge scores pending
+# pairs in periodic bursts with a colocated VLLMBatchedJudge/HFBatchedJudge
+# instead (ConPOTrainer.flush_pending_veto). Run this only when explicitly
+# opting into RUN_JUDGE_MODE=http (slurm/train.sbatch); while it holds a
+# card in that mode, every training run serializes on the other one.
+# Measured footprint for this judge: 27.5 GB (config.py "Compute notes").
 #
 # Endpoint-file handshake, ported from the pattern in
 # stackelberg-if/slurm/corruptor_server.sbatch: this job writes

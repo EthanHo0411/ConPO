@@ -95,10 +95,19 @@ class RepairResult:
     Edge.logp_ref_plus/minus are left as `nan` and Edge.len_plus/minus as 0:
     placeholders the trainer fills in once it has a reference-model forward
     pass available, so this module never has to load the policy as a scorer.
+
+    endpoint_sources is index-aligned with feasible_endpoints: entry i is the
+    (possibly empty) list of edges the trajectory that produced
+    feasible_endpoints[i] built along the way. A caller under the batched
+    veto (conpo/trainer.py, USER DECISIONS 2026-09-02) needs this to know an
+    endpoint is only as trustworthy as those edges' real veto verdicts turn
+    out to be -- the endpoint's own text was reached under a placeholder
+    keep=True from _QueueingVetoCollector, not a real judgment.
     """
 
     edges: list[Edge] = field(default_factory=list)
     feasible_endpoints: list[str] = field(default_factory=list)
+    endpoint_sources: list[list[Edge]] = field(default_factory=list)
     proposals: int = 0
     admitted: int = 0
     generated_tokens: int = 0
@@ -203,6 +212,7 @@ def repair_trajectory(
 
     if all(before):
         result.feasible_endpoints.append(y_t)
+        result.endpoint_sources.append(list(result.edges))
     return result
 
 
@@ -225,6 +235,7 @@ def repair_failed_group(
         r = repair_trajectory(row, response, engine, judge, rng, meter, current_update, max_steps, max_candidates, veto)
         merged.edges.extend(r.edges)
         merged.feasible_endpoints.extend(r.feasible_endpoints)
+        merged.endpoint_sources.extend(r.endpoint_sources)
         merged.proposals += r.proposals
         merged.admitted += r.admitted
         merged.generated_tokens += r.generated_tokens

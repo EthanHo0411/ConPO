@@ -428,9 +428,15 @@ def test_forward_feasible_endpoints_reach_feasible_buffer(tmp_path: Path, monkey
     # model actually generates, and forward repair always runs.
     monkeypatch.setattr("conpo.trainer.verifier_vector", lambda constraints, text: [False] * len(constraints))
     sentinel = "SENTINEL_FEASIBLE_ENDPOINT"
+    # endpoint_sources=[[]]: this endpoint has no source edges (mirrors
+    # repair_trajectory's already-feasible-input shape), so under the batched
+    # veto (the default judge placement here) it goes straight into
+    # feasible_buffer with no verdict to wait for -- see
+    # test_batched_veto_forward_endpoint_withheld_until_its_edges_are_kept in
+    # tests/test_batched_veto_trainer.py for the withheld-until-kept case.
     monkeypatch.setattr(
         "conpo.forward.repair_failed_group",
-        lambda *args, **kwargs: RepairResult(feasible_endpoints=[sentinel]),
+        lambda *args, **kwargs: RepairResult(feasible_endpoints=[sentinel], endpoint_sources=[[]]),
     )
 
     model, tokenizer = _tiny_model_and_tokenizer()

@@ -212,7 +212,12 @@ def env(name: str, default: str) -> str:
 # RUN_TOKEN_BUDGET: integer generated-token budget (section 4.1: "The
 #   primary comparison matches total generated tokens").
 # RUN_USE_VLLM: "1" to sample through vLLM, "0" for HF generate.
-# RUN_JUDGE_ENDPOINT: URL of the judge model's inference endpoint.
+# RUN_JUDGE_ENDPOINT: URL of the judge model's inference endpoint (RUN_JUDGE_MODE=http only).
+# RUN_JUDGE_MODE: "batched" (default, JUDGE_MODE_DEFAULT) or "http".
+# RUN_JUDGE_MODEL: overrides JUDGE_MODEL for the judge conpo.judge.build_judge constructs.
+# RUN_VETO_PERIOD: overrides VETO_PERIOD_K.
+# RUN_MODEL: overrides POLICY_MODEL for the policy checkpoint scripts/train.py loads.
+# RUN_LIMIT: caps training rows after RUN_SUBSET is applied, "0" (default) = no cap.
 # RUN_OUT_DIR: directory to write run artefacts (checkpoints, logs, metrics).
 
 # ---------------------------------------------------------------------------
@@ -237,6 +242,22 @@ EDGE_PAIRS_PER_STEP = 48  # DEV_SET
 # step, divided across compute_loss calls the same way as
 # EDGE_PAIRS_PER_STEP above (conpo/trainer.py's compute_loss). DEV_SET.
 PROMPT_PAIRS_PER_STEP = 8  # DEV_SET
+
+# ---------------------------------------------------------------------------
+# Batched veto (user decision 2026-09-02(d): the judge scores a burst of
+# pending pairs every VETO_PERIOD_K optimiser steps instead of one HTTP call
+# per candidate, so it never has to sit resident beside training on the
+# two-H100 estate -- conpo/judge.py's PendingQueue/VLLMBatchedJudge/
+# HFBatchedJudge/build_judge, conpo/trainer.py's flush_pending_veto).
+# ---------------------------------------------------------------------------
+
+# Optimiser steps between veto bursts (RUN_VETO_PERIOD overrides). DEV_SET.
+VETO_PERIOD_K = 25  # DEV_SET
+# Forces an early burst once the pending queue grows this large. DEV_SET.
+PENDING_QUEUE_MAX = 2000  # DEV_SET
+# RUN_JUDGE_MODE default: "batched" (VLLMBatchedJudge/HFBatchedJudge, no
+# resident judge server) or "http" (HttpJudge against slurm/judge_server.sbatch).
+JUDGE_MODE_DEFAULT = "batched"
 
 # ---------------------------------------------------------------------------
 # DPO baselines (locked decision 2026-09-02(c): vf_dpo, relax_dpo, edge_dpo

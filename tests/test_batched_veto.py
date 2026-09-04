@@ -1,0 +1,416 @@
+"""Tests for the batched-veto judge side (conpo/judge.py): PendingQueue,
+HFBatchedJudge on the tiny random model fixture, build_judge's selection
+matrix, and VLLMBatchedJudge's lazy vllm import.
+
+Trainer-side flush behaviour (PendingQueue wired into ConPOTrainer, the
+mechanism JSONL burst fields, edge age at construction step) is out of
+scope here; it belongs to tests/test_trainer_tiny.py.
+"""
+
+from __future__ import annotations
+
+import builtins
+import sys
+import types
+from pathlib import Path
+
+import pytest
+import torch
+from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
+
+from conpo import config, judge
+from conpo.edges import Edge
+
+# ---------------------------------------------------------------------------
+# PendingPair / PendingQueue
+# ---------------------------------------------------------------------------
+
+
+def _edge(prompt_id: str = "row-a", direction: str = "reverse") -> Edge:
+    return Edge(
+        prompt_id=prompt_id,
+        prompt="Explain how gravity works.",
+        y_plus="Gravity pulls things down.",
+        y_minus="Gravity.",
+        families=frozenset({"keywords:existence"}),
+        direction=direction,
+        step=0,
+        logp_ref_plus=float("nan"),
+        logp_ref_minus=float("nan"),
+        len_plus=0,
+        len_minus=0,
+        created_update=0,
+    )
+
+
+def _req() -> judge.VetoRequest:
+    return judge.VetoRequest(
+        prompt="Explain how gravity works.",
+        y_plus="Gravity pulls things down.",
+        y_minus="Gravity.",
+        families=("keywords:existence",),
+        descriptions=("Include the word 'apple'.",),
+    )
+
+
+def _pair(direction: str = "reverse") -> judge.PendingPair:
+    return judge.PendingPair(edge=_edge(direction=direction), request=_req(), direction=direction)
+
+
+def test_pending_pair_rejects_bad_direction() -> None:
+    with pytest.raises(ValueError):
+        judge.PendingPair(edge=_edge(), request=_req(), direction="sideways")
+
+
+def test_pending_queue_starts_empty() -> None:
+    q = judge.PendingQueue(max_size=10)
+    assert len(q) == 0
+    assert q.drain() == []
+
+
+def test_pending_queue_push_and_len() -> None:
+    q = judge.PendingQueue(max_size=10)
+    q.push(_pair())
+    q.push(_pair())
+    assert len(q) == 2
+
+
+def test_pending_queue_drain_empties_and_returns_pushed_pairs() -> None:
+    q = judge.PendingQueue(max_size=10)
+    p1, p2 = _pair(), _pair()
+    q.push(p1)
+    q.push(p2)
+    drained = q.drain()
+    assert drained == [p1, p2]
+    assert len(q) == 0
+    assert q.drain() == []
+
+
+def test_pending_queue_max_size_raises() -> None:
+    q = judge.PendingQueue(max_size=1)
+    q.push(_pair())
+    with pytest.raises(ValueError):
+        q.push(_pair())
+
+
+def test_pending_queue_push_after_drain_is_not_blocked_by_a_stale_full_count() -> None:
+    q = judge.PendingQueue(max_size=1)
+    q.push(_pair())
+    q.drain()
+    q.push(_pair())  # would raise if drain() left a stale size behind
+    assert len(q) == 1
+
+
+# ---------------------------------------------------------------------------
+# Judge protocol: veto is veto_many([req])[0] on every judge in this module
+# ---------------------------------------------------------------------------
+
+
+def test_static_judge_satisfies_veto_via_veto_many() -> None:
+    j = judge.StaticJudge(keep=False)
+    assert j.veto(_req()) == j.veto_many([_req()])[0]
+
+
+# ---------------------------------------------------------------------------
+# HFBatchedJudge, on the tiny random model fixture (test_trainer_tiny.py's
+# shape: real tokenizer, random tiny Qwen3 config, saved to a local
+# directory so HFBatchedJudge can load it by path like any model name).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def tiny_model_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    tokenizer = AutoTokenizer.from_pretrained(config.POLICY_MODEL)
+    torch.manual_seed(0)
+    cfg = Qwen3Config(
+        vocab_size=151936,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=64,
+        max_position_embeddings=512,
+    )
+    model = Qwen3ForCausalLM(cfg)
+    out_dir = tmp_path_factory.mktemp("tiny_judge_model")
+    model.save_pretrained(out_dir)
+    tokenizer.save_pretrained(out_dir)
+    return out_dir
+
+
+def test_hf_batched_judge_returns_one_verdict_per_request(tiny_model_dir: Path) -> None:
+    hfj = judge.HFBatchedJudge(str(tiny_model_dir), device="cpu", max_new_tokens=16, batch_size=2)
+    reqs = [_req(), _req(), _req()]
+    verdicts = hfj.veto_many(reqs)
+    assert len(verdicts) == len(reqs)
+    assert all(isinstance(v, judge.Verdict) for v in verdicts)
+
+
+def test_hf_batched_judge_fails_closed_on_garbage_and_counts_it(tiny_model_dir: Path) -> None:
+    # An untrained tiny random model cannot land on the exact
+    # {"degenerate": ...} JSON schema in 16 tokens: every reply here fails
+    # to parse and must reject (keep=False), never raise.
+    hfj = judge.HFBatchedJudge(str(tiny_model_dir), device="cpu", max_new_tokens=16, batch_size=2)
+    verdicts = hfj.veto_many([_req(), _req()])
+    assert all(v.keep is False for v in verdicts)
+    assert all("fail-closed" in v.reason for v in verdicts)
+    assert hfj.counts["discard"] == 2
+
+
+def test_hf_batched_judge_veto_matches_veto_many(tiny_model_dir: Path) -> None:
+    hfj = judge.HFBatchedJudge(str(tiny_model_dir), device="cpu", max_new_tokens=16, batch_size=2)
+    v = hfj.veto(_req())
+    assert isinstance(v, judge.Verdict)
+
+
+def test_hf_batched_judge_batches_more_requests_than_batch_size(tiny_model_dir: Path) -> None:
+    hfj = judge.HFBatchedJudge(str(tiny_model_dir), device="cpu", max_new_tokens=8, batch_size=2)
+    verdicts = hfj.veto_many([_req() for _ in range(5)])
+    assert len(verdicts) == 5
+
+
+def test_hf_batched_judge_veto_many_of_empty_is_empty(tiny_model_dir: Path) -> None:
+    hfj = judge.HFBatchedJudge(str(tiny_model_dir), device="cpu")
+    assert hfj.veto_many([]) == []
+
+
+# ---------------------------------------------------------------------------
+# VLLMBatchedJudge: construction must not import vllm; that only happens
+# inside veto_many. vllm is not installed in this CPU test environment, so
+# this also doubles as the "runs without vllm present" check.
+# ---------------------------------------------------------------------------
+
+
+def test_vllm_batched_judge_construction_does_not_import_vllm() -> None:
+    assert "vllm" not in sys.modules
+    j = judge.VLLMBatchedJudge("some/judge-model")
+    assert "vllm" not in sys.modules
+    assert j.model_name == "some/judge-model"
+
+
+def test_vllm_batched_judge_veto_many_imports_vllm_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
+    """veto_many is where the lazy import happens: with vllm absent, the
+    call fails on that import (ModuleNotFoundError), never earlier and
+    never with some other error, confirming the import site."""
+    real_import = builtins.__import__
+
+    def _blocking_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "vllm" or name.startswith("vllm."):
+            raise ModuleNotFoundError(f"No module named {name!r} (blocked by test)")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocking_import)
+    j = judge.VLLMBatchedJudge("some/judge-model")
+    with pytest.raises(ModuleNotFoundError):
+        j.veto_many([_req()])
+
+
+def test_vllm_batched_judge_veto_many_of_empty_never_touches_vllm() -> None:
+    """An empty batch returns [] without importing vllm at all, so a flush
+    with nothing pending never pays vllm's load cost."""
+    j = judge.VLLMBatchedJudge("some/judge-model")
+    assert j.veto_many([]) == []
+    assert "vllm" not in sys.modules
+
+
+class _FakeLLMOutput:
+    def __init__(self, text: str) -> None:
+        self.outputs = [type("_Choice", (), {"text": text})()]
+
+
+class _FakeVLLM_LLM:
+    """Stands in for vllm.LLM: records its own construction kwargs and the
+    SamplingParams it is called with, and answers every chat() with a
+    always-keep verdict."""
+
+    last_sampling_params: object | None = None
+
+    def __init__(self, **kwargs: object) -> None:
+        self.kwargs = kwargs
+
+    def chat(self, messages_batch, sampling_params, chat_template_kwargs=None):  # type: ignore[no-untyped-def]
+        _FakeVLLM_LLM.last_sampling_params = sampling_params
+        return [_FakeLLMOutput('{"degenerate": false, "reason": "fine"}') for _ in messages_batch]
+
+
+class _FakeSamplingParams:
+    def __init__(self, **kwargs: object) -> None:
+        self.kwargs = kwargs
+
+
+class _FakeStructuredOutputsParams:
+    def __init__(self, **kwargs: object) -> None:
+        self.kwargs = kwargs
+
+
+def test_vllm_batched_judge_uses_structured_outputs_not_guided_decoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review fix: the installed trl==1.9.2 package's own vLLM integration
+    uses SamplingParams(structured_outputs=StructuredOutputsParams(...)),
+    never guided_decoding/GuidedDecodingParams -- VLLMBatchedJudge must
+    match that API or the first real veto burst fails outright."""
+    fake_sampling_params_mod = types.ModuleType("vllm.sampling_params")
+    fake_sampling_params_mod.StructuredOutputsParams = _FakeStructuredOutputsParams  # type: ignore[attr-defined]
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = _FakeVLLM_LLM  # type: ignore[attr-defined]
+    fake_vllm.SamplingParams = _FakeSamplingParams  # type: ignore[attr-defined]
+    fake_vllm.sampling_params = fake_sampling_params_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", fake_sampling_params_mod)
+
+    j = judge.VLLMBatchedJudge("some/judge-model")
+    verdicts = j.veto_many([_req()])
+
+    assert len(verdicts) == 1
+    assert verdicts[0].keep is True
+    sampling = _FakeVLLM_LLM.last_sampling_params
+    assert "structured_outputs" in sampling.kwargs
+    assert isinstance(sampling.kwargs["structured_outputs"], _FakeStructuredOutputsParams)
+    assert "guided_decoding" not in sampling.kwargs
+
+
+class _RaisingFakeLLM:
+    """Fakes vllm.LLM raising during construction, e.g. GPU memory still
+    held by a not-yet-fully-freed colocated training engine."""
+
+    def __init__(self, **kwargs: object) -> None:
+        raise RuntimeError("out of memory (simulated)")
+
+
+def test_vllm_batched_judge_calls_after_unload_when_llm_construction_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review fix: before_load()/after_unload() must bracket LLM(...)
+    construction itself, not only the code that runs after it succeeds --
+    otherwise a construction failure (the exact scenario these hooks exist
+    to handle) leaves whatever before_load() did (e.g. sleeping the
+    training engine) permanently unreversed."""
+    fake_sampling_params_mod = types.ModuleType("vllm.sampling_params")
+    fake_sampling_params_mod.StructuredOutputsParams = _FakeStructuredOutputsParams  # type: ignore[attr-defined]
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = _RaisingFakeLLM  # type: ignore[attr-defined]
+    fake_vllm.SamplingParams = _FakeSamplingParams  # type: ignore[attr-defined]
+    fake_vllm.sampling_params = fake_sampling_params_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", fake_sampling_params_mod)
+
+    calls: list[str] = []
+    j = judge.VLLMBatchedJudge(
+        "some/judge-model",
+        before_load=lambda: calls.append("before_load"),
+        after_unload=lambda: calls.append("after_unload"),
+    )
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        j.veto_many([_req()])
+
+    assert calls == ["before_load", "after_unload"]
+
+
+# ---------------------------------------------------------------------------
+# build_judge selection matrix
+# ---------------------------------------------------------------------------
+
+
+def _clear_judge_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("RUN_NO_VETO", "RUN_JUDGE_MODE", "RUN_JUDGE_ENDPOINT", "RUN_USE_VLLM", "RUN_JUDGE_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_build_judge_no_veto_wins_over_everything(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setenv("RUN_JUDGE_MODE", "http")
+    j = judge.build_judge()
+    assert isinstance(j, judge.StaticJudge)
+    assert j.keep is True
+
+
+def test_build_judge_http_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("RUN_JUDGE_MODE", "http")
+    monkeypatch.setenv("RUN_JUDGE_ENDPOINT", "http://judge-host:1234")
+    j = judge.build_judge()
+    assert isinstance(j, judge.HttpJudge)
+    assert j.base_url == "http://judge-host:1234"
+    assert j.model == config.JUDGE_MODEL
+
+
+def test_build_judge_http_mode_with_model_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("RUN_JUDGE_MODE", "http")
+    monkeypatch.setenv("RUN_JUDGE_ENDPOINT", "http://judge-host:1234")
+    monkeypatch.setenv("RUN_JUDGE_MODEL", "some/other-judge")
+    j = judge.build_judge()
+    assert isinstance(j, judge.HttpJudge)
+    assert j.model == "some/other-judge"
+
+
+def test_build_judge_batched_mode_is_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_judge_env(monkeypatch)
+    j = judge.build_judge()
+    assert isinstance(j, judge.HFBatchedJudge)
+
+
+def test_build_judge_batched_mode_explicit_uses_hf_without_vllm_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("RUN_JUDGE_MODE", "batched")
+    monkeypatch.setenv("RUN_USE_VLLM", "0")
+    j = judge.build_judge()
+    assert isinstance(j, judge.HFBatchedJudge)
+
+
+def test_build_judge_batched_mode_with_vllm_flag_selects_vllm_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("RUN_JUDGE_MODE", "batched")
+    monkeypatch.setenv("RUN_USE_VLLM", "1")
+    assert "vllm" not in sys.modules
+    j = judge.build_judge()
+    assert isinstance(j, judge.VLLMBatchedJudge)
+    assert "vllm" not in sys.modules  # construction alone must not import it
+
+
+def test_build_judge_model_override_applies_to_batched_judges(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("RUN_JUDGE_MODEL", "some/other-judge")
+    j = judge.build_judge()
+    assert isinstance(j, judge.HFBatchedJudge)
+    assert j.model_name == "some/other-judge"
+
+    monkeypatch.setenv("RUN_USE_VLLM", "1")
+    j2 = judge.build_judge()
+    assert isinstance(j2, judge.VLLMBatchedJudge)
+    assert j2.model_name == "some/other-judge"
+
+
+def test_build_judge_default_model_is_config_judge_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_judge_env(monkeypatch)
+    j = judge.build_judge()
+    assert j.model_name == config.JUDGE_MODEL
+
+
+def test_build_judge_unknown_mode_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("RUN_JUDGE_MODE", "carrier-pigeon")
+    with pytest.raises(ValueError):
+        judge.build_judge()
+
+
+def test_build_judge_passes_device_and_dtype_to_hf_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_judge_env(monkeypatch)
+    j = judge.build_judge(device="cuda:0", dtype=torch.bfloat16)
+    assert isinstance(j, judge.HFBatchedJudge)
+    assert j.device == "cuda:0"
+    assert j.dtype is torch.bfloat16
+
+
+def test_build_judge_passes_hooks_to_vllm_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("RUN_USE_VLLM", "1")
+    before = lambda: None  # noqa: E731
+    after = lambda: None  # noqa: E731
+    j = judge.build_judge(before_load=before, after_unload=after)
+    assert isinstance(j, judge.VLLMBatchedJudge)
+    assert j.before_load is before
+    assert j.after_unload is after

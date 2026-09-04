@@ -143,6 +143,7 @@ def test_repair_trajectory_admits_two_edges_and_records_regression() -> None:
     assert edge1.families == frozenset({"change_case:english_lowercase"})
 
     assert result.feasible_endpoints == [PROPOSAL_2_FIXES_REST]
+    assert result.endpoint_sources == [result.edges]  # the endpoint depends on both trajectory edges
     assert result.reasons["regression:keywords:forbidden_words"] == 1
     assert result.generated_tokens > 0
     assert meter.total == result.generated_tokens
@@ -161,6 +162,7 @@ def test_repair_trajectory_static_judge_false_yields_zero_edges() -> None:
     assert result.edges == []
     assert result.admitted == 0
     assert result.feasible_endpoints == []
+    assert result.endpoint_sources == []
     # the meter is charged for rejected proposals too
     assert meter.total > 0
     assert result.reasons["veto"] >= 1
@@ -177,7 +179,10 @@ def test_repair_trajectory_already_feasible_response_needs_no_engine_call() -> N
         row, feasible_response, engine, judge, random.Random(0), meter, current_update=0
     )
 
-    assert result == RepairResult(feasible_endpoints=[feasible_response])
+    # No engine call means no edge was built, so the endpoint has no source
+    # edges: nothing to withhold it on (trainer.py's _defer_feasible_endpoint
+    # adds it straight to feasible_buffer for exactly this shape).
+    assert result == RepairResult(feasible_endpoints=[feasible_response], endpoint_sources=[[]])
     assert engine.calls == []
     assert meter.total == 0
 
@@ -207,5 +212,7 @@ def test_repair_failed_group_merges_edges_across_responses() -> None:
     assert result.admitted == 2
     assert len(result.edges) == 2
     assert len(result.feasible_endpoints) == 2
+    assert len(result.endpoint_sources) == 2
+    assert all(len(sources) == 1 for sources in result.endpoint_sources)  # one edge per single-step trajectory
     assert result.proposals == 2 * 2
     assert meter.total == result.generated_tokens
