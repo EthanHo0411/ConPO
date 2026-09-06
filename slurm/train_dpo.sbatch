@@ -7,7 +7,7 @@
 # real-GPU path (as opposed to train_dpo.py's --tiny CPU smoke path) has
 # never run, and neither has build_pairs.py's --engine vllm path
 # (_VLLMStandaloneEngine, lazily imported). Verify the gres line and the
-# conda env name on the mlp cluster before trusting it.
+# uv venv path on the mlp cluster before trusting it.
 #
 # Trains one DPO baseline on one H100 80 GB GPU (vf_dpo | edge_dpo, USER
 # DECISIONS 2026-09-02(c)): step 1 builds RUN_PAIRS with
@@ -58,9 +58,10 @@ mkdir -p logs
 echo "node=$(hostname) date=$(date -Is) job=${SLURM_JOB_ID}"
 nvidia-smi -L || echo "nvidia-smi -L failed"
 
-source "${CONDA_HOME:-$HOME/miniconda3}/etc/profile.d/conda.sh"
-conda activate vllm
-echo "env=${CONDA_DEFAULT_ENV:-none} python=$(python -V 2>&1)"
+# ponytail (2026-09-06): switching from conda to a uv venv is the user's
+# decision; CONPO_VENV/.venv naming is this session's choice.
+source "${CONPO_VENV:-${PROJECT}/.venv}/bin/activate"
+echo "env=${VIRTUAL_ENV:-none} python=$(python -V 2>&1)"
 
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1

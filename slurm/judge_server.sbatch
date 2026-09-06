@@ -1,7 +1,7 @@
 #!/bin/bash
 # UNTESTED: written on a machine with no GPU and no vllm install (dev conda
 # env "conpo" is torch CPU only). This script has never been submitted or
-# run. Verify the gres line, the conda env name, and the health-poll timing
+# run. Verify the gres line, the uv venv path, and the health-poll timing
 # on the mlp cluster before trusting it.
 #
 # Serves config.JUDGE_MODEL (Qwen/Qwen3-14B) as a long-lived OpenAI-compatible
@@ -48,9 +48,10 @@ mkdir -p logs
 echo "node=$(hostname) date=$(date -Is) job=${SLURM_JOB_ID}"
 nvidia-smi -L || echo "nvidia-smi -L failed"
 
-source "${CONDA_HOME:-$HOME/miniconda3}/etc/profile.d/conda.sh"
-conda activate vllm
-echo "env=${CONDA_DEFAULT_ENV:-none} python=$(python -V 2>&1)"
+# ponytail (2026-09-06): switching from conda to a uv venv is the user's
+# decision; CONPO_VENV/.venv naming is this session's choice.
+source "${CONPO_VENV:-${PROJECT}/.venv}/bin/activate"
+echo "env=${VIRTUAL_ENV:-none} python=$(python -V 2>&1)"
 
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
@@ -63,7 +64,7 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # config.JUDGE_MODEL, read by name rather than retyped. Assumes conpo is
-# pip installed editable in the "vllm" conda env, same as it is in "conpo".
+# installed editable in the uv venv by `uv sync` (pyproject.toml).
 MODEL="$(python -c 'from conpo import config; print(config.JUDGE_MODEL)')"
 PORT="${JS_PORT:-$(( 20000 + SLURM_JOB_ID % 20000 ))}"
 TTL="${JS_TTL:-14400}"

@@ -7,7 +7,6 @@ name = "conpo"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "torch==2.11.0",
     "transformers==5.14.1",
     "trl==1.9.2",
     "peft==0.20.0",
@@ -23,9 +22,48 @@ dependencies = [
     "syllapy>=0.8.0",
 ]
 
+# torch is selected through exactly one of the three extras below so the wheel
+# comes from the matching PyTorch index: `cpu` for the dev machine (mirrors the
+# conda env "conpo"), `cu128` for the local RTX 5060 smoke (mirrors "conpo-gpu"),
+# `cu130` for the H100 cluster. vllm 0.26.0 on PyPI is a CUDA 13 build (it pins
+# torch 2.11.0 and pulls nvidia-cuda-runtime 13.x), so `cluster` pairs with
+# `cu130` only; the conflicts table makes `uv sync` refuse the other pairings.
 [project.optional-dependencies]
+cpu = ["torch==2.11.0"]
+cu128 = ["torch==2.11.0"]
+cu130 = ["torch==2.11.0"]
 cluster = ["vllm==0.26.0"]
 dev = ["pytest"]
+
+[tool.uv]
+conflicts = [
+    [{ extra = "cpu" }, { extra = "cu128" }, { extra = "cu130" }],
+    [{ extra = "cluster" }, { extra = "cpu" }],
+    [{ extra = "cluster" }, { extra = "cu128" }],
+]
+environments = ["sys_platform == 'linux'", "sys_platform == 'win32'"]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [tool.setuptools.packages.find]
 include = ["conpo*"]

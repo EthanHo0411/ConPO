@@ -4,7 +4,7 @@ Post-training for verifiable instruction following: repaired/corrupted response 
 
 Locked: Qwen3-4B policy every run (later ablations: Qwen3-8B, Llama-3.1-Tulu-3-8B-SFT, Olmo-3-7B-Instruct-SFT, unused today); LoRA r64 alpha128 dropout0.05; 54 constraint families (IFEval 25 + IFBench-Train 29); pool `allenai/IF_multi_constraints_upto5`, eval on `google/IFEval` + held-out `allenai/IFBench_test` (58 disjoint families); official vendored IFEvalG scorers only; judge Qwen3-14B.
 
-Tests: `conda run -n conpo --no-capture-output python -m pytest tests/test_verifiers.py -q`
+Tests: `uv run --extra cpu --extra dev python -m pytest tests/test_verifiers.py -q`
 
 Layout: `conpo/config.py` constants; `conpo/verifiers.py` Constraint type + build/check/describe_failure + family registry; `conpo/vendor/ifevalg/` vendored checkers (see its VENDOR.md); `tests/` suite + kwargs fixture.
 
@@ -72,34 +72,51 @@ trainer directly rather than through the script; `scripts/train.py`'s own
 
 ## Local test commands
 
-Run from the repo root, conda env `conpo`:
+Run from the repo root. Default env manager is uv (the conda envs `conpo`
+and `conpo-gpu` are kept as a fallback -- USER DECISIONS 2026-09-06).
+Bootstrap once: `uv sync --extra cpu --extra dev` creates `.venv` with the
+same pins as the conda env `conpo` (torch 2.11.0+cpu, transformers 5.14.1,
+trl 1.9.2, peft 0.20.0).
 
 ```bash
 # whole suite
-conda run -n conpo --no-capture-output python -m pytest tests -q
+uv run --extra cpu --extra dev python -m pytest tests -q
 
 # one file
-conda run -n conpo --no-capture-output python -m pytest tests/test_verifiers.py -q
+uv run --extra cpu --extra dev python -m pytest tests/test_verifiers.py -q
 
 # corpus rebuild (CPU only, no network once the HF cache is staged)
-conda run -n conpo --no-capture-output python scripts/build_corpus.py
+uv run --extra cpu --extra dev python scripts/build_corpus.py
 ```
 
-As of 2026-09-03: 673 passed, 14 skipped, 0 failed.
+As of 2026-09-06 in the uv venv: 882 passed, 14 skipped, 0 failed (same
+counts as the conda env `conpo`).
 
 ## Cluster launch sequence
 
-Runs on the mlp SLURM cluster, conda env `vllm`
+Runs on the mlp SLURM cluster via the uv venv
 (`torch 2.11.0+cu130`, `transformers 5.14.1`, `trl 1.9.2`, `peft 0.20.0`,
 `vllm 0.26.0`). Two H100 80 GB GPUs: `--gres=gpu:h100:1` per LoRA run (one
 run per card, two runs concurrently) and for the judge server;
 `--gres=gpu:h100:2` for the full-FT point-check. The gres strings are
 unverified on the cluster.
 
+0. **Bootstrap uv on the cluster** (once, from the repo root; install uv if
+   missing):
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   uv sync --frozen --extra cu130 --extra cluster
+   ```
+   `cluster` (vllm 0.26.0, a CUDA 13 build) pairs with `cu130` only --
+   pyproject.toml's conflict markers refuse `cluster` with `cpu` or `cu128`.
+   This needs an NVIDIA driver of 580 or newer; nobody has checked the
+   cluster driver, and this uv bootstrap itself has never run on a GPU box.
+   The launchers activate `${PROJECT}/.venv` (override with `CONPO_VENV`).
+
 1. **Stage the HF cache** (once, from a node with network access,
    `HF_HUB_OFFLINE` unset):
    ```bash
-   conda activate vllm
+   source "${CONPO_VENV:-${PROJECT}/.venv}/bin/activate"
    python scripts/fetch_data.py
    ```
    Caches `config.POOL_DATASET`, `config.IFEVAL_DATASET`, the
@@ -197,10 +214,13 @@ unverified on the cluster.
 
 ## What is untested
 
-No GPU exists on this development machine and `vllm` is not installed here
-(the `conpo` conda env is CPU-only, `pyproject.toml`'s `cluster` optional
-group is not installed), so every GPU-dependent path below has never run,
-even though the surrounding Python modules now exist and are CPU-tested:
+No GPU exists on this development machine and `vllm` is not installed here.
+Of the uv extras, only `cpu` has been synced and verified (`uv sync --extra
+cpu --extra dev`, matching the conda env `conpo`); `cu128` (RTX 5060 smoke),
+`cu130`, and `cluster` have never been synced on a GPU box, and the uv
+cluster bootstrap itself (`uv sync --frozen --extra cu130 --extra cluster`)
+has never run. So every GPU-dependent path below has never run, even though
+the surrounding Python modules now exist and are CPU-tested:
 
 - `slurm/judge_server.sbatch` -- never submitted; the vLLM OpenAI-server
   invocation, the `--gres=gpu:h100:1` line, and the health-poll

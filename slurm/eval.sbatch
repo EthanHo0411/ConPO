@@ -4,7 +4,7 @@
 # run. scripts/eval_external.py and scripts/eval_internal.py exist and have
 # a "hf" backend exercised by tests/test_eval_scripts.py; their "vllm"
 # backend (each script's _generate_vllm, lazily imported) has never run
-# anywhere. Verify the gres line, the conda env name, and this launcher's
+# anywhere. Verify the gres line, the uv venv path, and this launcher's
 # --out paths on the mlp cluster before trusting it.
 #
 # Runs both eval scripts against one adapter directory, vLLM backend, on one
@@ -40,9 +40,10 @@ mkdir -p logs
 echo "node=$(hostname) date=$(date -Is) job=${SLURM_JOB_ID}"
 nvidia-smi -L || echo "nvidia-smi -L failed"
 
-source "${CONDA_HOME:-$HOME/miniconda3}/etc/profile.d/conda.sh"
-conda activate vllm
-echo "env=${CONDA_DEFAULT_ENV:-none} python=$(python -V 2>&1)"
+# ponytail (2026-09-06): switching from conda to a uv venv is the user's
+# decision; CONPO_VENV/.venv naming is this session's choice.
+source "${CONPO_VENV:-${PROJECT}/.venv}/bin/activate"
+echo "env=${VIRTUAL_ENV:-none} python=$(python -V 2>&1)"
 
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1

@@ -7,7 +7,7 @@
 # (below), but its real-model, real-GPU, RUN_USE_VLLM=1 path (as opposed to
 # its --tiny CPU smoke path) has never run, and neither has
 # VLLMBatchedJudge/HFBatchedJudge or the sleep/wake_up path. Verify the
-# gres line and the conda env name on the mlp cluster before trusting it.
+# gres line and the uv venv path on the mlp cluster before trusting it.
 #
 # Trains one ConPO run on one H100 80 GB GPU: policy + LoRA + colocated vLLM
 # generation (vllm_mode "colocate" -- ConPO-Build-Plan.md section 1). Two
@@ -88,9 +88,10 @@ mkdir -p logs
 echo "node=$(hostname) date=$(date -Is) job=${SLURM_JOB_ID}"
 nvidia-smi -L || echo "nvidia-smi -L failed"
 
-source "${CONDA_HOME:-$HOME/miniconda3}/etc/profile.d/conda.sh"
-conda activate vllm
-echo "env=${CONDA_DEFAULT_ENV:-none} python=$(python -V 2>&1)"
+# ponytail (2026-09-06): switching from conda to a uv venv is the user's
+# decision; CONPO_VENV/.venv naming is this session's choice.
+source "${CONPO_VENV:-${PROJECT}/.venv}/bin/activate"
+echo "env=${VIRTUAL_ENV:-none} python=$(python -V 2>&1)"
 
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
