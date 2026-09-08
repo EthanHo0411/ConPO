@@ -1,7 +1,8 @@
 #!/bin/bash
 # Local devbox, 2x H100 80 GB, no job scheduler: GPU=<idx> picks the card via
 # CUDA_VISIBLE_DEVICES (default 1, so the trainer's default GPU 0 stays
-# free). This script has never been run.
+# free). Verified on this box on 2026-09-08: served Qwen3-14B and answered
+# a RUN_JUDGE_MODE=http training smoke's veto calls (200 OK).
 #
 # Serves config.JUDGE_MODEL (Qwen/Qwen3-14B) as a long-lived OpenAI-compatible
 # vLLM server, for conpo/judge.py's HttpJudge (the quality veto of ConPO.pdf

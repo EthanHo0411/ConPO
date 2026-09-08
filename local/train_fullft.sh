@@ -1,7 +1,9 @@
 #!/bin/bash
 # Local devbox, 2x H100 80 GB, no job scheduler: CUDA_VISIBLE_DEVICES defaults to
 # "0,1" (both cards, since this is the only two-GPU launcher); GPU=<idx> or
-# GPU=<idx,idx> overrides it. This script has never been run. Two open
+# GPU=<idx,idx> overrides it; the accelerate process count follows the
+# number of listed cards, and the sharded full-FT needs two. This script
+# has never been run. Two open
 # questions beyond the usual GPU-untested caveat (local/train.sh's own
 # header, RUN_JUDGE_MODE=http wait loop, RUN_OUT_DIR layout):
 #   1. TRL's vllm_mode="colocate" generation under a two-process accelerate/
@@ -97,7 +99,8 @@ fi
 # set +e around the trainer only: with set -e, a nonzero exit here would
 # jump straight past the DONE line below instead of reporting it.
 set +e
-accelerate launch --config_file "${PROJECT}/local/accelerate_fullft.yaml" --num_processes 2 \
+NPROC=$(( $(printf '%s' "${CUDA_VISIBLE_DEVICES}" | tr -cd ',' | wc -c) + 1 ))
+accelerate launch --config_file "${PROJECT}/local/accelerate_fullft.yaml" --num_processes "${NPROC}" \
     "${PROJECT}/scripts/train.py"
 rc=$?
 set -e

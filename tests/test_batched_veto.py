@@ -223,8 +223,15 @@ def test_vllm_batched_judge_veto_many_imports_vllm_lazily(monkeypatch: pytest.Mo
         def __exit__(self, *exc_info: object) -> None:
             return None
 
-        def apply(self, func: Callable[..., list[str]], args: tuple[object, ...]) -> list[str]:
-            return func(*args)
+        def apply_async(self, func: Callable[..., list[str]], args: tuple[object, ...]) -> "_InlineResult":
+            return _InlineResult(func, args)
+
+    class _InlineResult:
+        def __init__(self, func: Callable[..., list[str]], args: tuple[object, ...]) -> None:
+            self.func, self.args = func, args
+
+        def get(self, timeout: float | None = None) -> list[str]:
+            return self.func(*self.args)
 
     class _InlineContext:
         def Pool(self, _processes: int) -> _InlinePool:  # noqa: N802  (mirrors multiprocessing's API)
@@ -344,6 +351,42 @@ def test_vllm_batched_judge_calls_after_unload_when_run_burst_raises(
     with pytest.raises(RuntimeError, match="out of memory"):
         j.veto_many([_req()])
 
+    assert calls == ["before_load", "after_unload"]
+
+
+def test_vllm_batched_judge_burst_timeout_raises_and_still_unloads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A child killed by the OOM killer or a CUDA abort never returns a
+    result; the burst must fail loud after burst_timeout_s (not block the
+    training step forever) and after_unload must still run."""
+    calls: list[str] = []
+    j = judge.VLLMBatchedJudge(
+        "some/judge-model",
+        burst_timeout_s=0.01,
+        before_load=lambda: calls.append("before_load"),
+        after_unload=lambda: calls.append("after_unload"),
+    )
+
+    class _NeverResult:
+        def get(self, timeout: float | None = None) -> list[str]:
+            raise judge.multiprocessing.TimeoutError()
+
+    class _StuckPool:
+        def __enter__(self) -> "_StuckPool":
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def apply_async(self, func: Callable[..., list[str]], args: tuple[object, ...]) -> _NeverResult:
+            return _NeverResult()
+
+    class _StuckContext:
+        def Pool(self, _processes: int) -> _StuckPool:  # noqa: N802
+            return _StuckPool()
+
+    monkeypatch.setattr(judge.multiprocessing, "get_context", lambda kind: _StuckContext())
+    with pytest.raises(RuntimeError, match="returned no result"):
+        j.veto_many([_req()])
     assert calls == ["before_load", "after_unload"]
 
 

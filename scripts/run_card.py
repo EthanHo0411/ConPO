@@ -126,7 +126,6 @@ class CardPlan:
 
 POLICY_MODEL = cfg.POLICY_MODEL
 
-_NOT_IMPLEMENTED_FULLFT = "not yet implemented: scripts/train.py has no full fine-tune switch (LoRA only)"
 
 PLANNED_RUNS: tuple[CardPlan, ...] = (
     CardPlan("full_s42", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "42", "planned", 18.0),
@@ -189,7 +188,7 @@ PLANNED_RUNS: tuple[CardPlan, ...] = (
     ),
     CardPlan(
         "full_fullft_s42", "train", "full", {}, "full-FT point-check", (), POLICY_MODEL, "42", "planned", 21.0,
-        launch=_NOT_IMPLEMENTED_FULLFT,
+        launch="RUN_ARM=full RUN_SEED=42 RUN_FULL_FT=1 RUN_OUT_DIR=runs/full_fullft_s42 bash local/train_fullft.sh",
     ),
 )
 

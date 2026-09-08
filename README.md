@@ -62,7 +62,7 @@ export env only and never retype a value `scripts/train.py` can read from
 | `RUN_NUM_GENERATIONS` | integer, default `config.NUM_GENERATIONS` (8) | `scripts/train.py`, also written to `run_metadata.json` as `num_generations`. Smoke and shape tests only -- cluster runs never set this. |
 | `RUN_MAX_COMPLETION_TOKENS` | integer, default `config.MAX_COMPLETION_TOKENS` (1024) | `scripts/train.py`, also written to `run_metadata.json` as `max_completion_tokens`. Smoke and shape tests only -- cluster runs never set this. |
 | `RUN_EFFECTIVE_BATCH` | integer, default `config.EFFECTIVE_BATCH` (128) | `scripts/train.py`, also written to `run_metadata.json` as `effective_batch`. Smoke and shape tests only -- cluster runs never set this. |
-| `RUN_FULL_FT` | `1` | `scripts/train.py`, default `0` there: `1` trains every weight (`peft_config=None`) instead of a LoRA adapter, for the full-FT point-check (`local/train_fullft.sh`); recorded as `run_metadata.json`'s `full_ft`. Reference scoring runs under TRL's own `self.ref_model` instead of a disabled adapter (`conpo/trainer.py`'s `_reference_model`); see "What is untested" for what still isn't. |
+| `RUN_FULL_FT` | `1` | `scripts/train.py`, default `0` there: `1` trains every weight (`peft_config=None`) instead of a LoRA adapter, for the full-FT point-check (`local/train_fullft.sh`); recorded as `run_metadata.json`'s `full_ft`. Reference scoring runs under TRL's own `self.ref_model` instead of a disabled adapter (`conpo/trainer.py`'s `_reference_model`); see "What is verified on the devbox, and what is not". |
 
 `conpo/arms.py:resolve_arm` and the `ConPOTrainer` it configures are
 exercised on CPU by `tests/test_trainer_tiny.py`, which constructs the
@@ -92,7 +92,7 @@ As of 2026-09-06 in the uv venv: 882 passed, 14 skipped, 0 failed.
 On this devbox, after the cu130 sync (step 0 below):
 `source local/env.sh && uv run --frozen --extra cu130 --extra cluster --extra dev python -m pytest tests -q`
 (Python 3.12.11, torch 2.11.0+cu130, vllm 0.26.0, transformers 5.14.1,
-trl 1.9.2, peft 0.20.0): 882 passed, 14 skipped on 2026-09-08. The suite
+trl 1.9.2, peft 0.20.0): 884 passed, 14 skipped on 2026-09-08 in 8m09s. The suite
 needs the HF cache staged (step 1) or network for the policy tokenizer.
 
 ## Devbox launch sequence
@@ -187,7 +187,7 @@ for the full-FT point-check), so two single-GPU runs can share the box with
    RUN_ARM=full RUN_SEED=42 RUN_FULL_FT=1 RUN_OUT_DIR=runs/full_fullft_s42 \
      bash local/train_fullft.sh
    ```
-   See "What is untested" for the open questions this script has never run
+   See "What is verified on the devbox, and what is not" for the open questions this script has never run
    against.
 
 6. **Model-axis replications** (one H100, `RUN_ARM=full` only, `RUN_MODEL`

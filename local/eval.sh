@@ -1,9 +1,10 @@
 #!/bin/bash
 # Local devbox, 2x H100 80 GB, no job scheduler: GPU=<idx> picks the card via
-# CUDA_VISIBLE_DEVICES (default 0). This script has never been run:
-# scripts/eval_external.py and scripts/eval_internal.py exist and have a
-# "hf" backend exercised by tests/test_eval_scripts.py; their "vllm" backend
-# (each script's _generate_vllm, lazily imported) has never run anywhere.
+# CUDA_VISIBLE_DEVICES (default 0). Verified on this box on 2026-09-08 for
+# the base model with the vllm backend (EVAL_LIMIT=8, both scripts wrote
+# their JSON and exited cleanly); the adapter (LoRARequest) path and the
+# hf backend's generation have not run, see README "What is verified on
+# the devbox, and what is not".
 #
 # Runs both eval scripts against one adapter directory, vLLM backend, on
 # whichever GPU is selected: scripts/eval_external.py (IFEval + IFBench,

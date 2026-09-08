@@ -98,7 +98,9 @@ def main() -> None:
         # the tokenizer) have to be in the hub cache before the first run.
         # Offline lookup first: an entry another user staged into a shared hub
         # cache is read-only for us, and the online path would fail taking its
-        # download lock even when nothing needs downloading.
+        # download lock even when nothing needs downloading. This stages once
+        # and never syncs: a cached model is not refreshed from the Hub; delete
+        # its hub entry to re-download.
         for name in (config.POLICY_MODEL, config.JUDGE_MODEL):
             print(f"model weights: {name}")
             try:

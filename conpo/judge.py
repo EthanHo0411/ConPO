@@ -443,12 +443,11 @@ def _vllm_burst(
     function must run in one.
     """
     # ponytail: this exact call shape (LLM.chat + SamplingParams(
-    # structured_outputs=...)) had no GPU to run against when first written
-    # and is still unverified end to end: the one real run so far crashed
-    # during LLM() construction (profile_run), before llm.chat() was ever
-    # reached. Verify against the real judge model the first time this path
-    # completes on the H100 estate, upgrade if the installed vllm version's
-    # API differs. structured_outputs (not guided_decoding) is confirmed
+    # structured_outputs=...)) had no GPU to run against when first written.
+    # It first ran end to end on the devbox on 2026-09-08 (vllm 0.26.0,
+    # Qwen3-14B, gpu_memory_utilization 0.6: 8 verdicts parsed from one
+    # burst), so the shape is confirmed for that vllm version; re-check it
+    # after a vllm upgrade. structured_outputs (not guided_decoding) is confirmed
     # against the installed trl==1.9.2 package's own vLLM integration, which
     # uses only StructuredOutputsParams/structured_outputs= (trl/generation/
     # vllm_generation.py, trl/scripts/vllm_serve.py) -- the vllm version
@@ -507,6 +506,7 @@ class VLLMBatchedJudge:
         # colocated trainer holds about 12 GiB of the card at burst time.
         gpu_memory_utilization: float = 0.6,
         quantization: str | None = None,
+        burst_timeout_s: float = 3600.0,
         before_load: Callable[[], None] | None = None,
         after_unload: Callable[[], None] | None = None,
     ) -> None:
@@ -514,6 +514,7 @@ class VLLMBatchedJudge:
         self.max_model_len = max_model_len
         self.gpu_memory_utilization = gpu_memory_utilization
         self.quantization = quantization
+        self.burst_timeout_s = burst_timeout_s
         self.before_load = before_load
         self.after_unload = after_unload
         self.counts: Counter[str] = Counter()
@@ -528,17 +529,27 @@ class VLLMBatchedJudge:
         A spawned context (Linux's default is fork, which would inherit the
         parent's CUDA state) starts a new interpreter with its own CUDA
         context, which is the whole point (see class docstring). A
-        one-process Pool with apply() blocks until the child returns or
-        raises, and re-raises the child's exception here, matching the
+        one-process Pool re-raises the child's exception here, matching the
         previous in-process behaviour where an LLM() failure propagated
-        directly to the caller.
+        directly to the caller. The result is awaited with a timeout: a
+        child killed by the OOM killer or by a CUDA abort never reports
+        back, and a plain apply() would then block the training step
+        forever while holding the GPU. Leaving the `with` block terminates
+        the child either way.
         """
         ctx = multiprocessing.get_context("spawn")
         with ctx.Pool(1) as pool:
-            return pool.apply(
+            result = pool.apply_async(
                 _vllm_burst,
                 (self.model_name, self.max_model_len, self.gpu_memory_utilization, self.quantization, prompts),
             )
+            try:
+                return result.get(timeout=self.burst_timeout_s)
+            except multiprocessing.TimeoutError as exc:
+                raise RuntimeError(
+                    f"judge burst of {len(prompts)} prompt(s) returned no result in "
+                    f"{self.burst_timeout_s:.0f} s: the child is dead or stuck"
+                ) from exc
 
     def veto_many(self, reqs: Sequence[VetoRequest]) -> list[Verdict]:
         if not reqs:

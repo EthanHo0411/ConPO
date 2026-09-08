@@ -1,13 +1,12 @@
 #!/bin/bash
 # Local devbox, 2x H100 80 GB, no job scheduler: GPU=<idx> picks the card via
 # CUDA_VISIBLE_DEVICES (default 0), so two such runs can share the box with
-# GPU=0 and GPU=1. This script has never been run: scripts/train.py exists
-# and its RUN_ARM/RUN_SEED/RUN_STEPS/RUN_USE_VLLM/RUN_OUT_DIR/RUN_NO_VETO/
-# RUN_JUDGE_MODE/RUN_JUDGE_MODEL/RUN_VETO_PERIOD/RUN_MODEL/RUN_LIMIT reads
-# are read directly from that file (below), but its real-model, real-GPU,
-# RUN_USE_VLLM=1 path (as opposed to its --tiny CPU smoke path) has never
-# run, and neither has VLLMBatchedJudge/HFBatchedJudge or the sleep/wake_up
-# path.
+# GPU=0 and GPU=1. Verified on this box on 2026-09-08 with 2-step smokes on
+# the real Qwen3-4B: HF generate, colocated vLLM, the batched veto
+# (VLLMBatchedJudge in a child process, sleep/wake around the burst) and
+# RUN_JUDGE_MODE=http. Production knobs (RUN_STEPS=500, effective batch
+# 128) have not run; see README "What is verified on the devbox, and what
+# is not". scripts/train.py reads every RUN_* variable itself (below).
 #
 # Trains one ConPO run on one H100 80 GB GPU: policy + LoRA + colocated vLLM
 # generation (vllm_mode "colocate" -- ConPO-Build-Plan.md section 1). Launches

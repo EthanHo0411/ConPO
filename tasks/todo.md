@@ -153,7 +153,12 @@ Results (2026-09-08):
 - Step 3 batched veto, child-process judge (09:45): first retry died in the child with `No available memory for the cache blocks` (judge default `gpu_memory_utilization=0.35` = 27.7 GiB, below the 27.5 GiB weights plus KV); raised to 0.6. Second retry: `### conpo_train DONE rc=0`, 2 steps in 4m00s (120 s per step, each with a 14B judge load in a fresh child), 8 verdicts parsed (`judge_replies.jsonl`), full artifact set in `runs/smoke_veto3/`. The default one-card design now runs on this box.
 - Eval, second attempt (Python 3.12.11 venv): `eval_external.py --backend vllm` generated 8 rows and wrote `runs/eval_base_smoke_eval2/external.json`, then its process never exited (parent in `wait()`, vLLM EngineCore child in a futex) and held GPU 1 for 7 min until killed; `eval_internal.py` never started. Fix: `VLLM_ENABLE_V1_MULTIPROCESSING=0` in `local/env.sh` (in-process engine for one-shot scripts; `local/judge_server.sh` sets it back to 1). Third attempt running with it.
 
+Final suite (node-local venv, after every fix): 884 passed, 14 skipped in 8m09s (2026-09-08 09:55).
+
 ### Task 5: Verify, review, record
+
+Round 1 (2026-09-08 09:55): verifier 10 of 10 PASS. Reviewer: spec PASS, quality FAIL on one defect (`_run_burst` used `Pool.apply` with no timeout, so a child killed by the OOM killer or a CUDA abort would hang the training step forever) plus five smaller findings (full-FT run card still said not implemented; three launcher headers still said never run; stale `_vllm_burst` comment; staging note; full-FT process count hardcoded). All six fixed: `apply_async(...).get(timeout=burst_timeout_s)` raising RuntimeError through the hook-restoring finally (test added), real launch line for `full_fullft_s42`, headers rewritten, comment updated, note added, `--num_processes` derived from the GPU list. 144 affected tests pass. Round 2 reviewer dispatched on the fix diff.
+
 
 - [ ] Step 1: fresh-context verifier (templates.md §6) over Tasks 2, 3a, 3b acceptance lines.
 - [ ] Step 2: review leg (templates.md §5) over `git diff fa842e3..HEAD`.
