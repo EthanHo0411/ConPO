@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import datasets
+from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
 from conpo import config
@@ -91,6 +92,13 @@ def main() -> None:
         print("nltk punkt / punkt_tab")
         ensure_nltk()
         print("  cached")
+
+        # Every launcher runs with HF_HUB_OFFLINE=1, so the weights (not only
+        # the tokenizer) have to be in the hub cache before the first run.
+        for name in (config.POLICY_MODEL, config.JUDGE_MODEL):
+            print(f"model weights: {name}")
+            path = snapshot_download(name)
+            print(f"  cached: {path}")
 
 
 if __name__ == "__main__":
