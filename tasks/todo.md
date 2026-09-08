@@ -30,6 +30,8 @@
 - D6 `fetch_data.py` gains `snapshot_download` of `config.POLICY_MODEL` and `config.JUDGE_MODEL` (weights, not just tokenizer), since every launcher runs `HF_HUB_OFFLINE=1`.
 - D7 conda references removed (README, `scripts/check_overlap.py` docstring). uv is the only env manager.
 - D8 No EnterPlanMode / brainstorming gate: Ethan is away; decisions D1-D7 are the gate output.
+- D2 revised (2026-09-08 09:30): the venv itself moves to `/node-local-cache/cache/conpo-venv`. Measured: `uv sync` there 3.0 s (hardlinks from the node-local cache), `import transformers, torch` 9.7 s; from the NFS `.venv` the same import took 31 s warm earlier and 2m28s under NFS load, and pytest collection exceeded 7 min. `local/env.sh` sets `CONPO_VENV` and `UV_PROJECT_ENVIRONMENT` to the node-local path when it exists (fallback `.venv`). Cost: gone after a node move, rebuilt by one `uv sync`.
+- D9 judge placement: the batched veto's `VLLMBatchedJudge` now spawns a child process per burst (commit after 615263a); `RUN_JUDGE_MODE=http` with `GPU=1 bash local/judge_server.sh` is the two-card alternative; `local/judge_server.sh` no longer aliases the model (HttpJudge sends the model id).
 
 ---
 

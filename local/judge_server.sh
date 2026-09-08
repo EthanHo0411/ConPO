@@ -76,7 +76,6 @@ echo "endpoint file=${ENDPOINT}"
 # drop it once M0 shows CUDA graphs help on the H100.
 python -m vllm.entrypoints.openai.api_server \
     --model "${MODEL}" \
-    --served-model-name judge \
     --host 0.0.0.0 \
     --port "${PORT}" \
     --dtype bfloat16 \

@@ -20,6 +20,7 @@ this module's contract calls them.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import random
 import re
 import time
@@ -421,14 +422,78 @@ class PendingQueue:
         return items
 
 
-class VLLMBatchedJudge:
-    """Quality-veto judge run locally with vllm.LLM, loaded once per flush burst.
+def _vllm_burst(
+    model_name: str,
+    max_model_len: int,
+    gpu_memory_utilization: float,
+    quantization: str | None,
+    prompts: list[str],
+) -> list[str]:
+    """Run one vLLM veto burst to completion and return the raw reply texts,
+    in the same order as `prompts`.
 
-    vllm is imported inside veto_many only: construction never imports it,
-    so build_judge can select this judge on a machine (or in a test) with no
-    vllm install, and the training loop can construct it long before the
-    first flush. before_load/after_unload let the caller sleep and wake a
-    colocated training vLLM engine around the burst (GRPOConfig's
+    Runs inside the process spawned by VLLMBatchedJudge._run_burst, never in
+    the training process directly, and is the only place in this module that
+    constructs vllm.LLM. TRL's colocated vLLM engine
+    (vllm_mode="colocate", distributed_executor_backend="external_launcher")
+    forces vLLM's in-process engine mode for the whole training process, so a
+    second vllm.LLM built there crashes CUDA even while the colocated engine
+    is asleep (see VLLMBatchedJudge's docstring for the confirmed failure).
+    A spawned child gets a fresh CUDA context instead, which is why this
+    function must run in one.
+    """
+    # ponytail: this exact call shape (LLM.chat + SamplingParams(
+    # structured_outputs=...)) had no GPU to run against when first written
+    # and is still unverified end to end: the one real run so far crashed
+    # during LLM() construction (profile_run), before llm.chat() was ever
+    # reached. Verify against the real judge model the first time this path
+    # completes on the H100 estate, upgrade if the installed vllm version's
+    # API differs. structured_outputs (not guided_decoding) is confirmed
+    # against the installed trl==1.9.2 package's own vLLM integration, which
+    # uses only StructuredOutputsParams/structured_outputs= (trl/generation/
+    # vllm_generation.py, trl/scripts/vllm_serve.py) -- the vllm version
+    # paired with this trl release has moved past the guided_decoding field
+    # name.
+    from vllm import LLM, SamplingParams
+    from vllm.sampling_params import StructuredOutputsParams
+
+    llm = LLM(
+        model=model_name,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=gpu_memory_utilization,
+        quantization=quantization,
+    )
+    messages_batch = [[{"role": "user", "content": p}] for p in prompts]
+    sampling = SamplingParams(
+        temperature=0.0,
+        max_tokens=256,
+        structured_outputs=StructuredOutputsParams(json=_VETO_SCHEMA),
+    )
+    outputs = llm.chat(messages_batch, sampling, chat_template_kwargs={"enable_thinking": False})
+    return [out.outputs[0].text for out in outputs]
+
+
+class VLLMBatchedJudge:
+    """Quality-veto judge run with vllm.LLM in a freshly spawned child
+    process, one process per flush burst.
+
+    TRL's colocated vLLM engine (vllm_mode="colocate",
+    distributed_executor_backend="external_launcher") forces vLLM's
+    in-process engine mode for the whole training process. Building a
+    second vllm.LLM directly in that process crashes CUDA even while the
+    colocated engine is asleep: two vLLM engines sharing one process's CUDA
+    context, one of them asleep under the cumem allocator, do not coexist
+    (confirmed on the H100 estate 2026-09-08: RuntimeError: CUDA driver
+    error: invalid argument during profile_run). Running the burst in a
+    spawned child instead (_run_burst, which calls the module-level
+    _vllm_burst) gives it its own fresh CUDA context; the parent's engine
+    stays asleep with its weights and KV cache released, so the child has
+    room to load. vllm is imported lazily inside _vllm_burst only, and only
+    the child ever imports it: construction never imports it, so build_judge
+    can select this judge on a machine (or in a test) with no vllm install,
+    and the training loop can construct it long before the first flush.
+    before_load/after_unload let the caller sleep and wake the colocated
+    training vLLM engine around the burst (GRPOConfig's
     vllm_enable_sleep_mode, see conpo/trainer.py) so the two engines never
     both hold GPU memory at once.
     """
@@ -453,49 +518,43 @@ class VLLMBatchedJudge:
     def veto(self, req: VetoRequest) -> Verdict:
         return self.veto_many([req])[0]
 
+    def _run_burst(self, prompts: list[str]) -> list[str]:
+        """Spawn a fresh child process to run one vLLM burst and return its
+        raw reply texts, in order.
+
+        A spawned context (Linux's default is fork, which would inherit the
+        parent's CUDA state) starts a new interpreter with its own CUDA
+        context, which is the whole point (see class docstring). A
+        one-process Pool with apply() blocks until the child returns or
+        raises, and re-raises the child's exception here, matching the
+        previous in-process behaviour where an LLM() failure propagated
+        directly to the caller.
+        """
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(1) as pool:
+            return pool.apply(
+                _vllm_burst,
+                (self.model_name, self.max_model_len, self.gpu_memory_utilization, self.quantization, prompts),
+            )
+
     def veto_many(self, reqs: Sequence[VetoRequest]) -> list[Verdict]:
         if not reqs:
             return []
         import gc
 
         import torch
-        # ponytail: no GPU in this environment to run vllm against, so the
-        # exact call shape (LLM.chat + SamplingParams(structured_outputs=...))
-        # is unverified here; verify against the real judge model the first
-        # time this path runs on the H100 estate, upgrade if the installed
-        # vllm version's API differs. structured_outputs (not guided_decoding)
-        # confirmed against the installed trl==1.9.2 package's own vLLM
-        # integration, which uses only StructuredOutputsParams/
-        # structured_outputs= (trl/generation/vllm_generation.py,
-        # trl/scripts/vllm_serve.py) -- the vllm version paired with this trl
-        # release has moved past the guided_decoding field name.
-        from vllm import LLM, SamplingParams
-        from vllm.sampling_params import StructuredOutputsParams
 
         if self.before_load is not None:
             self.before_load()
-        # llm is constructed inside the try so a failure here (plausible: GPU
-        # memory pressure from a not-yet-fully-freed colocated training
+        # _run_burst is called inside the try so a failure there (plausible:
+        # GPU memory pressure from a not-yet-fully-freed colocated training
         # engine is exactly the scenario this class exists to handle) still
         # runs after_unload() in the finally below, mirroring before_load().
-        llm = None
         try:
-            llm = LLM(
-                model=self.model_name,
-                max_model_len=self.max_model_len,
-                gpu_memory_utilization=self.gpu_memory_utilization,
-                quantization=self.quantization,
-            )
-            messages_batch = [[{"role": "user", "content": build_veto_prompt(r)}] for r in reqs]
-            sampling = SamplingParams(
-                temperature=0.0,
-                max_tokens=256,
-                structured_outputs=StructuredOutputsParams(json=_VETO_SCHEMA),
-            )
-            outputs = llm.chat(messages_batch, sampling, chat_template_kwargs={"enable_thinking": False})
+            prompts = [build_veto_prompt(r) for r in reqs]
+            raw_replies = self._run_burst(prompts)
             verdicts: list[Verdict] = []
-            for out in outputs:
-                raw = out.outputs[0].text
+            for raw in raw_replies:
                 try:
                     verdict = parse_verdict(raw)
                 except ValueError:
@@ -504,10 +563,16 @@ class VLLMBatchedJudge:
                 self.counts["keep" if verdict.keep else "discard"] += 1
             return verdicts
         finally:
-            if llm is not None:
-                del llm
-                gc.collect()
-                torch.cuda.empty_cache()
+            # The spawned child owns the vllm.LLM instance and its CUDA
+            # context; the child process exiting (end of the `with
+            # ctx.Pool` block in _run_burst) releases that GPU memory
+            # unconditionally, unlike the old in-process `del llm`. These
+            # two calls only tidy this (parent) process's own allocator
+            # state, which the burst never touches directly, so they are
+            # cheap insurance rather than the real cleanup -- kept for that
+            # reason.
+            gc.collect()
+            torch.cuda.empty_cache()
             if self.after_unload is not None:
                 self.after_unload()
 

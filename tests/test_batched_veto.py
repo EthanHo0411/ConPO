@@ -12,6 +12,7 @@ from __future__ import annotations
 import builtins
 import sys
 import types
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -205,17 +206,31 @@ def test_vllm_batched_judge_construction_does_not_import_vllm(monkeypatch: pytes
 
 
 def test_vllm_batched_judge_veto_many_imports_vllm_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
-    """veto_many is where the lazy import happens: with vllm absent, the
-    call fails on that import (ModuleNotFoundError), never earlier and
-    never with some other error, confirming the import site."""
-    real_import = builtins.__import__
+    """The only import of vllm on veto_many's path happens inside
+    _vllm_burst, run through _run_burst's spawned Pool. A real spawned
+    child starts a fresh interpreter, so blocking builtins.__import__ in
+    this process (as _block_vllm_imports does) cannot reach it; this
+    instead patches multiprocessing.get_context so _run_burst's apply()
+    call runs _vllm_burst in-process (no real subprocess), which still
+    proves _vllm_burst -- not construction, not prompt-building -- is
+    where the import happens."""
+    _block_vllm_imports(monkeypatch)
 
-    def _blocking_import(name: str, *args: object, **kwargs: object) -> object:
-        if name == "vllm" or name.startswith("vllm."):
-            raise ModuleNotFoundError(f"No module named {name!r} (blocked by test)")
-        return real_import(name, *args, **kwargs)
+    class _InlinePool:
+        def __enter__(self) -> "_InlinePool":
+            return self
 
-    monkeypatch.setattr(builtins, "__import__", _blocking_import)
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def apply(self, func: Callable[..., list[str]], args: tuple[object, ...]) -> list[str]:
+            return func(*args)
+
+    class _InlineContext:
+        def Pool(self, _processes: int) -> _InlinePool:  # noqa: N802  (mirrors multiprocessing's API)
+            return _InlinePool()
+
+    monkeypatch.setattr(judge.multiprocessing, "get_context", lambda kind: _InlineContext())
     j = judge.VLLMBatchedJudge("some/judge-model")
     with pytest.raises(ModuleNotFoundError):
         j.veto_many([_req()])
@@ -259,13 +274,16 @@ class _FakeStructuredOutputsParams:
         self.kwargs = kwargs
 
 
-def test_vllm_batched_judge_uses_structured_outputs_not_guided_decoding(
+def test_vllm_burst_uses_structured_outputs_not_guided_decoding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Review fix: the installed trl==1.9.2 package's own vLLM integration
-    uses SamplingParams(structured_outputs=StructuredOutputsParams(...)),
-    never guided_decoding/GuidedDecodingParams -- VLLMBatchedJudge must
-    match that API or the first real veto burst fails outright."""
+    """Review fix, retained under the new seam: the installed trl==1.9.2
+    package's own vLLM integration uses
+    SamplingParams(structured_outputs=StructuredOutputsParams(...)), never
+    guided_decoding/GuidedDecodingParams -- _vllm_burst must match that API
+    or the first real veto burst fails outright. _vllm_burst is what a
+    spawned child actually runs, so this exercises it directly, in-process,
+    with no real subprocess involved."""
     fake_sampling_params_mod = types.ModuleType("vllm.sampling_params")
     fake_sampling_params_mod.StructuredOutputsParams = _FakeStructuredOutputsParams  # type: ignore[attr-defined]
     fake_vllm = types.ModuleType("vllm")
@@ -275,42 +293,24 @@ def test_vllm_batched_judge_uses_structured_outputs_not_guided_decoding(
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(sys.modules, "vllm.sampling_params", fake_sampling_params_mod)
 
-    j = judge.VLLMBatchedJudge("some/judge-model")
-    verdicts = j.veto_many([_req()])
+    raw_replies = judge._vllm_burst("some/judge-model", 4096, 0.35, None, [judge.build_veto_prompt(_req())])
 
-    assert len(verdicts) == 1
-    assert verdicts[0].keep is True
-    assert verdicts[0].parse_ok is True
+    assert raw_replies == ['{"degenerate": false, "reason": "fine"}']
     sampling = _FakeVLLM_LLM.last_sampling_params
     assert "structured_outputs" in sampling.kwargs
     assert isinstance(sampling.kwargs["structured_outputs"], _FakeStructuredOutputsParams)
     assert "guided_decoding" not in sampling.kwargs
 
 
-class _FakeVLLM_LLM_Garbage:
-    """Stands in for vllm.LLM answering with a reply that never parses, the
-    shape a small judge model produces often (design 2026-09-04)."""
-
-    def __init__(self, **kwargs: object) -> None:
-        self.kwargs = kwargs
-
-    def chat(self, messages_batch, sampling_params, chat_template_kwargs=None):  # type: ignore[no-untyped-def]
-        return [_FakeLLMOutput("not json at all") for _ in messages_batch]
-
-
 def test_vllm_batched_judge_fails_closed_on_garbage_and_sets_parse_ok_false(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_sampling_params_mod = types.ModuleType("vllm.sampling_params")
-    fake_sampling_params_mod.StructuredOutputsParams = _FakeStructuredOutputsParams  # type: ignore[attr-defined]
-    fake_vllm = types.ModuleType("vllm")
-    fake_vllm.LLM = _FakeVLLM_LLM_Garbage  # type: ignore[attr-defined]
-    fake_vllm.SamplingParams = _FakeSamplingParams  # type: ignore[attr-defined]
-    fake_vllm.sampling_params = fake_sampling_params_mod  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
-    monkeypatch.setitem(sys.modules, "vllm.sampling_params", fake_sampling_params_mod)
-
+    """Fail-closed parsing is veto_many's own logic, applied to whatever
+    raw text _run_burst returns; a fake standing in for that seam is
+    enough, no vllm or subprocess involved."""
     j = judge.VLLMBatchedJudge("some/judge-model")
+    monkeypatch.setattr(j, "_run_burst", lambda prompts: ["not json at all" for _ in prompts])
+
     verdicts = j.veto_many([_req()])
 
     assert len(verdicts) == 1
@@ -320,31 +320,15 @@ def test_vllm_batched_judge_fails_closed_on_garbage_and_sets_parse_ok_false(
     assert j.counts["discard"] == 1
 
 
-class _RaisingFakeLLM:
-    """Fakes vllm.LLM raising during construction, e.g. GPU memory still
-    held by a not-yet-fully-freed colocated training engine."""
-
-    def __init__(self, **kwargs: object) -> None:
-        raise RuntimeError("out of memory (simulated)")
-
-
-def test_vllm_batched_judge_calls_after_unload_when_llm_construction_raises(
+def test_vllm_batched_judge_calls_after_unload_when_run_burst_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Review fix: before_load()/after_unload() must bracket LLM(...)
-    construction itself, not only the code that runs after it succeeds --
-    otherwise a construction failure (the exact scenario these hooks exist
-    to handle) leaves whatever before_load() did (e.g. sleeping the
-    training engine) permanently unreversed."""
-    fake_sampling_params_mod = types.ModuleType("vllm.sampling_params")
-    fake_sampling_params_mod.StructuredOutputsParams = _FakeStructuredOutputsParams  # type: ignore[attr-defined]
-    fake_vllm = types.ModuleType("vllm")
-    fake_vllm.LLM = _RaisingFakeLLM  # type: ignore[attr-defined]
-    fake_vllm.SamplingParams = _FakeSamplingParams  # type: ignore[attr-defined]
-    fake_vllm.sampling_params = fake_sampling_params_mod  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
-    monkeypatch.setitem(sys.modules, "vllm.sampling_params", fake_sampling_params_mod)
-
+    """Review fix, retained under the new seam: before_load()/after_unload()
+    must bracket _run_burst() itself, not only the code that runs after it
+    succeeds -- otherwise a burst failure (e.g. the child's LLM()
+    constructor hitting GPU memory still held by a not-yet-fully-freed
+    colocated training engine) leaves whatever before_load() did (e.g.
+    sleeping the training engine) permanently unreversed."""
     calls: list[str] = []
     j = judge.VLLMBatchedJudge(
         "some/judge-model",
@@ -352,10 +336,44 @@ def test_vllm_batched_judge_calls_after_unload_when_llm_construction_raises(
         after_unload=lambda: calls.append("after_unload"),
     )
 
+    def _raising_run_burst(prompts: list[str]) -> list[str]:
+        raise RuntimeError("out of memory (simulated)")
+
+    monkeypatch.setattr(j, "_run_burst", _raising_run_burst)
+
     with pytest.raises(RuntimeError, match="out of memory"):
         j.veto_many([_req()])
 
     assert calls == ["before_load", "after_unload"]
+
+
+def test_vllm_batched_judge_veto_many_uses_run_burst_seam(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The seam veto_many calls to get raw replies is _run_burst, never
+    vllm or multiprocessing directly: a fake standing in for it proves
+    veto_many's own contract -- before_load then after_unload bracket the
+    burst, replies parse into Verdicts in order, and counts update."""
+    calls: list[str] = []
+    j = judge.VLLMBatchedJudge(
+        "some/judge-model",
+        before_load=lambda: calls.append("before_load"),
+        after_unload=lambda: calls.append("after_unload"),
+    )
+    canned = ['{"degenerate": false, "reason": "fine"}', '{"degenerate": true, "reason": "bad"}']
+
+    def _fake_run_burst(prompts: list[str]) -> list[str]:
+        assert len(prompts) == 2
+        calls.append("run_burst")
+        return canned
+
+    monkeypatch.setattr(j, "_run_burst", _fake_run_burst)
+
+    verdicts = j.veto_many([_req(), _req()])
+
+    assert calls == ["before_load", "run_burst", "after_unload"]
+    assert [v.keep for v in verdicts] == [True, False]
+    assert all(v.parse_ok for v in verdicts)
+    assert j.counts["keep"] == 1
+    assert j.counts["discard"] == 1
 
 
 # ---------------------------------------------------------------------------

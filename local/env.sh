@@ -29,7 +29,27 @@ PROJECT="${PROJECT:-$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")
 export PROJECT
 
 export UV_CACHE_DIR="${CONPO_UV_CACHE:-/node-local-cache/cache/uv}"
-export UV_LINK_MODE=copy  # cache (ZFS) and .venv (NFS) are different filesystems
+
+# The venv lives on the node-local disk too: importing torch+transformers
+# from a venv on NFS took 30 s warm and 150 s under load (2026-09-08), from
+# the node-local one 10 s; `uv sync` rebuilds it there in seconds from the
+# node-local cache (minutes if the cache is gone as well). Falls back to the
+# repo .venv when the node-local dir is absent, e.g. right after a node move
+# before the first `uv sync`. UV_PROJECT_ENVIRONMENT makes `uv sync` and
+# `uv run` use the same path; .ethan-env unsets it globally on purpose.
+if [ -z "${CONPO_VENV:-}" ]; then
+    if [ -d /node-local-cache/cache/conpo-venv ] || [ ! -d "${PROJECT}/.venv" ]; then
+        CONPO_VENV=/node-local-cache/cache/conpo-venv
+    else
+        CONPO_VENV="${PROJECT}/.venv"
+    fi
+fi
+export CONPO_VENV
+export UV_PROJECT_ENVIRONMENT="${CONPO_VENV}"
+case "${CONPO_VENV}" in
+    /node-local-cache/*) export UV_LINK_MODE=hardlink ;;  # same ZFS pool as the cache
+    *) export UV_LINK_MODE=copy ;;  # NFS venv, ZFS cache: different filesystems
+esac
 
 export HF_HUB_CACHE="${CONPO_HF_HUB:-/node-local-cache/huggingface-home/hub}"
 export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
