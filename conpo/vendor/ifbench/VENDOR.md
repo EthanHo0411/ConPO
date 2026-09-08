@@ -49,9 +49,17 @@ not how this vendor copy is used, see `conpo/scoring.py`).
 conda env's declared package list, so both were `pip install`ed into the
 `conpo` env as a direct consequence of vendoring this module verbatim.
 `instructions_util.py` auto-downloads missing NLTK data (`punkt`, `punkt_tab`,
-`stopwords`, `averaged_perceptron_tagger_eng`) into a local `.nltk_data/`
-folder next to `instructions.py` the first time the module is imported --
-this needs network access on a cold machine (worked here).
+`stopwords`, `averaged_perceptron_tagger_eng`) the first time the module is
+imported. Both `instructions.py` and `instructions_util.py` now point nltk at
+the repo-root `nltk_data/` (shared with `conpo.verifiers.ensure_nltk`, which
+stages the same four packages) before importing nltk, and every
+`nltk.download` call passes `download_dir=` explicitly. Both are needed:
+nltk's module-level downloader snapshots its default directory at the first
+`import nltk` in the process (`~/nltk_data` unless an existing writable entry
+is already on `nltk.data.path`), so a path insert after that import changes
+lookups but not the download target. On a shared box `~` is another account's
+home (changed 2026-09-08 after exactly that happened). A cold machine still
+needs network for the first download.
 
 ## How scoring works (from run_eval.py + evaluation_lib.py)
 

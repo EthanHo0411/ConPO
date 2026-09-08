@@ -22,9 +22,12 @@ import string
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Union
 
-# Set NLTK data path to local directory before importing nltk
-_nltk_data_dir = Path(__file__).parent / ".nltk_data"
-_nltk_data_dir.mkdir(exist_ok=True)
+# Set NLTK data path to the repo-root nltk_data/ (the same dir
+# conpo.verifiers.ensure_nltk stages into) before importing nltk. The dir
+# must exist and be writable before any nltk.download() without a
+# download_dir, or nltk falls back to ~/nltk_data (VENDOR.md).
+_nltk_data_dir = Path(__file__).resolve().parents[3] / "nltk_data"
+_nltk_data_dir.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("NLTK_DATA", str(_nltk_data_dir))
 
 import nltk

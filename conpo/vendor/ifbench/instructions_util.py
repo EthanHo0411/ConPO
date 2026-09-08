@@ -19,7 +19,20 @@ import random
 import re
 
 import immutabledict
+import os
+from pathlib import Path
+
+# Same repo-root nltk_data/ as instructions.py, set up here as well because
+# download_nltk_resources() below runs at import time and this module can be
+# imported first; without an existing writable entry on nltk.data.path, nltk
+# downloads into ~/nltk_data (VENDOR.md).
+_nltk_data_dir = Path(__file__).resolve().parents[3] / "nltk_data"
+_nltk_data_dir.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("NLTK_DATA", str(_nltk_data_dir))
+
 import nltk
+
+nltk.data.path.insert(0, str(_nltk_data_dir))
 
 LANGUAGE_CODES = immutabledict.immutabledict({
     "en": "English",
@@ -1587,19 +1600,19 @@ def download_nltk_resources():
     try:
         nltk.data.find("tokenizers/punkt")
     except LookupError:
-        nltk.download("punkt", quiet=True)
+        nltk.download("punkt", download_dir=str(_nltk_data_dir), quiet=True)
     try:
         nltk.data.find("tokenizers/punkt_tab")
     except LookupError:
-        nltk.download("punkt_tab", quiet=True)
+        nltk.download("punkt_tab", download_dir=str(_nltk_data_dir), quiet=True)
     try:
         nltk.data.find("corpora/stopwords")
     except LookupError:
-        nltk.download("stopwords", quiet=True)
+        nltk.download("stopwords", download_dir=str(_nltk_data_dir), quiet=True)
     try:
         nltk.data.find("taggers/averaged_perceptron_tagger_eng")
     except LookupError:
-        nltk.download("averaged_perceptron_tagger_eng", quiet=True)
+        nltk.download("averaged_perceptron_tagger_eng", download_dir=str(_nltk_data_dir), quiet=True)
 
 
 download_nltk_resources()

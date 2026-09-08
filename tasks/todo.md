@@ -43,7 +43,8 @@
 - [ ] Step 4 regression: `.venv/bin/python -m pytest tests -q` (README baseline in the cpu venv: 882 passed, 14 skipped). Record the counts here.
 - [ ] Step 5: measure `time .venv/bin/python -c "import torch, transformers, trl, vllm"` (NFS venv import cost) and record it below.
 
-Result: (fill in)
+Result (2026-09-08): steps 1-3 and 5 done. `uv sync` installed 217 packages in 1m34s (cache on node-local ZFS); interpreter is /usr/bin/python3.12 (3.12.3). Proving check printed `2.11.0+cu130 True 2 0.26.0 5.14.1 1.9.2 0.20.0`. Import of torch+vllm+transformers+trl+peft: 66s cold, 31s warm (NFS venv; acceptable per-run cost, revisit with CONPO_VENV on node-local only if it hurts). Step 4 full suite: running in the background, counts pending.
+Guard note: `source local/env.sh` from a Claude session is allowed only because env.sh is exports-only (commit 1adef22); the tee/cd prologue lives in local/lib.sh, which launchers source and sessions never do. Scripts passed to `bash` are not scanned by the guard.
 
 ### Task 2: Stage models and data into the shared hub (main session)
 
@@ -66,6 +67,9 @@ and `import huggingface_hub` is NOT needed at top level (keep the lazy import so
 - [ ] Step 3 proving check: `ls /node-local-cache/huggingface-home/hub/models--Qwen--Qwen3-4B/snapshots/*/model*.safetensors` lists 3 shards; `ls .../datasets--allenai--IF_multi_constraints_upto5 .../datasets--google--IFEval .../datasets--lukaemon--bbh` exist.
 - [ ] Step 4: `source local/env.sh && HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 .venv/bin/python scripts/build_corpus.py` writes `data/{train,dev,eval_i,eval_ii,eval_iii}.jsonl` + `data/manifest.json` (background).
 - [ ] Step 5: commit `scripts/fetch_data.py`.
+
+Result (2026-09-08): staging ran twice. First run staged Qwen/Qwen3-4B (7.5 GB, 3 shards, dir `dev:dev 2755`) plus the IF datasets into the shared hub in 1m13s, then crashed on Qwen/Qwen3-14B: that entry is root-owned and its `.locks/` dir is not group-writable, so the online `snapshot_download` fails taking a lock even with nothing to download. Fix: offline lookup first (`local_files_only=True`), online only on `LocalEntryNotFoundError`. Second run: 47s, both models "already cached". Raw dataset files and processed arrow live in the in-boundary `HF_DATASETS_CACHE` (324 MB). Corpus build (offline): 3m26s, train 81897 / dev 1000 / eval_i 1500 / eval_ii 2952 / eval_iii 6947 rows.
+Side finding: the first test run created `/home/dev/nltk_data` (159 files) outside the boundary. Cause: the vendored `instructions_util.py` calls `nltk.download()` at import time without a target, and nltk's module-level downloader snapshots `~/nltk_data` as its default at the first `import nltk` in the process. Fixed in both vendored modules (repo-root `nltk_data/`, explicit `download_dir=`) and `ensure_nltk` now stages all four packages; proven twice under a fake HOME. `/home/dev/nltk_data` itself is held for Ethan (never deleted from a session).
 
 ### Task 3a: Local launchers replace slurm/ (Sonnet 5 xhigh subagent)
 

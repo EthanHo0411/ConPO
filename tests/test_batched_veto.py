@@ -183,10 +183,24 @@ def test_hf_batched_judge_veto_many_of_empty_is_empty(tiny_model_dir: Path) -> N
 # ---------------------------------------------------------------------------
 
 
-def test_vllm_batched_judge_construction_does_not_import_vllm() -> None:
-    assert "vllm" not in sys.modules
+def _block_vllm_imports(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make any `import vllm` raise, whether or not vllm is installed or already
+    loaded. On a GPU box vllm sits in sys.modules as soon as TRL's GRPO trainer
+    is imported by an earlier test, so `"vllm" not in sys.modules` cannot prove
+    that construction is lazy; a blocked import can."""
+    real_import = builtins.__import__
+
+    def _blocking_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "vllm" or name.startswith("vllm."):
+            raise ModuleNotFoundError(f"No module named {name!r} (blocked by test)")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocking_import)
+
+
+def test_vllm_batched_judge_construction_does_not_import_vllm(monkeypatch: pytest.MonkeyPatch) -> None:
+    _block_vllm_imports(monkeypatch)
     j = judge.VLLMBatchedJudge("some/judge-model")
-    assert "vllm" not in sys.modules
     assert j.model_name == "some/judge-model"
 
 
@@ -207,12 +221,12 @@ def test_vllm_batched_judge_veto_many_imports_vllm_lazily(monkeypatch: pytest.Mo
         j.veto_many([_req()])
 
 
-def test_vllm_batched_judge_veto_many_of_empty_never_touches_vllm() -> None:
+def test_vllm_batched_judge_veto_many_of_empty_never_touches_vllm(monkeypatch: pytest.MonkeyPatch) -> None:
     """An empty batch returns [] without importing vllm at all, so a flush
     with nothing pending never pays vllm's load cost."""
+    _block_vllm_imports(monkeypatch)
     j = judge.VLLMBatchedJudge("some/judge-model")
     assert j.veto_many([]) == []
-    assert "vllm" not in sys.modules
 
 
 class _FakeLLMOutput:
@@ -401,10 +415,9 @@ def test_build_judge_batched_mode_with_vllm_flag_selects_vllm_judge(monkeypatch:
     _clear_judge_env(monkeypatch)
     monkeypatch.setenv("RUN_JUDGE_MODE", "batched")
     monkeypatch.setenv("RUN_USE_VLLM", "1")
-    assert "vllm" not in sys.modules
+    _block_vllm_imports(monkeypatch)  # construction alone must not import it
     j = judge.build_judge()
     assert isinstance(j, judge.VLLMBatchedJudge)
-    assert "vllm" not in sys.modules  # construction alone must not import it
 
 
 def test_build_judge_model_override_applies_to_batched_judges(monkeypatch: pytest.MonkeyPatch) -> None:

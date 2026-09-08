@@ -15,6 +15,7 @@ from pathlib import Path
 
 import datasets
 from huggingface_hub import snapshot_download
+from huggingface_hub.errors import LocalEntryNotFoundError
 from transformers import AutoTokenizer
 
 from conpo import config
@@ -95,10 +96,17 @@ def main() -> None:
 
         # Every launcher runs with HF_HUB_OFFLINE=1, so the weights (not only
         # the tokenizer) have to be in the hub cache before the first run.
+        # Offline lookup first: an entry another user staged into a shared hub
+        # cache is read-only for us, and the online path would fail taking its
+        # download lock even when nothing needs downloading.
         for name in (config.POLICY_MODEL, config.JUDGE_MODEL):
             print(f"model weights: {name}")
-            path = snapshot_download(name)
-            print(f"  cached: {path}")
+            try:
+                path = snapshot_download(name, local_files_only=True)
+                print(f"  already cached: {path}")
+            except LocalEntryNotFoundError:
+                path = snapshot_download(name)
+                print(f"  cached: {path}")
 
 
 if __name__ == "__main__":

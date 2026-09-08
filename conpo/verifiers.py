@@ -264,7 +264,14 @@ def ensure_nltk() -> None:
     data_dir = str(_NLTK_DATA_DIR)
     if data_dir not in nltk.data.path:
         nltk.data.path.insert(0, data_dir)
-    for pkg, find_path in (("punkt", "tokenizers/punkt"), ("punkt_tab", "tokenizers/punkt_tab")):
+    # punkt/punkt_tab for our own sentence splitting; stopwords and the tagger
+    # for the vendored IFBench checkers, so an offline run never downloads.
+    for pkg, find_path in (
+        ("punkt", "tokenizers/punkt"),
+        ("punkt_tab", "tokenizers/punkt_tab"),
+        ("stopwords", "corpora/stopwords"),
+        ("averaged_perceptron_tagger_eng", "taggers/averaged_perceptron_tagger_eng"),
+    ):
         try:
             nltk.data.find(find_path)
         except LookupError:
