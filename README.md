@@ -92,7 +92,7 @@ As of 2026-09-06 in the uv venv: 882 passed, 14 skipped, 0 failed.
 On this devbox, after the cu130 sync (step 0 below):
 `source local/env.sh && uv run --frozen --extra cu130 --extra cluster --extra dev python -m pytest tests -q`
 (Python 3.12.11, torch 2.11.0+cu130, vllm 0.26.0, transformers 5.14.1,
-trl 1.9.2, peft 0.20.0): 884 passed, 14 skipped on 2026-09-08 in 8m09s. The suite
+trl 1.9.2, peft 0.20.0): 888 passed, 14 skipped on 2026-09-08 in 7m34s. The suite
 needs the HF cache staged (step 1) or network for the policy tokenizer.
 
 ## Devbox launch sequence
@@ -228,7 +228,9 @@ RUN_EFFECTIVE_BATCH=8`):
 
 - Steps 0 to 2 of the launch sequence (sync, staging of the policy and judge
   weights plus the IF datasets into the shared hub, corpus build) and the
-  full CPU suite (see "Local test commands" for the count).
+  full CPU suite (888 passed, 14 skipped in the cu130 venv; the 882 under
+  "Local test commands" is the 2026-09-06 cpu-venv baseline before the six
+  tests this adaptation added).
 - `local/train.sh` in four configurations, each writing `adapter/`,
   `checkpoint-2/`, `run_metadata.json`, `family_stats.json`,
   `mechanism.jsonl`, `edges.jsonl` (and `judge_replies.jsonl` when a judge

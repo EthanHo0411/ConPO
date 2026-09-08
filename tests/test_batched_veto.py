@@ -12,7 +12,6 @@ from __future__ import annotations
 import builtins
 import sys
 import types
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest

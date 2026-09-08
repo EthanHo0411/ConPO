@@ -556,7 +556,11 @@ class VLLMBatchedJudge:
         after burst_timeout_s, and the join afterwards is capped and followed
         by SIGKILL, so the training step fails instead of hanging. A
         multiprocessing.Pool was not used: its __exit__ joins a live worker
-        without a bound.
+        without a bound. Residual limit: a child stuck in an uninterruptible
+        driver wait survives SIGKILL until the kernel returns; the step
+        still fails within the bounds above, but multiprocessing's atexit
+        hook joins every live child, so such a child can delay the
+        interpreter's exit. No user-space code can bound that.
         """
         ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=False)
@@ -615,13 +619,11 @@ class VLLMBatchedJudge:
             return verdicts
         finally:
             # The spawned child owns the vllm.LLM instance and its CUDA
-            # context; the child process exiting (end of the `with
-            # ctx.Pool` block in _run_burst) releases that GPU memory
-            # unconditionally, unlike the old in-process `del llm`. These
-            # two calls only tidy this (parent) process's own allocator
-            # state, which the burst never touches directly, so they are
-            # cheap insurance rather than the real cleanup -- kept for that
-            # reason.
+            # context; _run_burst joins it with a cap and kills it if it
+            # lingers, and its exit releases that GPU memory unconditionally,
+            # unlike the old in-process `del llm`. These two calls only tidy
+            # this (parent) process's own allocator state, which the burst
+            # never touches directly: cheap insurance, not the real cleanup.
             gc.collect()
             torch.cuda.empty_cache()
             if self.after_unload is not None:
