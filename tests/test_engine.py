@@ -91,3 +91,46 @@ def test_fake_engine_callable_mode_receives_messages_and_n() -> None:
 def test_fake_engine_count_tokens() -> None:
     engine = FakeEngine(["irrelevant"])
     assert engine.count_tokens(["one two three", "four"]) == 4
+
+
+# --- VLLMColocateEngine: prompt contract (2026-09-08) --------------------------
+
+
+class _RecordingGeneration:
+    """Stands in for trl's VLLMGeneration: records the prompts it was handed."""
+
+    def __init__(self) -> None:
+        self.temperature = 0.5
+        self.top_p = 0.9
+        self.max_completion_length = 16
+        self.generation_kwargs: dict[str, object] = {}
+        self.prompts: list[object] = []
+        self.synced = 0
+
+    def sync_weights(self) -> None:
+        self.synced += 1
+
+    def generate(self, prompts, images, num_generations):  # type: ignore[no-untyped-def]
+        self.prompts = list(prompts)
+        return None, [[151644, 872] for _ in prompts], None, None
+
+
+def test_vllm_colocate_engine_hands_vllm_plain_token_id_lists(tokenizer) -> None:
+    """transformers 5 returns a BatchEncoding from apply_chat_template(tokenize=True);
+    vLLM's input validation does max(prompt_ids), which on a dict sees the key
+    'input_ids' (a str) and raises. The engine must pass plain int lists."""
+    from types import SimpleNamespace
+
+    from conpo.engine import VLLMColocateEngine
+
+    gen = _RecordingGeneration()
+    trainer = SimpleNamespace(processing_class=tokenizer, vllm_generation=gen, state=SimpleNamespace(global_step=3))
+    engine = VLLMColocateEngine(trainer)
+    out = engine.generate([[{"role": "user", "content": "hi"}]], n=2, max_tokens=8, temperature=0.1, top_p=1.0, seed=7)
+
+    assert len(gen.prompts) == 2  # n copies of the single prompt
+    for ids in gen.prompts:
+        assert isinstance(ids, list) and ids and all(isinstance(t, int) for t in ids)
+    assert gen.synced == 1
+    assert (gen.temperature, gen.top_p, gen.max_completion_length, gen.generation_kwargs) == (0.5, 0.9, 16, {})
+    assert len(out) == 1 and len(out[0]) == 2

@@ -4,6 +4,11 @@
 
 ## Log (newest first -- each entry IS a standing rule)
 
+### 2026-09-08 | transformers 5 changed what apply_chat_template(tokenize=True) returns
+- **What went wrong**: the vLLM colocate smoke died in vLLM's input validation with `'>' not supported between 'str' and 'int'`. `conpo/engine.py` passed `apply_chat_template(tokenize=True)` output as token-id lists; under transformers 5.14.1 that call returns a `BatchEncoding` dict, so vLLM's `max(prompt_ids)` saw the key `"input_ids"`.
+- **Rule**: every `apply_chat_template(..., tokenize=True)` that wants a plain id list passes `return_dict=False` (valid in transformers 4 and 5). The CPU test suite could not catch this because the tiny-model tests never reach a real vLLM engine; a GPU smoke of each generation path is part of done.
+- **Category**: implementation
+
 ### 2026-09-08 | offline launchers with an un-staged model
 - **What went wrong**: `scripts/fetch_data.py` cached only the policy tokenizer, while every launcher exports `HF_HUB_OFFLINE=1`. The first real run would have failed at `from_pretrained` on the weights.
 - **Rule**: a staging step must download everything the offline path loads: weights for `config.POLICY_MODEL` and `config.JUDGE_MODEL`, every dataset in `config`, nltk data. Check by grepping `from_pretrained|load_dataset|snapshot_download` against the staging script.

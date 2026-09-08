@@ -166,6 +166,9 @@ class VLLMColocateEngine:
                 list(messages),
                 add_generation_prompt=True,
                 tokenize=True,
+                # transformers 5 returns a BatchEncoding dict by default; vLLM
+                # needs the plain id list (tasks/lessons.md 2026-09-08).
+                return_dict=False,
                 **config.POLICY_CHAT_TEMPLATE_KWARGS,
             )
             for messages in messages_batch
