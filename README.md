@@ -89,9 +89,11 @@ uv run --extra cpu --extra dev python scripts/build_corpus.py
 
 As of 2026-09-06 in the uv venv: 882 passed, 14 skipped, 0 failed.
 
-On this devbox, after the cu130 sync (step 0 below): `.venv/bin/python -m
-pytest tests -q` (Python 3.12.3, torch 2.11.0+cu130, vllm 0.26.0,
-transformers 5.14.1, trl 1.9.2, peft 0.20.0).
+On this devbox, after the cu130 sync (step 0 below):
+`source local/env.sh && uv run --frozen --extra cu130 --extra cluster --extra dev python -m pytest tests -q`
+(Python 3.12.11, torch 2.11.0+cu130, vllm 0.26.0, transformers 5.14.1,
+trl 1.9.2, peft 0.20.0): 882 passed, 14 skipped on 2026-09-08. The suite
+needs the HF cache staged (step 1) or network for the policy tokenizer.
 
 ## Devbox launch sequence
 
@@ -106,16 +108,21 @@ for the full-FT point-check), so two single-GPU runs can share the box with
    ```bash
    source local/env.sh && uv sync --frozen --extra cu130 --extra cluster --extra dev
    ```
-   Measured on this box: 217 packages in 1m34s, uv cache on
-   `/node-local-cache/cache/uv`. `.venv` (Python 3.12.3) then has torch
-   2.11.0+cu130, vllm 0.26.0, transformers 5.14.1, trl 1.9.2, peft 0.20.0.
-   `cluster` (vllm 0.26.0, a CUDA 13 build) pairs with `cu130` only --
-   pyproject.toml's conflict markers refuse `cluster` with `cpu` or `cu128`.
-   The launchers activate `${PROJECT}/.venv` (override with `CONPO_VENV`).
+   Measured on this box: 217 packages in 1m34s the first time (uv cache on
+   `/node-local-cache/cache/uv`), 3 s on a rebuild. `local/env.sh` puts the
+   venv on the node-local disk as well (`CONPO_VENV=/node-local-cache/cache/conpo-venv`,
+   Python 3.12.11 per `.python-version`: the apt 3.12.3 has no `Python.h`
+   and Triton's JIT, hence vLLM, fails on it). Importing torch and
+   transformers takes 10 s from that venv against 30 s to 150 s from one on
+   NFS, which is why the repo `.venv` is only the fallback. The node-local
+   venv is gone after a node move: re-run this step. `cluster` (vllm 0.26.0,
+   a CUDA 13 build) pairs with `cu130` only -- pyproject.toml's conflict
+   markers refuse `cluster` with `cpu` or `cu128`. The launchers activate
+   `$CONPO_VENV`.
 
 1. **Stage the HF cache and model weights** (once, `HF_HUB_OFFLINE` unset):
    ```bash
-   source local/env.sh && .venv/bin/python scripts/fetch_data.py
+   source local/env.sh && "$CONPO_VENV/bin/python" scripts/fetch_data.py
    ```
    Caches `config.POOL_DATASET`, `config.IFEVAL_DATASET`, nltk
    punkt/punkt_tab, and now also `snapshot_download`s the
@@ -125,8 +132,10 @@ for the full-FT point-check), so two single-GPU runs can share the box with
 
 2. **Build the training corpus** (CPU only):
    ```bash
-   .venv/bin/python scripts/build_corpus.py
+   source local/env.sh && HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 "$CONPO_VENV/bin/python" scripts/build_corpus.py
    ```
+   Measured: 3m26s; train 81897 / dev 1000 / eval_i 1500 / eval_ii 2952 /
+   eval_iii 6947 rows from the 95373-row pool.
    Writes `data/{train,dev,eval_i,eval_ii,eval_iii}.jsonl` and
    `data/manifest.json`.
 
@@ -210,74 +219,53 @@ for the full-FT point-check), so two single-GPU runs can share the box with
    runs/full_s42/adapter`. `local/retention.sh` mirrors `local/eval.sh`'s
    own "positional adapter dir, omit for base model".
 
-## What is untested
+## What is verified on the devbox, and what is not
 
-No GPU exists on this development machine and `vllm` is not installed here.
-Of the uv extras, only `cpu` has been synced and verified (`uv sync --extra
-cpu --extra dev`); `cu128` (RTX 5060 smoke), `cu130`, and `cluster` have
-never been synced on a GPU box. So every GPU-dependent path below has never
-run, even though the surrounding Python modules now exist and are
-CPU-tested:
+Verified end to end on this box on 2026-09-08 (2x H100 80 GB, node-local
+venv, the real `Qwen/Qwen3-4B` checkpoint, smoke knobs `RUN_STEPS=2
+RUN_LIMIT=64 RUN_NUM_GENERATIONS=4 RUN_MAX_COMPLETION_TOKENS=64
+RUN_EFFECTIVE_BATCH=8`):
 
-- `local/judge_server.sh` -- never submitted; the vLLM OpenAI-server
-  invocation, the `--gres=gpu:h100:1` line, and the health-poll
-  timing are unverified.
-- `local/train.sh` -- never submitted; the `RUN_JUDGE_MODE=http`
-  judge-endpoint wait loop, the `RUN_OUT_DIR` layout, and the two-GPU
-  full-FT comment variant are unverified.
-- `local/eval.sh` -- never submitted; the `--out` file paths it builds
-  are checked against `scripts/eval_external.py`/`scripts/eval_internal.py`'s
-  real `argparse` contract, but only their `--score-only` path (no
-  generation) is exercised by `tests/test_eval_scripts.py` -- real
-  generation, both `--backend hf` and `--backend vllm`, is untested.
-- `scripts/train.py` -- exists and reads the RUN_* contract above, but as
-  an entrypoint it has no direct test; `use_vllm=False` (`RUN_USE_VLLM=0`)
-  and `--tiny` are its only combination exercised anywhere, and only
-  indirectly, by `tests/test_trainer_tiny.py` constructing `ConPOTrainer`
-  directly rather than running the script.
-- `scripts/eval_external.py`'s and `scripts/eval_internal.py`'s
-  `_generate_vllm` -- lazily imports `vllm.LLM`, `vllm.SamplingParams`,
-  `vllm.lora.request.LoRARequest`; never called by anything on this
-  machine.
-- `conpo/judge.py:HttpJudge` -- the real HTTP path against a live vLLM
-  server. Only `StaticJudge`, `parse_verdict`, and `build_veto_prompt` are
-  exercised by `tests/test_judge.py`.
-- `conpo/judge.py:VLLMBatchedJudge` -- the batched veto's default judge
-  (loads/unloads a colocated `vllm.LLM` per burst). No vLLM install on this
-  machine; only `HFBatchedJudge` and `PendingQueue` are CPU-tested
-  (`tests/test_batched_veto.py`), and `ConPOTrainer.flush_pending_veto`'s
-  wiring is tested against a recording fake judge, not a real batched one
-  (`tests/test_batched_veto_trainer.py`).
-- `ConPOTrainer._sleep_engine_if_enabled`/`_wake_engine` -- the
-  `vllm_enable_sleep_mode` sleep-before/wake-after path around a veto
-  burst, verified only by reading `trl/generation/vllm_generation.py`'s own
-  `sleep(level=2)`/`wake_up(tags=...)` calls; never run against a live
-  colocated vLLM engine.
-- `conpo/engine.py:VLLMColocateEngine` -- wraps a live TRL `GRPOTrainer`'s
-  colocated vLLM generation. Only `HFEngine` and `FakeEngine` are
-  exercised by tests.
-- Any `RUN_USE_VLLM=1` code path end to end, and TRL's own
-  `vllm_mode="colocate"` integration on a real GPU.
-- `RUN_ARM=full` and `RUN_ARM=ifrlvr` are exercised end to end at
-  `RUN_STEPS<=2` on a tiny random model (`tests/test_trainer_tiny.py`);
-  neither has run on the real `Qwen/Qwen3-4B` checkpoint or a real GPU.
-  The ablation overrides are unit-tested at the mechanism level (e.g. the
-  `selection` modes in `tests/test_reverse.py`), not end to end through
-  `ConPOTrainer`.
-- `local/train_dpo.sh` -- never submitted; the `build_pairs.py --engine
-  vllm` step and `train_dpo.py`'s real-model path are unverified, same
-  caveats as `local/train.sh`'s own header.
-- `local/train_fullft.sh` / `local/accelerate_fullft.yaml` -- never
-  submitted; the ZeRO-2 ("no offload") config is a guess at fitting full
-  fp32 AdamW state across two H100s, and TRL's `vllm_mode="colocate"`
-  generation under a two-process accelerate/deepspeed launch has never been
-  exercised. `RUN_FULL_FT=1`'s reference scoring is a real, tested path
-  (`conpo/trainer.py`'s `_reference_model` scores under TRL's own
-  `self.ref_model` when there is no adapter to disable, see
-  `tests/test_train_knobs.py`'s full-FT test) -- only the two-process launch
-  above remains unverified.
-- `local/eval_sweep.sh` -- `bash -n` and one `DRY_RUN=1` run are checked on
-  this machine (no `runs/` directories to iterate); submitting it to Slurm
-  itself is untested. Its assumption about `local/retention.sh`'s CLI
-  (positional adapter dir, omit for base model) was confirmed by reading the
-  landed `local/retention.sh`, written by another builder.
+- Steps 0 to 2 of the launch sequence (sync, staging of the policy and judge
+  weights plus the IF datasets into the shared hub, corpus build) and the
+  full CPU suite (882 passed, 14 skipped).
+- `local/train.sh` in four configurations, each writing `adapter/`,
+  `checkpoint-2/`, `run_metadata.json`, `family_stats.json`,
+  `mechanism.jsonl`, `edges.jsonl` (and `judge_replies.jsonl` when a judge
+  ran): `RUN_USE_VLLM=0 RUN_NO_VETO=1` (HF generate, 495 s per step, smoke
+  only); `RUN_USE_VLLM=1 RUN_NO_VETO=1` (TRL colocate vLLM through
+  `VLLMColocateEngine`, 38 s per step); the default batched veto
+  (`VLLMBatchedJudge` burst in a spawned child process with the trainer's
+  engine asleep, `RUN_VETO_PERIOD=1`, 120 s per step, 8 verdicts parsed);
+  and `RUN_JUDGE_MODE=http` against `GPU=1 bash local/judge_server.sh`
+  (`HttpJudge`, 8 calls answered 200).
+- `local/eval.sh` on the base model with `--backend vllm`
+  (`_generate_vllm`, `EVAL_LIMIT=8`): `external.json` and `internal.json`
+  written, process exits cleanly (in-process vLLM engine, see
+  `local/env.sh`).
+- `local/eval_sweep.sh`: `bash -n` and `DRY_RUN=1` only.
+
+Still untested:
+
+- `local/eval.sh` with an adapter (the `LoRARequest` path) and
+  `--backend hf` generation.
+- `local/retention.sh` (never launched).
+- `local/train_dpo.sh`: the `build_pairs.py --engine vllm` step and
+  `train_dpo.py` on the real model.
+- `local/train_fullft.sh` / `local/accelerate_fullft.yaml`: the two-process
+  accelerate FSDP launch (torch-native, not DeepSpeed ZeRO-2, since
+  `deepspeed` is not in `uv.lock`) and TRL colocate generation under it.
+  `RUN_FULL_FT=1`'s reference scoring itself is a tested path
+  (`tests/test_train_knobs.py`).
+- `RUN_ARM=ifrlvr` and every ablation override on the real model
+  (unit-tested at the mechanism level only); production knobs
+  (`RUN_STEPS=500`, `RUN_EFFECTIVE_BATCH=128`, 8 generations, 1024
+  completion tokens) and their memory; two concurrent single-GPU runs.
+- Model-axis replications: `Qwen/Qwen3-8B` is in the shared hub;
+  `allenai/Olmo-3-7B-Instruct-SFT` and `allenai/Llama-3.1-Tulu-3-8B-SFT`
+  are not staged.
+- `HFBatchedJudge` on a GPU (CPU tests only).
+
+Version note: trl 1.9.2 warns that it supports vLLM 0.17.0 to 0.25.1 while
+`uv.lock` pins vllm 0.26.0; colocate generation, the batched judge, and the
+judge server all ran on that pairing.

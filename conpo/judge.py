@@ -502,7 +502,10 @@ class VLLMBatchedJudge:
         self,
         model: str,
         max_model_len: int = 4096,
-        gpu_memory_utilization: float = 0.35,
+        # 0.6 of an H100 80 GB: Qwen3-14B bf16 weights alone are 27.5 GiB, so 0.35
+        # left vLLM no room for KV blocks (devbox burst, 2026-09-08); the sleeping
+        # colocated trainer holds about 12 GiB of the card at burst time.
+        gpu_memory_utilization: float = 0.6,
         quantization: str | None = None,
         before_load: Callable[[], None] | None = None,
         after_unload: Callable[[], None] | None = None,
