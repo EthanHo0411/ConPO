@@ -99,6 +99,12 @@ fi
 # set +e around the trainer only: with set -e, a nonzero exit here would
 # jump straight past the DONE line below instead of reporting it.
 set +e
+case "${CUDA_VISIBLE_DEVICES}" in
+    *[!0-9,]*|*,,*|,*|*,|"")
+        echo "GPU must be a comma-separated list of device indices, got '${CUDA_VISIBLE_DEVICES}'"
+        exit 2
+        ;;
+esac
 NPROC=$(( $(printf '%s' "${CUDA_VISIBLE_DEVICES}" | tr -cd ',' | wc -c) + 1 ))
 accelerate launch --config_file "${PROJECT}/local/accelerate_fullft.yaml" --num_processes "${NPROC}" \
     "${PROJECT}/scripts/train.py"

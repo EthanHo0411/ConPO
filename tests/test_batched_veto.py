@@ -206,41 +206,14 @@ def test_vllm_batched_judge_construction_does_not_import_vllm(monkeypatch: pytes
 
 
 def test_vllm_batched_judge_veto_many_imports_vllm_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The only import of vllm on veto_many's path happens inside
-    _vllm_burst, run through _run_burst's spawned Pool. A real spawned
-    child starts a fresh interpreter, so blocking builtins.__import__ in
-    this process (as _block_vllm_imports does) cannot reach it; this
-    instead patches multiprocessing.get_context so _run_burst's apply()
-    call runs _vllm_burst in-process (no real subprocess), which still
-    proves _vllm_burst -- not construction, not prompt-building -- is
-    where the import happens."""
+    """The only import of vllm on veto_many's path happens inside _vllm_burst,
+    the function the spawned child runs. A real child starts a fresh
+    interpreter that a blocked builtins.__import__ here cannot reach, so this
+    calls _vllm_burst directly under the block: it must fail on that import
+    (ModuleNotFoundError), never earlier and never with another error."""
     _block_vllm_imports(monkeypatch)
-
-    class _InlinePool:
-        def __enter__(self) -> "_InlinePool":
-            return self
-
-        def __exit__(self, *exc_info: object) -> None:
-            return None
-
-        def apply_async(self, func: Callable[..., list[str]], args: tuple[object, ...]) -> "_InlineResult":
-            return _InlineResult(func, args)
-
-    class _InlineResult:
-        def __init__(self, func: Callable[..., list[str]], args: tuple[object, ...]) -> None:
-            self.func, self.args = func, args
-
-        def get(self, timeout: float | None = None) -> list[str]:
-            return self.func(*self.args)
-
-    class _InlineContext:
-        def Pool(self, _processes: int) -> _InlinePool:  # noqa: N802  (mirrors multiprocessing's API)
-            return _InlinePool()
-
-    monkeypatch.setattr(judge.multiprocessing, "get_context", lambda kind: _InlineContext())
-    j = judge.VLLMBatchedJudge("some/judge-model")
     with pytest.raises(ModuleNotFoundError):
-        j.veto_many([_req()])
+        judge._vllm_burst("some/judge-model", 4096, 0.6, None, [judge.build_veto_prompt(_req())])
 
 
 def test_vllm_batched_judge_veto_many_of_empty_never_touches_vllm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -354,39 +327,110 @@ def test_vllm_batched_judge_calls_after_unload_when_run_burst_raises(
     assert calls == ["before_load", "after_unload"]
 
 
-def test_vllm_batched_judge_burst_timeout_raises_and_still_unloads(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A child killed by the OOM killer or a CUDA abort never returns a
-    result; the burst must fail loud after burst_timeout_s (not block the
-    training step forever) and after_unload must still run."""
-    calls: list[str] = []
-    j = judge.VLLMBatchedJudge(
+class _FakeConn:
+    """One end of the parent/child pipe as _run_burst sees it."""
+
+    def __init__(self, poll_result: bool, message: object = None) -> None:
+        self.poll_result, self.message, self.closed = poll_result, message, False
+
+    def poll(self, timeout: float | None = None) -> bool:
+        return self.poll_result
+
+    def recv(self) -> object:
+        if self.message is None:
+            raise EOFError  # the child died before sending anything
+        return self.message
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeProcess:
+    """Stands in for the spawned child: never runs the target."""
+
+    exitcode: int | None = -9
+
+    def __init__(self, target: object, args: tuple[object, ...]) -> None:
+        self.args, self.killed, self.joins = args, False, 0
+
+    def start(self) -> None:
+        return None
+
+    def join(self, timeout: float | None = None) -> None:
+        self.joins += 1
+
+    def is_alive(self) -> bool:
+        return not self.killed
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _fake_spawn(monkeypatch: pytest.MonkeyPatch, parent: _FakeConn) -> list[_FakeProcess]:
+    """Route _run_burst's get_context("spawn") to fakes; returns the processes it creates."""
+    procs: list[_FakeProcess] = []
+
+    class _Ctx:
+        def Pipe(self, duplex: bool = True) -> tuple[_FakeConn, _FakeConn]:  # noqa: N802
+            return parent, _FakeConn(False)
+
+        def Process(self, target: object, args: tuple[object, ...]) -> _FakeProcess:  # noqa: N802
+            procs.append(_FakeProcess(target, args))
+            return procs[-1]
+
+    monkeypatch.setattr(judge.multiprocessing, "get_context", lambda kind: _Ctx())
+    return procs
+
+
+def _judge_with_hooks(calls: list[str], **kwargs: object) -> judge.VLLMBatchedJudge:
+    return judge.VLLMBatchedJudge(
         "some/judge-model",
-        burst_timeout_s=0.01,
         before_load=lambda: calls.append("before_load"),
         after_unload=lambda: calls.append("after_unload"),
+        **kwargs,  # type: ignore[arg-type]
     )
 
-    class _NeverResult:
-        def get(self, timeout: float | None = None) -> list[str]:
-            raise judge.multiprocessing.TimeoutError()
 
-    class _StuckPool:
-        def __enter__(self) -> "_StuckPool":
-            return self
-
-        def __exit__(self, *exc_info: object) -> None:
-            return None
-
-        def apply_async(self, func: Callable[..., list[str]], args: tuple[object, ...]) -> _NeverResult:
-            return _NeverResult()
-
-    class _StuckContext:
-        def Pool(self, _processes: int) -> _StuckPool:  # noqa: N802
-            return _StuckPool()
-
-    monkeypatch.setattr(judge.multiprocessing, "get_context", lambda kind: _StuckContext())
+def test_vllm_batched_judge_burst_timeout_raises_kills_child_and_still_unloads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A child wedged in the driver never reports; the burst must fail loud
+    after burst_timeout_s, SIGKILL the child after a bounded join, and still
+    run after_unload."""
+    calls: list[str] = []
+    procs = _fake_spawn(monkeypatch, _FakeConn(poll_result=False))
+    j = _judge_with_hooks(calls, burst_timeout_s=0.01)
     with pytest.raises(RuntimeError, match="returned no result"):
         j.veto_many([_req()])
+    assert calls == ["before_load", "after_unload"]
+    assert procs[0].killed and procs[0].joins == 2
+
+
+def test_vllm_batched_judge_child_death_raises_and_still_unloads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A child killed by the OOM killer closes the pipe without a message
+    (EOFError on recv): a clear RuntimeError, hooks still bracketed."""
+    calls: list[str] = []
+    _fake_spawn(monkeypatch, _FakeConn(poll_result=True, message=None))
+    j = _judge_with_hooks(calls)
+    with pytest.raises(RuntimeError, match="exited without a result"):
+        j.veto_many([_req()])
+    assert calls == ["before_load", "after_unload"]
+
+
+def test_vllm_batched_judge_child_failure_reraises_with_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    _fake_spawn(monkeypatch, _FakeConn(poll_result=True, message=(False, "Traceback: simulated OOM")))
+    j = _judge_with_hooks(calls)
+    with pytest.raises(RuntimeError, match="simulated OOM"):
+        j.veto_many([_req()])
+    assert calls == ["before_load", "after_unload"]
+
+
+def test_vllm_batched_judge_child_result_parses_into_verdicts(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    procs = _fake_spawn(monkeypatch, _FakeConn(poll_result=True, message=(True, ['{"degenerate": false, "reason": "fine"}'])))
+    j = _judge_with_hooks(calls)
+    verdicts = j.veto_many([_req()])
+    assert [v.keep for v in verdicts] == [True] and verdicts[0].parse_ok
+    assert procs[0].args[1] == "some/judge-model" and procs[0].args[-1][0].startswith(judge.build_veto_prompt(_req())[:20])
     assert calls == ["before_load", "after_unload"]
 
 

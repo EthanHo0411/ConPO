@@ -24,6 +24,7 @@ import multiprocessing
 import random
 import re
 import time
+import traceback
 import urllib.request
 import zlib
 from collections import Counter, deque
@@ -472,6 +473,24 @@ def _vllm_burst(
     return [out.outputs[0].text for out in outputs]
 
 
+def _burst_entry(
+    conn: "multiprocessing.connection.Connection",
+    model_name: str,
+    max_model_len: int,
+    gpu_memory_utilization: float,
+    quantization: str | None,
+    prompts: list[str],
+) -> None:
+    """Child-process entry point: run _vllm_burst and report through the pipe,
+    (True, texts) on success or (False, traceback text) on any failure."""
+    try:
+        conn.send((True, _vllm_burst(model_name, max_model_len, gpu_memory_utilization, quantization, prompts)))
+    except BaseException:  # noqa: BLE001  the child reports everything; the parent decides
+        conn.send((False, traceback.format_exc()))
+    finally:
+        conn.close()
+
+
 class VLLMBatchedJudge:
     """Quality-veto judge run with vllm.LLM in a freshly spawned child
     process, one process per flush burst.
@@ -528,28 +547,46 @@ class VLLMBatchedJudge:
 
         A spawned context (Linux's default is fork, which would inherit the
         parent's CUDA state) starts a new interpreter with its own CUDA
-        context, which is the whole point (see class docstring). A
-        one-process Pool re-raises the child's exception here, matching the
-        previous in-process behaviour where an LLM() failure propagated
-        directly to the caller. The result is awaited with a timeout: a
-        child killed by the OOM killer or by a CUDA abort never reports
-        back, and a plain apply() would then block the training step
-        forever while holding the GPU. Leaving the `with` block terminates
-        the child either way.
+        context, which is the whole point (see class docstring). The child
+        reports (ok, payload) through a pipe; a failure inside it is re-raised
+        here as RuntimeError carrying the child's traceback, matching the
+        previous in-process behaviour where an LLM() failure propagated to
+        the caller. Every wait is bounded: a child killed by the OOM killer
+        closes the pipe (EOFError), a child wedged in the driver times out
+        after burst_timeout_s, and the join afterwards is capped and followed
+        by SIGKILL, so the training step fails instead of hanging. A
+        multiprocessing.Pool was not used: its __exit__ joins a live worker
+        without a bound.
         """
         ctx = multiprocessing.get_context("spawn")
-        with ctx.Pool(1) as pool:
-            result = pool.apply_async(
-                _vllm_burst,
-                (self.model_name, self.max_model_len, self.gpu_memory_utilization, self.quantization, prompts),
-            )
-            try:
-                return result.get(timeout=self.burst_timeout_s)
-            except multiprocessing.TimeoutError as exc:
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        proc = ctx.Process(
+            target=_burst_entry,
+            args=(child_conn, self.model_name, self.max_model_len, self.gpu_memory_utilization, self.quantization, prompts),
+        )
+        proc.start()
+        child_conn.close()
+        try:
+            if not parent_conn.poll(self.burst_timeout_s):
                 raise RuntimeError(
                     f"judge burst of {len(prompts)} prompt(s) returned no result in "
                     f"{self.burst_timeout_s:.0f} s: the child is dead or stuck"
+                )
+            try:
+                ok, payload = parent_conn.recv()
+            except EOFError as exc:
+                raise RuntimeError(
+                    f"judge burst child exited without a result (exit code {proc.exitcode})"
                 ) from exc
+        finally:
+            parent_conn.close()
+            proc.join(timeout=30)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=30)
+        if not ok:
+            raise RuntimeError(f"judge burst failed in the child:\n{payload}")
+        return payload
 
     def veto_many(self, reqs: Sequence[VetoRequest]) -> list[Verdict]:
         if not reqs:

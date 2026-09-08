@@ -228,7 +228,7 @@ RUN_EFFECTIVE_BATCH=8`):
 
 - Steps 0 to 2 of the launch sequence (sync, staging of the policy and judge
   weights plus the IF datasets into the shared hub, corpus build) and the
-  full CPU suite (882 passed, 14 skipped).
+  full CPU suite (see "Local test commands" for the count).
 - `local/train.sh` in four configurations, each writing `adapter/`,
   `checkpoint-2/`, `run_metadata.json`, `family_stats.json`,
   `mechanism.jsonl`, `edges.jsonl` (and `judge_replies.jsonl` when a judge
