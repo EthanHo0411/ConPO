@@ -38,6 +38,14 @@ export TRANSFORMERS_CACHE="${HF_HUB_CACHE}"
 export TOKENIZERS_PARALLELISM=false
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# In-process vLLM engine for scripts that build a vllm.LLM themselves (eval,
+# retention, the batched veto judge): with the default EngineCore subprocess
+# the parent sat in wait() and the child in a futex after the outputs were
+# written (2026-09-08 eval smoke), and a judge's GPU memory only returns when
+# that child exits. TRL's colocate engine is in-process regardless.
+# local/judge_server.sh sets this back to 1: a long-lived server wants the
+# separate engine process.
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
 
 # Stands in for the scheduler's job id in log and output names.
 JOB_ID="${JOB_ID:-$(date +%Y%m%d_%H%M%S)_$$}"

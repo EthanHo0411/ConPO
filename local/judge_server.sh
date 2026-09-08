@@ -39,6 +39,8 @@ export CUDA_VISIBLE_DEVICES="${GPU:-1}"
 conpo_launch_setup
 
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
+# A long-lived server keeps vLLM's separate engine process (env.sh turns it off for one-shot scripts).
+export VLLM_ENABLE_V1_MULTIPROCESSING=1
 
 # config.JUDGE_MODEL, read by name rather than retyped. Assumes conpo is
 # installed editable in the uv venv by `uv sync` (pyproject.toml).
