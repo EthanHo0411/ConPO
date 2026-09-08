@@ -569,7 +569,6 @@ def test_model_axis_launch_line_names_run_model() -> None:
             continue
         line = run_card.launch_line(plan)
         assert f"RUN_MODEL={plan.model}" in line
-        assert "RUN_MODEL" in line.split("--export=ALL,", 1)[1]
         assert "not yet implemented" not in line
 
 
@@ -640,7 +639,7 @@ def test_planned_subset_path_uses_forward_slashes() -> None:
     config_section = text.split("## 2. Configuration")[1].split("## 3.")[0]
     line = next(line for line in config_section.splitlines() if line.startswith("- subset path:"))
     assert "\\" not in line
-    assert "conpo/subsets/train_15000_seed42.keys" in line
+    assert line.endswith("/subsets/train_15000_seed42.keys")
 
 
 # --- edge_dpo hypotheses (conpo/arms.py registers objective_isolation_edge_dpo) ----

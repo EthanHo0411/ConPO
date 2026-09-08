@@ -121,7 +121,7 @@ class CardPlan:
     status: str  # "planned"
     est_h100h: float | None
     detail: str = ""
-    launch: str = ""  # non-empty overrides the derived sbatch launch line
+    launch: str = ""  # non-empty overrides the derived local/ launch line
 
 
 POLICY_MODEL = cfg.POLICY_MODEL
@@ -139,7 +139,7 @@ PLANNED_RUNS: tuple[CardPlan, ...] = (
     CardPlan(
         "untrained", "train", "untrained", {}, "floor", ("H1",), POLICY_MODEL, "-", "planned", 0.0,
         detail="eval hours are counted in the eval job rows.",
-        launch="N/A: this policy never trains; sbatch slurm/eval.sbatch and sbatch slurm/retention.sbatch with no adapter",
+        launch="N/A: this policy never trains; bash local/eval.sh and bash local/retention.sh with no adapter",
     ),
     CardPlan("ifrlvr_s42", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "42", "planned", 6.0),
     CardPlan("ifrlvr_s43", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "43", "planned", 6.0),
@@ -403,29 +403,24 @@ def front_matter(fields: dict[str, str]) -> str:
 
 def launch_line(plan: CardPlan) -> str:
     if plan.kind == "eval":
-        return "launched per checkpoint by slurm/eval.sbatch; see the checkpoint list in detail below"
+        return "launched per checkpoint by local/eval.sh; see the checkpoint list in detail below"
     if plan.launch:
         return plan.launch
     arm_spec = ARMS.get(plan.arm)
     if arm_spec is not None and arm_spec.trainer == "dpo":
         return (
             f"RUN_ARM={plan.arm} RUN_SEED={plan.seed} RUN_OUT_DIR=runs/{plan.run_id} "
-            "python -u scripts/train_dpo.py (no slurm/train_dpo.sbatch yet; RUN_STEPS is unset "
-            "here and train_dpo.py defaults it to 1 -- set RUN_STEPS explicitly before launching)"
+            "bash local/train_dpo.sh (RUN_STEPS is unset here and local/train_dpo.sh "
+            "defaults it to 500 -- set RUN_STEPS explicitly to override)"
         )
     assignments = [f"RUN_ARM={plan.arm}"]
-    export_names = ["RUN_ARM"]
     if plan.model != POLICY_MODEL:
         assignments.append(f"RUN_MODEL={plan.model}")
-        export_names.append("RUN_MODEL")
     for key, value in plan.overrides.items():
         assignments.append(f"{key}={value}")
-        export_names.append(key)
     assignments.append(f"RUN_SEED={plan.seed}")
-    export_names.append("RUN_SEED")
     assignments.append(f"RUN_OUT_DIR=runs/{plan.run_id}")
-    export_names.append("RUN_OUT_DIR")
-    return " ".join(assignments) + " sbatch --export=ALL," + ",".join(export_names) + " slurm/train.sbatch"
+    return " ".join(assignments) + " bash local/train.sh"
 
 
 def section_header(plan: CardPlan, status: str) -> str:

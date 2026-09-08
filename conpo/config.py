@@ -304,7 +304,7 @@ VETO_PERIOD_K = 25  # DEV_SET
 # Forces an early burst once the pending queue grows this large. DEV_SET.
 PENDING_QUEUE_MAX = 2000  # DEV_SET
 # RUN_JUDGE_MODE default: "batched" (VLLMBatchedJudge/HFBatchedJudge, no
-# resident judge server) or "http" (HttpJudge against slurm/judge_server.sbatch).
+# resident judge server) or "http" (HttpJudge against local/judge_server.sh).
 JUDGE_MODE_DEFAULT = "batched"
 
 # ---------------------------------------------------------------------------

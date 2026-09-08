@@ -35,17 +35,17 @@ plus 1 full fine-tune point-check -- 21 runs total.
 ## The RUN_* contract
 
 Every training and eval knob is an environment variable read by
-`config.env(name, default)`, so `slurm/train.sbatch` and `slurm/eval.sbatch`
+`config.env(name, default)`, so `local/train.sh` and `local/eval.sh`
 export env only and never retype a value `scripts/train.py` can read from
 `conpo/config.py` itself.
 
 | Variable | Values | Read by |
 |---|---|---|
 | `RUN_ARM` | `full` \| `ifrlvr` \| `solve_only` \| `forward_only` \| `reverse_only` | `scripts/train.py` -> `conpo/arms.py:resolve_arm` (`ARMS` dict) |
-| `RUN_SEED` | integer | `scripts/train.py`, default `0` there (`slurm/train.sbatch` defaults it to `42`) |
-| `RUN_STEPS` | integer, optimiser-step budget | `scripts/train.py`, default `1` there (`slurm/train.sbatch` defaults it to `500`) |
+| `RUN_SEED` | integer | `scripts/train.py`, default `0` there (`local/train.sh` defaults it to `42`) |
+| `RUN_STEPS` | integer, optimiser-step budget | `scripts/train.py`, default `1` there (`local/train.sh` defaults it to `500`) |
 | `RUN_TOKEN_BUDGET` | integer, generated-token budget, `0` = no cap | `conpo/data.py:TokenMeter` |
-| `RUN_USE_VLLM` | `1` sample through vLLM, `0` HF generate | `scripts/train.py`, default `0` there (`slurm/train.sbatch` always sets `1`) |
+| `RUN_USE_VLLM` | `1` sample through vLLM, `0` HF generate | `scripts/train.py`, default `0` there (`local/train.sh` defaults it to `1`, overridable) |
 | `RUN_JUDGE_ENDPOINT` | base URL, used verbatim | `conpo/judge.py:resolve_endpoint` (`RUN_JUDGE_MODE=http` only) |
 | `RUN_JUDGE_MODE` | `batched` (default, `config.JUDGE_MODE_DEFAULT`) \| `http` | `scripts/train.py:build_judge`, also written to `run_metadata.json` |
 | `RUN_JUDGE_MODEL` | model name, default `config.JUDGE_MODEL` | `scripts/train.py:build_judge`, also written to `run_metadata.json` |
@@ -62,21 +62,19 @@ export env only and never retype a value `scripts/train.py` can read from
 | `RUN_NUM_GENERATIONS` | integer, default `config.NUM_GENERATIONS` (8) | `scripts/train.py`, also written to `run_metadata.json` as `num_generations`. Smoke and shape tests only -- cluster runs never set this. |
 | `RUN_MAX_COMPLETION_TOKENS` | integer, default `config.MAX_COMPLETION_TOKENS` (1024) | `scripts/train.py`, also written to `run_metadata.json` as `max_completion_tokens`. Smoke and shape tests only -- cluster runs never set this. |
 | `RUN_EFFECTIVE_BATCH` | integer, default `config.EFFECTIVE_BATCH` (128) | `scripts/train.py`, also written to `run_metadata.json` as `effective_batch`. Smoke and shape tests only -- cluster runs never set this. |
-| `RUN_FULL_FT` | `1` | `scripts/train.py`, default `0` there: `1` trains every weight (`peft_config=None`) instead of a LoRA adapter, for the full-FT point-check (`slurm/train_fullft.sbatch`); recorded as `run_metadata.json`'s `full_ft`. Reference scoring runs under TRL's own `self.ref_model` instead of a disabled adapter (`conpo/trainer.py`'s `_reference_model`); see "What is untested" for what still isn't. |
+| `RUN_FULL_FT` | `1` | `scripts/train.py`, default `0` there: `1` trains every weight (`peft_config=None`) instead of a LoRA adapter, for the full-FT point-check (`local/train_fullft.sh`); recorded as `run_metadata.json`'s `full_ft`. Reference scoring runs under TRL's own `self.ref_model` instead of a disabled adapter (`conpo/trainer.py`'s `_reference_model`); see "What is untested" for what still isn't. |
 
 `conpo/arms.py:resolve_arm` and the `ConPOTrainer` it configures are
 exercised on CPU by `tests/test_trainer_tiny.py`, which constructs the
 trainer directly rather than through the script; `scripts/train.py`'s own
-`main()` (SLURM entrypoint) has one direct `--tiny` test in
+`main()` (CLI entrypoint) has one direct `--tiny` test in
 `tests/test_subset.py`, covering `run_metadata.json`'s RUN_* fields.
 
 ## Local test commands
 
-Run from the repo root. Default env manager is uv (the conda envs `conpo`
-and `conpo-gpu` are kept as a fallback -- USER DECISIONS 2026-09-06).
-Bootstrap once: `uv sync --extra cpu --extra dev` creates `.venv` with the
-same pins as the conda env `conpo` (torch 2.11.0+cpu, transformers 5.14.1,
-trl 1.9.2, peft 0.20.0).
+Run from the repo root. uv is the only env manager. Bootstrap once: `uv sync
+--extra cpu --extra dev` creates `.venv` (torch 2.11.0+cpu, transformers
+5.14.1, trl 1.9.2, peft 0.20.0).
 
 ```bash
 # whole suite
@@ -89,43 +87,45 @@ uv run --extra cpu --extra dev python -m pytest tests/test_verifiers.py -q
 uv run --extra cpu --extra dev python scripts/build_corpus.py
 ```
 
-As of 2026-09-06 in the uv venv: 882 passed, 14 skipped, 0 failed (same
-counts as the conda env `conpo`).
+As of 2026-09-06 in the uv venv: 882 passed, 14 skipped, 0 failed.
 
-## Cluster launch sequence
+On this devbox, after the cu130 sync (step 0 below): `.venv/bin/python -m
+pytest tests -q` (Python 3.12.3, torch 2.11.0+cu130, vllm 0.26.0,
+transformers 5.14.1, trl 1.9.2, peft 0.20.0).
 
-Runs on the mlp SLURM cluster via the uv venv
+## Devbox launch sequence
+
+Runs on this devbox (2x H100 80 GB, no job scheduler) via the uv venv
 (`torch 2.11.0+cu130`, `transformers 5.14.1`, `trl 1.9.2`, `peft 0.20.0`,
-`vllm 0.26.0`). Two H100 80 GB GPUs: `--gres=gpu:h100:1` per LoRA run (one
-run per card, two runs concurrently) and for the judge server;
-`--gres=gpu:h100:2` for the full-FT point-check. The gres strings are
-unverified on the cluster.
+`vllm 0.26.0`). `GPU=<idx>` picks the card via `CUDA_VISIBLE_DEVICES`
+(default 0 for training/eval/retention/dpo, 1 for the judge server, `0,1`
+for the full-FT point-check), so two single-GPU runs can share the box with
+`GPU=0` and `GPU=1`.
 
-0. **Bootstrap uv on the cluster** (once, from the repo root; install uv if
-   missing):
+0. **Sync the uv environment** (once, from the repo root):
    ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   uv sync --frozen --extra cu130 --extra cluster
+   source local/env.sh && uv sync --frozen --extra cu130 --extra cluster --extra dev
    ```
+   Measured on this box: 217 packages in 1m34s, uv cache on
+   `/node-local-cache/cache/uv`. `.venv` (Python 3.12.3) then has torch
+   2.11.0+cu130, vllm 0.26.0, transformers 5.14.1, trl 1.9.2, peft 0.20.0.
    `cluster` (vllm 0.26.0, a CUDA 13 build) pairs with `cu130` only --
    pyproject.toml's conflict markers refuse `cluster` with `cpu` or `cu128`.
-   This needs an NVIDIA driver of 580 or newer; nobody has checked the
-   cluster driver, and this uv bootstrap itself has never run on a GPU box.
    The launchers activate `${PROJECT}/.venv` (override with `CONPO_VENV`).
 
-1. **Stage the HF cache** (once, from a node with network access,
-   `HF_HUB_OFFLINE` unset):
+1. **Stage the HF cache and model weights** (once, `HF_HUB_OFFLINE` unset):
    ```bash
-   source "${CONPO_VENV:-${PROJECT}/.venv}/bin/activate"
-   python scripts/fetch_data.py
+   source local/env.sh && .venv/bin/python scripts/fetch_data.py
    ```
-   Caches `config.POOL_DATASET`, `config.IFEVAL_DATASET`, the
-   `config.POLICY_MODEL` tokenizer, and nltk punkt/punkt_tab. Every later
-   step runs with `HF_HUB_OFFLINE=1` against this cache.
+   Caches `config.POOL_DATASET`, `config.IFEVAL_DATASET`, nltk
+   punkt/punkt_tab, and now also `snapshot_download`s the
+   `config.POLICY_MODEL` and `config.JUDGE_MODEL` weights into
+   `local/env.sh`'s shared hub (`/node-local-cache/huggingface-home/hub`).
+   Every launcher below runs with `HF_HUB_OFFLINE=1` against this cache.
 
 2. **Build the training corpus** (CPU only):
    ```bash
-   python scripts/build_corpus.py
+   .venv/bin/python scripts/build_corpus.py
    ```
    Writes `data/{train,dev,eval_i,eval_ii,eval_iii}.jsonl` and
    `data/manifest.json`.
@@ -135,100 +135,97 @@ unverified on the cluster.
    placement is the batched veto (USER DECISIONS 2026-09-02): no judge
    server needed, so this is the whole sequence for a normal run:
    ```bash
-   RUN_ARM=full RUN_SEED=42 \
-     sbatch --export=ALL,RUN_ARM,RUN_SEED slurm/train.sbatch
+   RUN_ARM=full RUN_SEED=42 GPU=0 bash local/train.sh
    ```
    `scripts/train.py`'s `build_judge` loads/unloads a `VLLMBatchedJudge`/
    `HFBatchedJudge` on the same card, in bursts, every `RUN_VETO_PERIOD`
    optimiser steps (`ConPOTrainer.flush_pending_veto`); writes to
    `runs/full_s42/`. Add ablation overrides the same way, e.g.
-   `RUN_ARM=full RUN_NO_VETO=1 sbatch --export=ALL,RUN_ARM,RUN_NO_VETO slurm/train.sbatch`.
+   `RUN_ARM=full RUN_NO_VETO=1 GPU=0 bash local/train.sh`.
 
    **`RUN_JUDGE_MODE=http` fallback** (a resident judge server on the second
    H100, serialising every training run against it -- for comparison or
    debugging the batched path):
    ```bash
-   sbatch slurm/judge_server.sbatch
+   GPU=1 bash local/judge_server.sh
    ```
-   Wait for `runs/serve/judge.endpoint` to appear (the job also polls its
-   own `/health` before writing it), then
-   `RUN_ARM=full RUN_SEED=42 RUN_JUDGE_MODE=http sbatch --export=ALL,RUN_ARM,RUN_SEED,RUN_JUDGE_MODE slurm/train.sbatch`
-   (`slurm/train.sbatch` waits for the judge endpoint only in this mode).
+   Wait for `runs/serve/judge.endpoint` to appear (the launcher also polls
+   its own `/health` before writing it), then
+   `RUN_ARM=full RUN_SEED=42 RUN_JUDGE_MODE=http GPU=0 bash local/train.sh`
+   (`local/train.sh` waits for the judge endpoint only in this mode).
 
 4. **DPO baseline launch** (one H100, `vf_dpo` | `edge_dpo`, USER DECISIONS
-   2026-09-02(c)): `slurm/train_dpo.sbatch` builds `RUN_PAIRS` with
+   2026-09-02(c)): `local/train_dpo.sh` builds `RUN_PAIRS` with
    `scripts/build_pairs.py` first (skipped when a pairs file already
    exists), then trains with `scripts/train_dpo.py`.
    ```bash
-   RUN_ARM=vf_dpo RUN_SEED=42 \
-     sbatch --export=ALL,RUN_ARM,RUN_SEED slurm/train_dpo.sbatch
+   RUN_ARM=vf_dpo RUN_SEED=42 GPU=0 bash local/train_dpo.sh
    RUN_ARM=edge_dpo RUN_SEED=42 RUN_EDGES=runs/full_s42/edges.jsonl \
-     sbatch --export=ALL,RUN_ARM,RUN_SEED,RUN_EDGES slurm/train_dpo.sbatch
+     GPU=0 bash local/train_dpo.sh
    ```
    `edge_dpo` needs a finished `full` run's `edges.jsonl` (default
    `runs/full_s${RUN_SEED}/edges.jsonl`) and fails loud when it is missing.
 
-5. **Full fine-tune point-check** (two H100s, `slurm/train_fullft.sbatch`):
+5. **Full fine-tune point-check** (two H100s, `local/train_fullft.sh`):
    `RUN_FULL_FT=1` (`scripts/train.py`, `peft_config=None`) under an
-   `accelerate launch --config_file slurm/accelerate_fullft.yaml
-   --num_processes 2` ZeRO-2 launch, sharding the full optimizer state
-   across both cards. `RUN_OUT_DIR` is explicit (a plain
+   `accelerate launch --config_file local/accelerate_fullft.yaml
+   --num_processes 2` FSDP launch, sharding the full optimizer state across
+   both cards (torch-native, not DeepSpeed ZeRO-2: `deepspeed` is not in
+   `uv.lock`). `RUN_OUT_DIR` is explicit (a plain
    `runs/${RUN_ARM}_s${RUN_SEED}` default would collide with the LoRA
    `full_s42` run):
    ```bash
-   sbatch --export=ALL,RUN_ARM,RUN_SEED,RUN_FULL_FT,RUN_OUT_DIR \
-     slurm/train_fullft.sbatch
+   RUN_ARM=full RUN_SEED=42 RUN_FULL_FT=1 RUN_OUT_DIR=runs/full_fullft_s42 \
+     bash local/train_fullft.sh
    ```
-   (`RUN_ARM=full RUN_SEED=42 RUN_FULL_FT=1 RUN_OUT_DIR=runs/full_fullft_s42`
-   -- the `full_fullft_s42` card's own launch line.) See "What is untested"
-   for the two open questions this script has never run against.
+   See "What is untested" for the open questions this script has never run
+   against.
 
 6. **Model-axis replications** (one H100, `RUN_ARM=full` only, `RUN_MODEL`
    overriding `config.POLICY_MODEL`):
    ```bash
    RUN_ARM=full RUN_SEED=42 RUN_MODEL=Qwen/Qwen3-8B RUN_OUT_DIR=runs/full_qwen3_8b_s42 \
-     sbatch --export=ALL,RUN_ARM,RUN_SEED,RUN_MODEL,RUN_OUT_DIR slurm/train.sbatch
+     GPU=0 bash local/train.sh
    RUN_ARM=full RUN_SEED=42 RUN_MODEL=allenai/Olmo-3-7B-Instruct-SFT RUN_OUT_DIR=runs/full_olmo3_7b_sft_s42 \
-     sbatch --export=ALL,RUN_ARM,RUN_SEED,RUN_MODEL,RUN_OUT_DIR slurm/train.sbatch
+     GPU=0 bash local/train.sh
    ```
 
 7. **Evaluate a finished run**:
    ```bash
-   sbatch slurm/eval.sbatch runs/full_s42/adapter
+   GPU=0 bash local/eval.sh runs/full_s42/adapter
    ```
    Omit the adapter argument to evaluate the base model.
 
-   **Evaluate every run in one sweep** (`slurm/eval_sweep.sh`, plain bash,
-   not an sbatch script -- run it from a login/head node):
+   **Evaluate every run in one sweep** (`local/eval_sweep.sh`, plain bash,
+   sequential -- each launcher owns whichever GPU it is given until it
+   exits, since this devbox has no queue to serialise them):
    ```bash
-   bash slurm/eval_sweep.sh                     # eval.sbatch: base + every runs/*/adapter
-   RETENTION=1 bash slurm/eval_sweep.sh          # + retention.sbatch (GSM8K/MMLU/BBH, USER DECISIONS)
-   DRY_RUN=1 bash slurm/eval_sweep.sh            # print the sbatch lines instead of submitting
+   bash local/eval_sweep.sh                      # eval.sh: base + every runs/*/adapter
+   RETENTION=1 bash local/eval_sweep.sh           # + retention.sh (GSM8K/MMLU/BBH, USER DECISIONS)
+   DRY_RUN=1 bash local/eval_sweep.sh             # print the launch lines instead of running
    ```
-   `RETENTION=1` submits `slurm/retention.sbatch` for the base model and for
-   the run ids in `RETENTION_RUNS` (default `full_s42 full_s43 full_s44
-   ifrlvr_s42 ifrlvr_s43 ifrlvr_s44`), e.g. `sbatch slurm/retention.sbatch
-   runs/full_s42/adapter`. `slurm/retention.sbatch` itself is being written
-   by another builder in parallel -- this is its assumed CLI shape, mirroring
-   `slurm/eval.sbatch`'s own "positional adapter dir, omit for base model".
+   `RETENTION=1` runs `local/retention.sh` for the base model and for the
+   run ids in `RETENTION_RUNS` (default `full_s42 full_s43 full_s44
+   ifrlvr_s42 ifrlvr_s43 ifrlvr_s44`), e.g. `bash local/retention.sh
+   runs/full_s42/adapter`. `local/retention.sh` mirrors `local/eval.sh`'s
+   own "positional adapter dir, omit for base model".
 
 ## What is untested
 
 No GPU exists on this development machine and `vllm` is not installed here.
 Of the uv extras, only `cpu` has been synced and verified (`uv sync --extra
-cpu --extra dev`, matching the conda env `conpo`); `cu128` (RTX 5060 smoke),
-`cu130`, and `cluster` have never been synced on a GPU box, and the uv
-cluster bootstrap itself (`uv sync --frozen --extra cu130 --extra cluster`)
-has never run. So every GPU-dependent path below has never run, even though
-the surrounding Python modules now exist and are CPU-tested:
+cpu --extra dev`); `cu128` (RTX 5060 smoke), `cu130`, and `cluster` have
+never been synced on a GPU box. So every GPU-dependent path below has never
+run, even though the surrounding Python modules now exist and are
+CPU-tested:
 
-- `slurm/judge_server.sbatch` -- never submitted; the vLLM OpenAI-server
+- `local/judge_server.sh` -- never submitted; the vLLM OpenAI-server
   invocation, the `--gres=gpu:h100:1` line, and the health-poll
   timing are unverified.
-- `slurm/train.sbatch` -- never submitted; the `RUN_JUDGE_MODE=http`
+- `local/train.sh` -- never submitted; the `RUN_JUDGE_MODE=http`
   judge-endpoint wait loop, the `RUN_OUT_DIR` layout, and the two-GPU
   full-FT comment variant are unverified.
-- `slurm/eval.sbatch` -- never submitted; the `--out` file paths it builds
+- `local/eval.sh` -- never submitted; the `--out` file paths it builds
   are checked against `scripts/eval_external.py`/`scripts/eval_internal.py`'s
   real `argparse` contract, but only their `--score-only` path (no
   generation) is exercised by `tests/test_eval_scripts.py` -- real
@@ -267,10 +264,10 @@ the surrounding Python modules now exist and are CPU-tested:
   The ablation overrides are unit-tested at the mechanism level (e.g. the
   `selection` modes in `tests/test_reverse.py`), not end to end through
   `ConPOTrainer`.
-- `slurm/train_dpo.sbatch` -- never submitted; the `build_pairs.py --engine
+- `local/train_dpo.sh` -- never submitted; the `build_pairs.py --engine
   vllm` step and `train_dpo.py`'s real-model path are unverified, same
-  caveats as `slurm/train.sbatch`'s own header.
-- `slurm/train_fullft.sbatch` / `slurm/accelerate_fullft.yaml` -- never
+  caveats as `local/train.sh`'s own header.
+- `local/train_fullft.sh` / `local/accelerate_fullft.yaml` -- never
   submitted; the ZeRO-2 ("no offload") config is a guess at fitting full
   fp32 AdamW state across two H100s, and TRL's `vllm_mode="colocate"`
   generation under a two-process accelerate/deepspeed launch has never been
@@ -279,8 +276,8 @@ the surrounding Python modules now exist and are CPU-tested:
   `self.ref_model` when there is no adapter to disable, see
   `tests/test_train_knobs.py`'s full-FT test) -- only the two-process launch
   above remains unverified.
-- `slurm/eval_sweep.sh` -- `bash -n` and one `DRY_RUN=1` run are checked on
+- `local/eval_sweep.sh` -- `bash -n` and one `DRY_RUN=1` run are checked on
   this machine (no `runs/` directories to iterate); submitting it to Slurm
-  itself is untested. Its assumption about `slurm/retention.sbatch`'s CLI
+  itself is untested. Its assumption about `local/retention.sh`'s CLI
   (positional adapter dir, omit for base model) was confirmed by reading the
-  landed `slurm/retention.sbatch`, written by another builder.
+  landed `local/retention.sh`, written by another builder.

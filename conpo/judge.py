@@ -97,7 +97,7 @@ def resolve_endpoint(path_or_url: str | Path) -> str:
 
     RUN_JUDGE_ENDPOINT, when set, is used verbatim as the base URL.
     Otherwise `path_or_url` is read as an endpoint file in the read_endpoint
-    format, written by the judge server's SLURM job.
+    format, written by local/judge_server.sh.
     """
     url = config.env("RUN_JUDGE_ENDPOINT", "")
     if url:

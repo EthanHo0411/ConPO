@@ -2,7 +2,7 @@
 
 RUN_FULL_FT=1 (design choice, builder, 2026-09-04, read via config.env
 inside main()): trains every weight instead of a LoRA adapter (peft_config=
-None), for the full-FT point-check (slurm/train_fullft.sbatch). Default "0"
+None), for the full-FT point-check (local/train_fullft.sh). Default "0"
 (LoRA, every other run). Recorded as run_metadata.json's "full_ft" field.
 """
 

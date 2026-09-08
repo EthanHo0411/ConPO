@@ -2,7 +2,7 @@
 (google/IFEval) and IFBench_test prompt texts.
 
 Usage:
-    conda run -n conpo --no-capture-output python scripts/check_overlap.py \
+    .venv/bin/python scripts/check_overlap.py \
         [--subset subsets/<keys>] [--rows data/train.jsonl] [--limit N] \
         [--n 13] [--out overlap_report.json]
 

@@ -701,7 +701,7 @@ def average_verdicts(cards: list[dict[str, str]], metric: str) -> dict[Any, floa
 # live only in mechanism.jsonl, which is not part of the card contract, so
 # these read it straight from the training run directory the run_id/
 # RUN_OUT_DIR convention implies (runs/<run_id>, mirroring
-# scripts/run_card.py's launch_line and slurm/train.sbatch's RUN_OUT_DIR
+# scripts/run_card.py's launch_line and local/train.sh's RUN_OUT_DIR
 # default) -- design choice, builder, 2026-09-04.
 
 

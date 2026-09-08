@@ -22,7 +22,7 @@ in `conpo/arms.py` (`ArmSpec`, `Overrides`, `resolve_arm`) and
 | reverse_only | `RUN_ARM=reverse_only` | 42 | `full` with forward construction off: reverse corruption edges + `L_clean` only |
 | RUN_SELECTION=uniform | `RUN_ARM=full RUN_SELECTION=uniform` | 42 | Active-selection ablation: `mu(c\|x)` replaced by uniform sampling over `C(x)` |
 | RUN_SELECTION=half | `RUN_ARM=full RUN_SELECTION=half` | 42 | Active-selection ablation: `mu(c\|x)` replaced by 50%-success-rate sampling |
-| RUN_NO_VETO | `RUN_ARM=full RUN_NO_VETO=1` | 42 | Quality veto off: `scripts/train.py:build_judge` returns `StaticJudge(keep=True)` instead of the batched judge. The batched veto is the default judge placement (USER DECISIONS 2026-09-02): every other arm builds a `VLLMBatchedJudge`/`HFBatchedJudge` (`RUN_JUDGE_MODE=batched`, the default) that loads/unloads on the same card in periodic bursts (`ConPOTrainer.flush_pending_veto`), needing no judge server; `RUN_JUDGE_MODE=http` is a separate fallback placement against `slurm/judge_server.sbatch`, which `slurm/train.sbatch` waits for only in that mode |
+| RUN_NO_VETO | `RUN_ARM=full RUN_NO_VETO=1` | 42 | Quality veto off: `scripts/train.py:build_judge` returns `StaticJudge(keep=True)` instead of the batched judge. The batched veto is the default judge placement (USER DECISIONS 2026-09-02): every other arm builds a `VLLMBatchedJudge`/`HFBatchedJudge` (`RUN_JUDGE_MODE=batched`, the default) that loads/unloads on the same card in periodic bursts (`ConPOTrainer.flush_pending_veto`), needing no judge server; `RUN_JUDGE_MODE=http` is a separate fallback placement against `local/judge_server.sh`, which `local/train.sh` waits for only in that mode |
 | RUN_NO_EXACTNESS | `RUN_ARM=full RUN_NO_EXACTNESS=1` | 42 | Corruption exactness admission off: reverse edges no longer required to satisfy `V(x, y_A^-) = A` exactly |
 | RUN_NO_DISTANCE | `RUN_ARM=full RUN_NO_DISTANCE=1` | 42 | Distance bound `delta` off on both directions: minimality (`d_Y <= delta`) no longer gates admission |
 | RUN_LAMBDA_P=0 | `RUN_ARM=full RUN_LAMBDA_P=0` | 42 | Prompt counterfactuals off: the `L_prompt` term is zeroed |
@@ -30,8 +30,8 @@ in `conpo/arms.py` (`ArmSpec`, `Overrides`, `resolve_arm`) and
 
 `RUN_SELECTION`, `RUN_NO_VETO`, `RUN_NO_EXACTNESS`, `RUN_NO_DISTANCE`,
 `RUN_LAMBDA_P` and `RUN_MULTI` are overrides on top of `RUN_ARM=full`, not
-separate arm names; `slurm/train.sbatch` passes them through unmodified via
-`--export=ALL,<name>` (see README.md's cluster launch sequence).
+separate arm names; `local/train.sh` passes them through unmodified from the
+calling shell's environment (see README.md's devbox launch sequence).
 
 ## Hypotheses
 
