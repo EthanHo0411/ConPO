@@ -1,72 +1,48 @@
 #!/bin/bash
-# UNTESTED: written on a machine with no GPU and no vllm install (dev conda
-# env "conpo" is torch CPU only). This script has never been submitted or
-# run. Verify the gres line, the uv venv path, and the health-poll timing
-# on the mlp cluster before trusting it.
+# Local devbox, 2x H100 80 GB, no job scheduler: GPU=<idx> picks the card via
+# CUDA_VISIBLE_DEVICES (default 1, so the trainer's default GPU 0 stays
+# free). This script has never been run.
 #
 # Serves config.JUDGE_MODEL (Qwen/Qwen3-14B) as a long-lived OpenAI-compatible
-# vLLM server on the second H100, for conpo/judge.py's HttpJudge (the
-# quality veto of ConPO.pdf section 2.3). RUN_JUDGE_MODE=http fallback
-# placement only (USER DECISIONS 2026-09-02): the default RUN_JUDGE_MODE=
-# batched needs no server -- scripts/train.py's build_judge scores pending
-# pairs in periodic bursts with a colocated VLLMBatchedJudge/HFBatchedJudge
-# instead (ConPOTrainer.flush_pending_veto). Run this only when explicitly
-# opting into RUN_JUDGE_MODE=http (slurm/train.sbatch); while it holds a
-# card in that mode, every training run serializes on the other one.
-# Measured footprint for this judge: 27.5 GB (config.py "Compute notes").
+# vLLM server, for conpo/judge.py's HttpJudge (the quality veto of ConPO.pdf
+# section 2.3). RUN_JUDGE_MODE=http fallback placement only (USER DECISIONS
+# 2026-09-02): the default RUN_JUDGE_MODE=batched needs no server --
+# scripts/train.py's build_judge scores pending pairs in periodic bursts
+# with a colocated VLLMBatchedJudge/HFBatchedJudge instead
+# (ConPOTrainer.flush_pending_veto). Run this only when explicitly opting
+# into RUN_JUDGE_MODE=http (local/train.sh); while it holds a card in that
+# mode, every training run serializes on the other one. Measured footprint
+# for this judge: 27.5 GB (config.py "Compute notes").
 #
-# Endpoint-file handshake, ported from the pattern in
-# stackelberg-if/slurm/corruptor_server.sbatch: this job writes
+# Endpoint-file handshake, ported from the corruptor-server pattern in the
+# stackelberg-if repo: this process writes
 # "hostname port jobid" to the endpoint file once /health answers, and stays
-# alive until TTL or cancellation. slurm/train.sbatch polls that file and
-# builds RUN_JUDGE_ENDPOINT = http://<hostname>:<port> from it --
+# alive until TTL or it is killed. local/train.sh polls that file and builds
+# RUN_JUDGE_ENDPOINT = http://<hostname>:<port> from it --
 # conpo/judge.py:read_endpoint requires exactly that three-field format and
 # fails closed on a malformed read.
 #
-#   sbatch slurm/judge_server.sbatch
+#   GPU=1 bash local/judge_server.sh
 #
 # Env:
-#   JS_PORT       port              (default derived from the job id)
+#   GPU           GPU index for CUDA_VISIBLE_DEVICES (default 1)
+#   JS_PORT       port              (default 8000)
 #   JS_TTL        seconds to serve  (default 14400)
 #   JS_POLLS      health polls at 10s each before giving up (default 360)
 #   JS_ENDPOINT   endpoint file     (default runs/serve/judge.endpoint)
-#
-#SBATCH --job-name=judge_server
-#SBATCH --gres=gpu:h100:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=96G
-#SBATCH --time=04:00:00
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.out
 
 set -euo pipefail
-
-PROJECT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "${PROJECT}"
-mkdir -p logs
-
-echo "node=$(hostname) date=$(date -Is) job=${SLURM_JOB_ID}"
-nvidia-smi -L || echo "nvidia-smi -L failed"
-
-# ponytail (2026-09-06): switching from conda to a uv venv is the user's
-# decision; CONPO_VENV/.venv naming is this session's choice.
-source "${CONPO_VENV:-${PROJECT}/.venv}/bin/activate"
-echo "env=${VIRTUAL_ENV:-none} python=$(python -V 2>&1)"
+source "$(dirname "$(readlink -f "$0")")/env.sh"
+NAME=judge_server
+export CUDA_VISIBLE_DEVICES="${GPU:-1}"
+conpo_launch_setup
 
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
-export TOKENIZERS_PARALLELISM=false
-# no_proxy landmine (README.md): node-to-node HTTP must bypass the site
-# proxy, or /health and chat calls get a 503 from a proxy that cannot
-# connect back to a compute node.
-export no_proxy="localhost,127.0.0.1,::1,$(hostname),$(hostname -f)"
-export NO_PROXY="${no_proxy}"
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # config.JUDGE_MODEL, read by name rather than retyped. Assumes conpo is
 # installed editable in the uv venv by `uv sync` (pyproject.toml).
 MODEL="$(python -c 'from conpo import config; print(config.JUDGE_MODEL)')"
-PORT="${JS_PORT:-$(( 20000 + SLURM_JOB_ID % 20000 ))}"
+PORT="${JS_PORT:-8000}"
 TTL="${JS_TTL:-14400}"
 SERVE_DIR="${PROJECT}/runs/serve"
 ENDPOINT="${JS_ENDPOINT:-${SERVE_DIR}/judge.endpoint}"
@@ -118,7 +94,7 @@ for i in $(seq 1 "${JS_POLLS}"); do
         echo "server process exited during startup, see the log above"
         exit 1
     fi
-    if curl -sf --noproxy '*' "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+    if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
         READY=1
         echo "engine ready after ~$(( i * 10 ))s"
         break
@@ -130,12 +106,12 @@ if [ "${READY}" -ne 1 ]; then
     exit 1
 fi
 
-printf '%s %s %s\n' "$(hostname)" "${PORT}" "${SLURM_JOB_ID}" > "${ENDPOINT}"
+printf '%s %s %s\n' "$(hostname)" "${PORT}" "${JOB_ID}" > "${ENDPOINT}"
 echo "advertised: $(cat "${ENDPOINT}")"
-curl -s --noproxy '*' "http://127.0.0.1:${PORT}/v1/models" | head -c 400 || true
+curl -s "http://127.0.0.1:${PORT}/v1/models" | head -c 400 || true
 echo
 
-echo "serving until TTL ${TTL}s elapses or the job is cancelled"
+echo "serving until TTL ${TTL}s elapses or the process is killed"
 END=$(( $(date +%s) + TTL ))
 while [ "$(date +%s)" -lt "${END}" ]; do
     if ! kill -0 "${SRV_PID}" 2>/dev/null; then

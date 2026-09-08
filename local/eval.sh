@@ -1,61 +1,41 @@
 #!/bin/bash
-# UNTESTED: written on a machine with no GPU and no vllm install (dev conda
-# env "conpo" is torch CPU only). This script has never been submitted or
-# run. scripts/eval_external.py and scripts/eval_internal.py exist and have
-# a "hf" backend exercised by tests/test_eval_scripts.py; their "vllm"
-# backend (each script's _generate_vllm, lazily imported) has never run
-# anywhere. Verify the gres line, the uv venv path, and this launcher's
-# --out paths on the mlp cluster before trusting it.
+# Local devbox, 2x H100 80 GB, no job scheduler: GPU=<idx> picks the card via
+# CUDA_VISIBLE_DEVICES (default 0). This script has never been run:
+# scripts/eval_external.py and scripts/eval_internal.py exist and have a
+# "hf" backend exercised by tests/test_eval_scripts.py; their "vllm" backend
+# (each script's _generate_vllm, lazily imported) has never run anywhere.
 #
-# Runs both eval scripts against one adapter directory, vLLM backend, on one
-# H100 (whichever card is free): scripts/eval_external.py (IFEval + IFBench,
+# Runs both eval scripts against one adapter directory, vLLM backend, on
+# whichever GPU is selected: scripts/eval_external.py (IFEval + IFBench,
 # vendored official scorers) and scripts/eval_internal.py (PAcc/IAcc over the
 # four internal splits, conpo/metrics.py). No judge server is needed;
 # neither script calls HttpJudge (conpo/metrics.py's task_relevance hook is
 # left None here).
 #
-#   sbatch slurm/eval.sbatch                                # base model
-#   sbatch slurm/eval.sbatch runs/full_s42/adapter           # one adapter
-#   sbatch --export=ALL,EVAL_BACKEND=hf slurm/eval.sbatch runs/full_s42/adapter
+#   bash local/eval.sh                                # base model
+#   bash local/eval.sh runs/full_s42/adapter           # one adapter
+#   EVAL_BACKEND=hf bash local/eval.sh runs/full_s42/adapter
 #
 # Env:
+#   GPU           GPU index for CUDA_VISIBLE_DEVICES (default 0)
 #   EVAL_BACKEND  "vllm" (default here) or "hf"
 #   EVAL_OUT_DIR  results directory (default runs/eval_<adapter-or-base>_<jobid>)
 #   EVAL_LIMIT    cap rows per dataset/split, for a smoke run (unset = full)
-#
-#SBATCH --job-name=conpo_eval
-#SBATCH --gres=gpu:h100:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=64G
-#SBATCH --time=04:00:00
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.out
 
 set -euo pipefail
-
-PROJECT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "${PROJECT}"
-mkdir -p logs
-
-echo "node=$(hostname) date=$(date -Is) job=${SLURM_JOB_ID}"
-nvidia-smi -L || echo "nvidia-smi -L failed"
-
-# ponytail (2026-09-06): switching from conda to a uv venv is the user's
-# decision; CONPO_VENV/.venv naming is this session's choice.
-source "${CONPO_VENV:-${PROJECT}/.venv}/bin/activate"
-echo "env=${VIRTUAL_ENV:-none} python=$(python -V 2>&1)"
+source "$(dirname "$(readlink -f "$0")")/env.sh"
+NAME=conpo_eval
+export CUDA_VISIBLE_DEVICES="${GPU:-0}"
+conpo_launch_setup
 
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export TOKENIZERS_PARALLELISM=false
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ADAPTER_DIR="${1:-}"
 BACKEND="${EVAL_BACKEND:-vllm}"
 ADAPTER_NAME="$(basename "${ADAPTER_DIR:-base}")"
-OUT_DIR="${EVAL_OUT_DIR:-${PROJECT}/runs/eval_${ADAPTER_NAME}_${SLURM_JOB_ID}}"
+OUT_DIR="${EVAL_OUT_DIR:-${PROJECT}/runs/eval_${ADAPTER_NAME}_${JOB_ID}}"
 mkdir -p "${OUT_DIR}"
 
 echo "adapter=${ADAPTER_DIR:-<base model>} backend=${BACKEND} out=${OUT_DIR}"

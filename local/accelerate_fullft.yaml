@@ -1,0 +1,18 @@
+# deepspeed is not in uv.lock (plan decision D5); torch-native FSDP shards
+# gradients and optimizer state across both cards instead. UNTESTED: never
+# launched.
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+fsdp_config:
+  fsdp_version: 2
+  fsdp_reshard_after_forward: false
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_offload_params: false
+mixed_precision: bf16
+num_machines: 1
+num_processes: 2
+main_training_function: main
+rdzv_backend: static
+same_network: true
+use_cpu: false

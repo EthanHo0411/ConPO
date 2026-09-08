@@ -1,13 +1,12 @@
 #!/bin/bash
-# UNTESTED: written on a machine with no GPU and no vllm install (dev conda
-# env "conpo" is torch CPU only). This script has never been submitted or
-# run. scripts/build_pairs.py and scripts/train_dpo.py exist and their
-# RUN_ARM/RUN_SEED/RUN_STEPS/RUN_OUT_DIR/RUN_PAIRS reads are read directly
-# from scripts/train_dpo.py (see its docstring), but the real-model,
-# real-GPU path (as opposed to train_dpo.py's --tiny CPU smoke path) has
-# never run, and neither has build_pairs.py's --engine vllm path
-# (_VLLMStandaloneEngine, lazily imported). Verify the gres line and the
-# uv venv path on the mlp cluster before trusting it.
+# Local devbox, 2x H100 80 GB, no job scheduler: GPU=<idx> picks the card via
+# CUDA_VISIBLE_DEVICES (default 0). This script has never been run:
+# scripts/build_pairs.py and scripts/train_dpo.py exist and their RUN_ARM/
+# RUN_SEED/RUN_STEPS/RUN_OUT_DIR/RUN_PAIRS reads are read directly from
+# scripts/train_dpo.py (see its docstring), but the real-model, real-GPU
+# path (as opposed to train_dpo.py's --tiny CPU smoke path) has never run,
+# and neither has build_pairs.py's --engine vllm path
+# (_VLLMStandaloneEngine, lazily imported).
 #
 # Trains one DPO baseline on one H100 80 GB GPU (vf_dpo | edge_dpo, USER
 # DECISIONS 2026-09-02(c)): step 1 builds RUN_PAIRS with
@@ -16,10 +15,9 @@
 # configuration from the RUN_* environment contract (README.md's "The RUN_*
 # contract"); nothing here reads conpo/config.py directly.
 #
-#   RUN_ARM=vf_dpo RUN_SEED=42 \
-#     sbatch --export=ALL,RUN_ARM,RUN_SEED slurm/train_dpo.sbatch
+#   RUN_ARM=vf_dpo RUN_SEED=42 bash local/train_dpo.sh
 #   RUN_ARM=edge_dpo RUN_SEED=42 RUN_EDGES=runs/full_s42/edges.jsonl \
-#     sbatch --export=ALL,RUN_ARM,RUN_SEED,RUN_EDGES slurm/train_dpo.sbatch
+#     bash local/train_dpo.sh
 #
 # scripts/run_card.py's status logic (derive_status, via load_metadata)
 # reads RUN_OUT_DIR/metadata.json -- scripts/train_dpo.py's own artefact
@@ -28,10 +26,11 @@
 # "planned" until this script's step 2 has written that file.
 #
 # Env:
+#   GPU         GPU index for CUDA_VISIBLE_DEVICES (default 0)
 #   RUN_ARM     "vf_dpo" or "edge_dpo", required
 #   RUN_SEED    default 42
 #   RUN_STEPS   optimiser-step budget, default 500 (design choice, builder,
-#               2026-09-04, matching slurm/train.sbatch's default)
+#               2026-09-04, matching local/train.sh's default)
 #   RUN_OUT_DIR default runs/${RUN_ARM}_s${RUN_SEED}
 #   RUN_PAIRS   default ${RUN_OUT_DIR}/pairs.jsonl; step 1 skips building
 #               when a non-empty file already exists there
@@ -40,39 +39,20 @@
 #   RUN_EDGES   edge_dpo only, an existing edges.jsonl from a finished full
 #               run, default runs/full_s${RUN_SEED}/edges.jsonl -- step 1
 #               fails loud when this does not exist
-#
-#SBATCH --job-name=conpo_train_dpo
-#SBATCH --gres=gpu:h100:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=96G
-#SBATCH --time=08:00:00
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.out
 
 set -euo pipefail
-
-PROJECT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "${PROJECT}"
-mkdir -p logs
-
-echo "node=$(hostname) date=$(date -Is) job=${SLURM_JOB_ID}"
-nvidia-smi -L || echo "nvidia-smi -L failed"
-
-# ponytail (2026-09-06): switching from conda to a uv venv is the user's
-# decision; CONPO_VENV/.venv naming is this session's choice.
-source "${CONPO_VENV:-${PROJECT}/.venv}/bin/activate"
-echo "env=${VIRTUAL_ENV:-none} python=$(python -V 2>&1)"
+source "$(dirname "$(readlink -f "$0")")/env.sh"
+NAME=conpo_train_dpo
+export CUDA_VISIBLE_DEVICES="${GPU:-0}"
+conpo_launch_setup
 
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export TOKENIZERS_PARALLELISM=false
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # RUN_* contract (README.md). Every value below is overridable from the
-# submitting shell via --export=ALL,<name>; defaults apply only when the
-# caller left the variable unset.
+# calling shell; defaults apply only when the caller left the variable
+# unset.
 export RUN_ARM="${RUN_ARM:?RUN_ARM is required (vf_dpo or edge_dpo)}"
 case "${RUN_ARM}" in
     vf_dpo|edge_dpo) ;;
@@ -90,8 +70,8 @@ mkdir -p "${RUN_OUT_DIR}"
 
 echo "arm=${RUN_ARM} seed=${RUN_SEED} steps=${RUN_STEPS} pairs=${RUN_PAIRS} out=${RUN_OUT_DIR}"
 
-# Step 1: build RUN_PAIRS when it does not already exist (a resubmit after a
-# preempted training step should not rebuild pairs it already has).
+# Step 1: build RUN_PAIRS when it does not already exist (a rerun after an
+# interrupted training step should not rebuild pairs it already has).
 if [ -s "${RUN_PAIRS}" ]; then
     echo "pairs already exist at ${RUN_PAIRS}, skipping build_pairs.py"
 elif [ "${RUN_ARM}" = "edge_dpo" ]; then
