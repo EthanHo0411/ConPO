@@ -1,8 +1,11 @@
 #!/bin/bash
-# Shared environment for every launcher in local/. Source it; never run it.
+# Shared environment for every launcher in local/, and for a shell that wants
+# the same uv/HF cache placement (`source local/env.sh` before `uv sync` or
+# `python scripts/fetch_data.py`). Exports only; the launcher prologue that
+# redirects output lives in local/lib.sh.
 #
 # Devbox facts (see /home/dev/project/ethan/SERVER.md): one node, 2x H100 80 GB,
-# no SLURM, 128 GB RAM cgroup cap. /home/dev is NFS (persists, 94% full).
+# no job scheduler, 128 GB RAM cgroup cap. /home/dev is NFS (persists, 94% full).
 # /node-local-cache is node-local ZFS (fast, 6.8 TB free, NOT synced between
 # nodes: anything under it must be re-creatable).
 #
@@ -36,19 +39,6 @@ export TOKENIZERS_PARALLELISM=false
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Stands in for SLURM_JOB_ID in log and output names.
+# Stands in for the scheduler's job id in log and output names.
 JOB_ID="${JOB_ID:-$(date +%Y%m%d_%H%M%S)_$$}"
 export JOB_ID
-
-# Every launcher calls this after setting NAME; it activates the venv and tees
-# stdout+stderr into logs/<NAME>_<JOB_ID>.out (what SLURM's --output did).
-conpo_launch_setup() {
-    cd "${PROJECT}"
-    mkdir -p "${PROJECT}/logs"
-    exec > >(tee -a "${PROJECT}/logs/${NAME}_${JOB_ID}.out") 2>&1
-    echo "node=$(hostname) date=$(date -Is) job=${JOB_ID} gpus=${CUDA_VISIBLE_DEVICES:-all}"
-    nvidia-smi -L || echo "nvidia-smi -L failed"
-    # shellcheck disable=SC1091
-    source "${CONPO_VENV:-${PROJECT}/.venv}/bin/activate"
-    echo "env=${VIRTUAL_ENV:-none} python=$(python -V 2>&1)"
-}

@@ -61,6 +61,7 @@
 
 set -euo pipefail
 source "$(dirname "$(readlink -f "$0")")/env.sh"
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
 NAME=conpo_train
 export CUDA_VISIBLE_DEVICES="${GPU:-0}"
 conpo_launch_setup

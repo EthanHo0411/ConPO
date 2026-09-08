@@ -33,6 +33,7 @@
 
 set -euo pipefail
 source "$(dirname "$(readlink -f "$0")")/env.sh"
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
 NAME=judge_server
 export CUDA_VISIBLE_DEVICES="${GPU:-1}"
 conpo_launch_setup
