@@ -7,3 +7,4 @@ __pycache__/
 .venv/
 nltk_data/
 .serena/
+/logs/

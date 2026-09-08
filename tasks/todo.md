@@ -140,6 +140,11 @@ Prerequisites: Tasks 1-3a done, `data/train.jsonl` exists.
 - [ ] Step 4 eval: `EVAL_LIMIT=8 GPU=0 bash local/eval.sh` (base model, vllm backend). Pass = `### conpo_eval DONE rc_external=0 rc_internal=0`.
 - [ ] Step 5: record durations and peak memory (`nvidia-smi` sampled) in this file; remove the now-verified items from README "What is untested".
 
+Results (2026-09-08):
+- Step 1 HF path: `### conpo_train DONE rc=0`, 2 steps in 16m31s (495 s/step: HF generate runs without KV cache under gradient checkpointing, so this path is smoke-only), 56423 tokens generated, GPU 0 peak about 10.9 GB, `runs/smoke_hf/{adapter,checkpoint-2,run_metadata.json,mechanism.jsonl,family_stats.json,edges.jsonl}` written. Model loaded from the shared hub offline.
+- Step 4 eval, first attempt: vLLM engine core failed: Triton JIT needs `Python.h`, and uv had picked the apt `/usr/bin/python3.12` (3.12.3, no headers). Fix: `.python-version` pinned to `3.12.11` (uv-managed build with headers, installed under `.claude-ethan/uv-python`), venv rebuilt. Side effect found: `uv python install` also wrote a `python3.12` symlink to `/opt/local/bin` (the container's `XDG_BIN_HOME`), outside the boundary; `UV_PYTHON_BIN_DIR` added to `.ethan-env`, symlink held for Ethan.
+- TRL 1.9.2 warns it supports vLLM 0.17.0 to 0.25.1 while uv.lock pins 0.26.0; colocate smoke (step 2) is the test of that pairing.
+
 ### Task 5: Verify, review, record
 
 - [ ] Step 1: fresh-context verifier (templates.md §6) over Tasks 2, 3a, 3b acceptance lines.
