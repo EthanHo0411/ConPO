@@ -14,6 +14,12 @@ conpo_launch_setup() {
     exec > >(tee -a "${CONPO_RUNS_DIR}/logs/${NAME}_${JOB_ID}.out") 2>&1
     echo "node=$(hostname) date=$(date -Is) job=${JOB_ID} gpus=${CUDA_VISIBLE_DEVICES:-all}"
     nvidia-smi -L || echo "nvidia-smi -L failed"
+    # One torch.distributed rendezvous port per card: two colocate runs that
+    # initialise at the same moment both bind the default 29500 and the second
+    # dies with EADDRINUSE (seen 2026-09-11 launching full_s42 next to
+    # ifrlvr_s42). An explicit MASTER_PORT from the caller still wins.
+    export MASTER_PORT="${MASTER_PORT:-$(( 29500 + ${CUDA_VISIBLE_DEVICES%%,*} ))}"
+    echo "master_port=${MASTER_PORT}"
     if [ ! -f "${CONPO_VENV:-${PROJECT}/.venv}/bin/activate" ]; then
         echo "venv missing at ${CONPO_VENV:-${PROJECT}/.venv} (node-local disk wiped?), running uv sync"
         command -v uv >/dev/null 2>&1 || { echo "uv not found on PATH, cannot rebuild the venv"; exit 1; }
