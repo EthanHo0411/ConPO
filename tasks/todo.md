@@ -172,3 +172,36 @@ Round 3 (10:25): spec PASS; quality findings were a stale comment, the undocumen
 ## Session log
 
 - 2026-09-08: plan written; explored repo, caches, GPU, network (all facts above measured this session).
+
+## 2026-09-11 takeover from the handoff: Ethan's decisions and the work plan
+
+Ethan's decisions (2026-09-11, in his words, paraphrased):
+1. Primary model is `Qwen/Qwen3-4B` non-thinking; the Instruct-2507 variant is retired completely.
+2. The ConPO checkout on this devbox is the truth (`handoff/conpo` is a symlink to it).
+3. M0: a 50-step production-shape probe first, then the real `full_s42`.
+4. This session owns the handoff repo; the Windows session does nothing from now on.
+5. Node-local disk is wiped about every 48 hours: immediate outputs and logs go to node-local; Ethan reviews and says when to move them into the repo.
+6. Both GPUs are ours: never wait on jobs, always run evals, baselines or tests on a free card; one card for testing changes while the other runs evals.
+7. HackMD: tokens and scripts move to our own config; this session publishes and updates from now on.
+8. Stage `allenai/Llama-3.1-Tulu-3-8B-SFT` and `allenai/Olmo-3-7B-Instruct-SFT` into the shared hub now.
+9. Full-FT point-check stays, scheduled last.
+10. AlpacaEval 2 and the optional statistics stay on hold.
+Also: audit IFBench's IF-RLVR GRPO pipeline (open source? cloneable?) as the strongest comparator; implement it if it is not.
+
+Running as of 2026-09-11 (outputs under /node-local-cache/cache/conpo-runs):
+- `probe_full_s42`: `RUN_ARM=full RUN_SEED=42 RUN_STEPS=50 GPU=0` at production knobs (M0 numbers).
+- `eval_base_full`: `GPU=1 bash local/eval.sh` on the base model, full IFEval + IFBench + internal splits (the untrained floor).
+- staging of the two ablation models into the shared hub; reference clones of allenai/open-instruct and allenai/IFBench under /home/dev/project/ethan/refs.
+
+Plan (Sonnet 5 xhigh builders, xhigh reviewers, fresh verifier):
+- [ ] A. local/: `CONPO_RUNS_DIR` (node-local) as the default output root for every launcher, logs beside it, venv self-heal after a wipe, `local/harvest.sh` to copy finished runs into `runs/`; fetch_data.py stages the ablation models; README updated.
+- [ ] B. handoff docs: resolve the two flagged inconsistencies, retire 2507 everywhere it is called ConPO's model, fix the stale rows, details note scheduler/environment rows, publish scripts read the token from our config; resume point 2026-09-11.
+- [ ] C. IF-RLVR pipeline audit written to handoff/ifrlvr-pipeline-audit.md.
+- [ ] D. After the probe: record steps/hour, peak memory, tokens/step; launch `full_s42` on GPU 0; keep GPU 1 on evals (retention on base, then eval of every finished adapter).
+- [ ] E. Full-FT point-check last; AlpacaEval 2 held.
+
+### M0 probe results (2026-09-11, production knobs, one H100 each, outputs under /node-local-cache/cache/conpo-runs)
+- `probe_full_s42` (`RUN_ARM=full`, GPU 0): steps 0-2 took 395, 400, 406 s each; 174,624 / 177,704 / 223,521 generated tokens per step (about 440 tokens/s against about 9,000 tokens/s from the standalone vLLM eval engine); 31 GB peak by nvidia-smi; degenerate group rate 0.81-0.88; forward repair at step 0: 388 no_improvement, 32 distance, 7 admitted; 0 edges in the buffer before the first veto burst (K=25). Crashed at step 3: `VLLMValidationError`, a 3,731-token prompt against `MAX_MODEL_LEN` 3584. One 15k pass at this rate would be about 4 days, against the 18 H100-hour pre-M0 estimate.
+- `probe_ifrlvr_s42` (`RUN_ARM=ifrlvr`, GPU 1): 9 steps in 13m50s (about 92 s/step; 59 s at step 1, 108 s/it near the end); 32k-69k tokens per step (mean about 54k); 35 GB peak; degenerate rate 0.44-0.75. Crashed at step 9: a 6,971-token prompt against 3584. One pass would be about 24 h.
+- Both crashes share one cause with the base-model internal eval crash (eval_ii, 40,961 tokens): prompts are never capped before reaching vLLM. The 15k subset holds 154 rows over 2,048 tokens, 116 over 2,560, 50 over 3,584, 17 over 8,192 (max 90,649); eval_i/ii/iii hold 23/31/75 rows over 2,048.
+- Base-model floor (GPU 1): IFEval prompt-loose 0.815 (strict 0.778), IFBench prompt-loose 0.300 (strict 0.263), decoded at a 1,024 cap (protocol says 2,048; re-run pending the eval fix); retention GSM8K 0.915, MMLU 0.678, BBH 0.499 (BBH dyck_languages and web_of_lies 0.0, word_sorting 0.068: scorer format suspected, under investigation).
