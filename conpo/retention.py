@@ -121,77 +121,140 @@ def _normalise_bbh_line(text: str) -> str:
     return text.strip("'\"")
 
 
-def extract_bbh_prediction(response: str) -> str | None:
-    """Final non-empty line of `response`, normalised (strip, lowercase,
+_BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
+_ANSWER_MARKER_RE = re.compile(
+    r"(?im)^[ \t]*#{0,6}[ \t]*\*{0,2}[ \t]*(?:final\s+answer|answer)[ \t]*\*{0,2}[ \t]*:[ \t]*\*{0,2}[ \t]*(.*)$"
+)
+_MARKDOWN_CHARS_RE = re.compile(r"[*_`$]")
+
+
+def _clean_marker_text(text: str) -> str:
+    """Strip markdown emphasis/code-fence characters and `$` math
+    delimiters, then run the shared BBH line normalisation."""
+    return _normalise_bbh_line(_MARKDOWN_CHARS_RE.sub("", text))
+
+
+def _extract_bbh_marker_prediction(response: str) -> str | None:
+    """Design choice -- Task F point 2, diagnosed against the real
+    Qwen3-4B responses `record_verdicts` captured for the base-model BBH
+    zeros (dyck_languages, web_of_lies, word_sorting,
+    multistep_arithmetic_two, logical_deduction_seven_objects). Qwen3-4B
+    commonly states its committed answer as the last `\\boxed{...}` or
+    behind a "Final Answer:" / "Answer:" line (optional heading/bold
+    around it) and then keeps talking -- the plain last-non-empty-line
+    read below missed it entirely. Search from the end (last boxed, else
+    last marker line) so an earlier "answer" mention inside the reasoning
+    is never preferred over a later, real one. When the marker line has
+    nothing after its colon (the value is on the following line(s)),
+    keep reading forward to the next blank line. None if neither is
+    present, so the caller falls back to the last-line heuristic."""
+    boxed = list(_BOXED_RE.finditer(response))
+    if boxed:
+        return _clean_marker_text(boxed[-1].group(1)) or None
+    markers = list(_ANSWER_MARKER_RE.finditer(response))
+    if not markers:
+        return None
+    match = markers[-1]
+    text = match.group(1).strip()
+    if not text:
+        collected: list[str] = []
+        for line in response[match.end() :].split("\n"):
+            if not line.strip():
+                if collected:
+                    break
+                continue
+            collected.append(line.strip())
+        text = " ".join(collected)
+    return _clean_marker_text(text) or None
+
+
+def extract_bbh_prediction(response: str, target: str | None = None) -> str | None:
+    """The model's committed BBH answer, normalised (strip, lowercase,
     drop a trailing full stop, collapse whitespace, strip surrounding
-    quotes). None if `response` has no non-empty line."""
-    non_empty = [line for line in response.split("\n") if line.strip()]
-    return _normalise_bbh_line(non_empty[-1]) if non_empty else None
+    quotes):
+
+    1. `_extract_bbh_marker_prediction` (a `\\boxed{...}` or a "Final
+       Answer:" / "Answer:" line), when present.
+    2. Otherwise, ONLY when `target` is given and is itself more than
+       one word (a word_sorting-shaped gold, Task F point 4): the final
+       non-empty line, and the non-empty lines directly above it, are
+       joined with spaces if they are each a single whitespace-free
+       token (word_sorting responses that put one word per line) -- up
+       to as many trailing lines as `target` has words, so an unrelated
+       single-word line further up (e.g. a "Reasoning." lead-in before a
+       True/False line) is never pulled in by accident. A single-line,
+       comma-separated list is accepted the same way, but ONLY when
+       every comma-separated part is itself a single token -- ordinary
+       prose with an incidental comma (seen in truncated
+       logical_deduction_seven_objects responses) is left alone.
+    3. Otherwise (no marker, no multi-word `target`, or the list checks
+       above did not apply): the final non-empty line as-is -- the
+       original, target-agnostic behaviour, unchanged.
+
+    None if `response` has no non-empty line and no marker."""
+    marker = _extract_bbh_marker_prediction(response)
+    if marker is not None:
+        return marker
+    non_empty = [line.strip() for line in response.split("\n") if line.strip()]
+    if not non_empty:
+        return None
+    last = non_empty[-1]
+    target_words = _normalise_bbh_line(target).split() if target else []
+    if len(target_words) > 1:
+        if " " not in last:
+            tokens: list[str] = []
+            for line in reversed(non_empty):
+                if " " in line:
+                    break
+                tokens.append(line)
+                if len(tokens) >= len(target_words):
+                    break
+            tokens.reverse()
+            if tokens:
+                return _normalise_bbh_line(" ".join(tokens))
+        elif "," in last:
+            parts = [part.strip() for part in last.split(",") if part.strip()]
+            if parts and all(" " not in part for part in parts):
+                return _normalise_bbh_line(" ".join(parts))
+    return _normalise_bbh_line(last)
 
 
-# Design proposal -- Claude (subagent), 2026-09-11, Task F point 2.
-# Not applied to the scoring rule below; verify against real Qwen3-4B
-# responses (now captured per-row by record_verdicts) before changing it.
-#
-# Diagnosis of the base-model BBH zeros (dyck_languages 0.0, web_of_lies 0.0,
-# word_sorting 0.068, multistep_arithmetic_two 0.116,
-# logical_deduction_seven_objects 0.072):
-#
-# The scorer expects the LAST non-empty line, after normalisation, to be
-# EXACTLY equal to the normalised target -- except when target is "(X)",
-# where substring containment is also accepted (norm_target in line).
-# The prompt only says "Give only the final answer on the last line"; it
-# does not tell the model to give a BARE answer. Qwen3-4B non-thinking, even
-# in its final line, tends to keep prose around the answer:
-#   - "The answer is No." / "Answer: No" for web_of_lies -- exact-match
-#     fails because of the prefix, even though normalisation already
-#     strips the trailing period.
-#   - "The final answer is -16." for multistep_arithmetic_two -- exact
-#     match against a bare number fails the same way; GSM8K's scorer
-#     tolerates this by extracting the last number, BBH's does not.
-#   - "apple, banana, cherry" for word_sorting -- gold is space-separated
-#     ("apple banana cherry"); normalisation collapses whitespace but does
-#     not strip commas, so comma-joined output never matches.
-#   - dyck_languages closing sequences ("] > )") likely fail the same
-#     prefix/spacing way, plus the model may join brackets without spaces.
-#   - logical_deduction_seven_objects (target "(A)"): the paren-containment
-#     rule only checks norm_target-in-line, i.e. it accepts "(a)" inside a
-#     longer line, but a bare "a" (letter without parens, which chat models
-#     commonly emit despite the "(X)" gold format) is NOT accepted --
-#     containment is one-directional. Markdown emphasis ("**(A)**") already
-#     passes by accident (substring check), but a bare letter does not.
-#
-# Proposed normalisation (none applied yet):
-#   1. Strip a leading "answer:", "final answer:", "the answer is" (or
-#      similar, case-insensitive) prefix from the line before comparing.
-#   2. Strip markdown emphasis markers ("*", "_", "`") in addition to the
-#      quote-stripping already done, so "**No**" normalises to "no".
-#   3. For a purely numeric target (multistep_arithmetic_two), reuse
-#      extract_gsm8k_prediction's last-number extraction instead of exact
-#      string equality.
-#   4. For word-list targets (word_sorting), also strip commas before
-#      collapsing whitespace, so "apple, banana, cherry" and
-#      "apple banana cherry" normalise the same.
-#   5. For a "(X)" target, also accept a bare letter/word match (strip the
-#      target's own parens before the containment check) so "a" matches
-#      gold "(A)", not only "(a)".
-# Each of these narrows a real gap without loosening exact match elsewhere;
-# they should be checked against the actual captured `response` field for
-# these five groups once a GPU smoke run exists, then landed as a single
-# scoring-rule change with updated tests.
+def _bracket_suffix_match(prediction: str, target: str) -> bool:
+    """Labelled leniency -- Task F point 5, dyck_languages only (`target`
+    made up solely of bracket/space characters). Qwen3-4B typically
+    restates the WHOLE sequence, the given unbalanced prefix plus its own
+    closing brackets, instead of emitting only the closing part the
+    prompt asks for. Accept `prediction` when its bracket characters,
+    spaces removed, END with `target`'s (also space-stripped). Still
+    strict everywhere else: an incomplete or wrongly-nested completion
+    (5 of the 8 dyck_languages samples inspected for this task) scores
+    wrong, same as before."""
+    compact_target = target.replace(" ", "")
+    return bool(compact_target) and prediction.replace(" ", "").endswith(compact_target)
+
+
 def score_bbh(response: str, target: str) -> bool:
-    """Final non-empty line of `response`, normalised (strip, lowercase,
-    drop a trailing full stop, collapse whitespace, strip surrounding
-    quotes), compared to the same-normalised `target`. When `target` has
-    the form "(X)", a normalised line that merely contains "(x)" also
-    counts (BBH's multiple-choice tasks sometimes get "(a)" back out of a
-    fuller sentence)."""
-    line = extract_bbh_prediction(response) or ""
+    """`extract_bbh_prediction(response)` compared to the
+    same-normalised `target`, with two labelled exceptions:
+
+    - `target` of the form "(X)": also accept a prediction that merely
+      CONTAINS "(x)" (unchanged: a fuller sentence around the letter),
+      or that contains the bare letter "x" as its own token (Task F
+      point 3 -- chat models often drop the parens BBH's gold keeps).
+    - `target` made only of bracket/space characters: see
+      `_bracket_suffix_match` (dyck_languages leniency).
+    """
+    prediction = extract_bbh_prediction(response, target) or ""
     norm_target = _normalise_bbh_line(target)
-    if line == norm_target:
+    if prediction == norm_target:
         return True
     if _PAREN_LETTER_RE.match(target.strip()):
-        return norm_target in line
+        letter = norm_target.strip("()")
+        if norm_target in prediction:
+            return True
+        return bool(re.search(rf"(?<![a-z]){re.escape(letter)}(?![a-z])", prediction))
+    if target and all(ch in "()[]{}<> \t" for ch in target):
+        return _bracket_suffix_match(prediction, target)
     return False
 
 
@@ -203,7 +266,7 @@ def extract_prediction(row: RetentionRow, response: str) -> str | None:
     if row.benchmark == "mmlu":
         return extract_mmlu_prediction(response)
     if row.benchmark == "bbh":
-        return extract_bbh_prediction(response)
+        return extract_bbh_prediction(response, row.target)
     raise ValueError(f"unknown benchmark {row.benchmark!r}")
 
 

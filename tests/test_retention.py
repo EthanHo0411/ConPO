@@ -101,6 +101,114 @@ def test_score_bbh_wrong_answer() -> None:
     assert score_bbh("Reasoning.\nFalse.", "True") is False
 
 
+# --- score_bbh: robust extractor, Task F point 2 (real Qwen3-4B responses) -----
+# Every response string below is copied verbatim (full response, or a verbatim
+# tail when the full response is long prose) from
+# scratchpad/bbh_group_samples.jsonl -- real record_verdicts output for the
+# base-model retention run, not fabricated text.
+
+
+@pytest.mark.parametrize(
+    "response,gold,expected",
+    [
+        # dyck_languages: model repeats the whole sequence, ending in the
+        # gold closing brackets -- accepted (point 5 leniency).
+        ("[ [ ] ]", "] ]", True),
+        ("( { { } } )", ")", True),
+        ("< ( ( ( [ { } ] ) ) ) >", ") ) >", True),
+        # dyck_languages: repeats the sequence but never closes the outer
+        # bracket -- a genuine wrong answer, still scores wrong.
+        ("< [ [ ] ]", "] ] >", False),
+    ],
+)
+def test_score_bbh_dyck_languages_whole_sequence_repeat(response: str, gold: str, expected: bool) -> None:
+    assert score_bbh(response, gold) is expected
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        # "Final Answer:" with the value on the same line, more text follows.
+        "### Final Answer: **No**  \nElanor does **not** tell the truth.",
+        # last marker in the text wins even when an earlier empty marker exists.
+        "### Final Answer:\n\n**No, Shalonda does not tell the truth.**  \n**Shalonda lies.**\n\n**Answer: No**",
+        # marker line is not the last line of the response.
+        "### Final Answer: **No**  \n**Ka does not tell the truth.**",
+    ],
+)
+def test_score_bbh_web_of_lies_final_answer_marker(response: str) -> None:
+    assert score_bbh(response, "No") is True
+
+
+def test_score_bbh_web_of_lies_marker_with_trailing_clause_stays_wrong() -> None:
+    # Labelled residual gap: the marker's own line carries the committed answer
+    # plus an explanatory clause ("Yes, Elanor tells the truth."); point 2 only
+    # strips a trailing period, not a trailing clause, so this does not match
+    # bare gold "Yes". Out of scope for this pass (see extract_bbh_prediction).
+    response = "### Final Answer: **Yes, Elanor tells the truth.**"
+    assert score_bbh(response, "Yes") is False
+
+
+def test_score_bbh_web_of_lies_truncated_response_no_marker_stays_wrong() -> None:
+    # 512-token cap hit mid-reasoning: no marker, no committed answer -- a
+    # capacity issue, not something the extractor can or should fix.
+    response = (
+        "So, the only statement we can be certain of is:\n\n- **Jim lies.**\n\n"
+        "Now, if **Crista says Jim lies**, and we know that **Jim lies**, "
+        "then **Crista is telling the truth**.\n\nSo"
+    )
+    assert score_bbh(response, "Yes") is False
+
+
+def test_score_bbh_word_sorting_one_word_per_line() -> None:
+    assert score_bbh("syndrome  \ntherefrom", "syndrome therefrom") is True
+
+
+def test_extract_bbh_prediction_word_sorting_comma_separated_list() -> None:
+    response = (
+        "barn, delmarva, dot, embezzle, greene, it&t, panicking, prod, scorch, same, "
+        "splutter, subsist, thrill, drumhead, onus, obstetric, malton, guru, damp, entirety"
+    )
+    gold = "barn damp delmarva dot drumhead embezzle entirety greene guru it&t malton obstetric onus panicking prod same scorch splutter subsist thrill"
+    # Comma-list is accepted and space-joined (point 4) once `target` shows a
+    # multi-word gold is expected...
+    assert extract_bbh_prediction(response, gold) == response.replace(", ", " ")
+    # ...but the model's order does not match the sorted gold, so it still scores wrong.
+    assert score_bbh(response, gold) is False
+
+
+@pytest.mark.parametrize(
+    "response,gold",
+    [
+        ("### Final Answer:\n$$\n\\boxed{24}\n$$", "24"),
+        ("**Final Answer: 58**", "58"),
+        ("**Final answer:**  \n$-80$", "-80"),
+    ],
+)
+def test_score_bbh_multistep_arithmetic_answer_marker(response: str, gold: str) -> None:
+    assert score_bbh(response, gold) is True
+
+
+def test_score_bbh_logical_deduction_truncated_prose_with_commas_stays_wrong() -> None:
+    # 512-token cap hit mid-reasoning; the trailing line has commas but each
+    # comma-separated part is multi-word prose, not a word list, so it is left
+    # to the plain last-line path (point 4's "all parts single token" guard)
+    # instead of being corrupted by the comma-splitting meant for word_sorting.
+    response = (
+        "That means **Joe and Rob are in positions 1st, 2nd, or 4th, 5th, 6th**, "
+        "but **Joe must be above Rob**, and **Rob must"
+    )
+    assert score_bbh(response, "(D)") is False
+
+
+def test_score_bbh_logical_deduction_marker_value_on_next_line_still_matches() -> None:
+    # No-regression check: this sample already scored correct under the old
+    # last-line extractor via paren-containment; confirm the new marker path
+    # (empty "Final Answer:" line, value on the next line) still finds it.
+    response = "Third-to-last is **5th place**.\n\n### Final Answer:\n**(B) Eve finished third-to-last**."
+    assert score_bbh(response, "(B)") is True
+
+
 # --- extract_*_prediction ------------------------------------------------------
 
 
@@ -337,6 +445,35 @@ def test_eval_retention_limit_caps_rows_per_benchmark(tmp_path: Path, monkeypatc
 def test_load_retention_rows_limit_zero_returns_empty(tmp_path: Path) -> None:
     data_dir = _fixture_rows(tmp_path)
     assert eval_retention.load_retention_rows(data_dir, "gsm8k", limit=0) == []
+
+
+def test_eval_retention_groups_filters_rows_by_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data_dir = _fixture_rows(tmp_path)
+    canned_path = _fixture_canned(tmp_path)
+    out_path = tmp_path / "out.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_retention.py",
+            "--data-dir",
+            str(data_dir),
+            "--groups",
+            "task_b",
+            "--score-only",
+            str(canned_path),
+            "--out",
+            str(out_path),
+        ],
+    )
+    eval_retention.main()
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    # gsm8k (group "") and mmlu (sub1/sub2) rows are all filtered out; only
+    # bbh:task_b:0 matches, so gsm8k/mmlu are absent (0 rows), same as
+    # test_eval_retention_benchmarks_subset_omits_others's "absent, not 0" rule.
+    assert set(result["n"]) == {"bbh"}
+    assert result["n"]["bbh"] == 1
+    assert result["by_group"]["bbh"] == {"task_b": 1.0}
 
 
 def test_eval_retention_benchmarks_subset_omits_others(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

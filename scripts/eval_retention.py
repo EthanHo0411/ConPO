@@ -125,6 +125,12 @@ def main() -> None:
     parser.add_argument("--backend", choices=("hf", "vllm"), default="hf")
     parser.add_argument("--out", required=True, help="output JSON path")
     parser.add_argument("--benchmarks", default=",".join(BENCHMARKS), help="comma-separated subset of gsm8k,mmlu,bbh")
+    parser.add_argument(
+        "--groups",
+        default=None,
+        help="comma-separated group names (BBH task names, or MMLU subjects); applied after loading, "
+        "keeps only rows whose group matches -- lets a group-filtered smoke run without a custom script",
+    )
     parser.add_argument("--data-dir", default=str(DATA_DIR), help="directory holding retention_{benchmark}.jsonl")
     parser.add_argument("--score-only", default=None, help="jsonl of {key, response}; skips generation")
     parser.add_argument("--limit", type=int, default=None, help="cap rows per benchmark, for smoke runs")
@@ -134,6 +140,9 @@ def main() -> None:
     benchmarks = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
     data_dir = Path(args.data_dir)
     rows_by_benchmark = {b: load_retention_rows(data_dir, b, args.limit) for b in benchmarks}
+    if args.groups is not None:
+        groups = {g.strip() for g in args.groups.split(",") if g.strip()}
+        rows_by_benchmark = {b: [r for r in rows if r.group in groups] for b, rows in rows_by_benchmark.items()}
 
     engine = None
     if args.score_only is None and args.backend == "hf":
