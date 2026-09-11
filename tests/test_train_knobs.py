@@ -511,3 +511,21 @@ def test_main_fresh_run_refuses_out_dir_with_existing_checkpoint(
     message = str(exc_info.value)
     assert "RUN_RESUME" in message
     assert "checkpoint" in message
+
+
+# ---------------------------------------------------------------------------
+# scripts/train.py: SaveCadenceCallback (resume keeps RUN_SAVE_STEPS)
+# ---------------------------------------------------------------------------
+
+
+def test_save_cadence_callback_reasserts_args_on_train_begin() -> None:
+    from types import SimpleNamespace
+
+    from transformers import TrainerState
+
+    # transformers reloads this from the checkpoint after copying the args in.
+    state = TrainerState(save_steps=25, logging_steps=25)
+    args = SimpleNamespace(save_steps=15, logging_steps=1)
+    train_script.SaveCadenceCallback().on_train_begin(args, state, None)
+    assert state.save_steps == 15
+    assert state.logging_steps == 1

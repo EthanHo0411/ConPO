@@ -269,6 +269,21 @@ class Pass1CheckpointCallback(TrainerCallback):
         (out_dir / "pass1.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+class SaveCadenceCallback(TrainerCallback):
+    """Re-asserts the launch-time checkpoint cadence on resume. transformers
+    copies args.save_steps into TrainerState, then replaces the state with the
+    checkpoint's trainer_state.json, and DefaultFlowCallback saves on
+    state.save_steps: a run resumed with a different RUN_SAVE_STEPS kept the
+    old cadence (observed 2026-09-11: full_s42 resumed from checkpoint-25 with
+    RUN_SAVE_STEPS=15 saved nothing at step 30). on_train_begin runs after
+    that reload.
+    """
+
+    def on_train_begin(self, args: object, state: object, control: object, **kwargs: object) -> None:
+        state.save_steps = args.save_steps  # type: ignore[attr-defined]
+        state.logging_steps = args.logging_steps  # type: ignore[attr-defined]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tiny", action="store_true", help="tiny random model + 4 rows, for smoke tests")
@@ -482,7 +497,7 @@ def main() -> None:
         veto_period_k=veto_period_k,
         out_dir=out_dir,
         peft_config=lora_config,
-        callbacks=[pass1_callback],
+        callbacks=[pass1_callback, SaveCadenceCallback()],
         resume_from=resume_checkpoint_dir,
     )
     pass1_callback.trainer = trainer
