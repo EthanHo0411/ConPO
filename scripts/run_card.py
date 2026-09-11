@@ -128,9 +128,9 @@ POLICY_MODEL = cfg.POLICY_MODEL
 
 
 PLANNED_RUNS: tuple[CardPlan, ...] = (
-    CardPlan("full_s42", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "42", "planned", 39.0),
-    CardPlan("full_s43", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "43", "planned", 39.0),
-    CardPlan("full_s44", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "44", "planned", 39.0),
+    CardPlan("full_s42", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "42", "planned", 51.0),
+    CardPlan("full_s43", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "43", "planned", 51.0),
+    CardPlan("full_s44", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "44", "planned", 51.0),
     # The untrained base policy: never trains (arm kept out of conpo.arms.ARMS
     # on purpose), so its status is derived from its own eval_dir alone
     # (see render_card's _EVAL_ONLY_STATUS_RUN_IDS branch) rather than from
@@ -140,54 +140,54 @@ PLANNED_RUNS: tuple[CardPlan, ...] = (
         detail="eval hours are counted in the eval job rows.",
         launch="N/A: this policy never trains; bash local/eval.sh and bash local/retention.sh with no adapter",
     ),
-    CardPlan("ifrlvr_s42", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "42", "planned", 63.0),
-    CardPlan("ifrlvr_s43", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "43", "planned", 63.0),
-    CardPlan("ifrlvr_s44", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "44", "planned", 63.0),
+    CardPlan("ifrlvr_s42", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "42", "planned", 66.0),
+    CardPlan("ifrlvr_s43", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "43", "planned", 66.0),
+    CardPlan("ifrlvr_s44", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "44", "planned", 66.0),
     CardPlan("solve_only_s42", "train", "solve_only", {}, "H1 attribution", ("H1",), POLICY_MODEL, "42", "planned", 18.0),
     CardPlan(
         "full_no_exactness_s42", "train", "full", {"RUN_NO_EXACTNESS": "1"}, "H2", ("H2",), POLICY_MODEL, "42",
-        "planned", 39.0,
+        "planned", 51.0,
     ),
     CardPlan(
         "full_no_distance_s42", "train", "full", {"RUN_NO_DISTANCE": "1"}, "H2", ("H2",), POLICY_MODEL, "42",
-        "planned", 39.0,
+        "planned", 51.0,
     ),
     CardPlan("vf_dpo_s42", "train", "vf_dpo", {}, "H2", ("H2",), POLICY_MODEL, "42", "planned", 18.0),
-    CardPlan("forward_only_s42", "train", "forward_only", {}, "H3", ("H3",), POLICY_MODEL, "42", "planned", 39.0),
-    CardPlan("reverse_only_s42", "train", "reverse_only", {}, "H3", ("H3",), POLICY_MODEL, "42", "planned", 39.0),
+    CardPlan("forward_only_s42", "train", "forward_only", {}, "H3", ("H3",), POLICY_MODEL, "42", "planned", 51.0),
+    CardPlan("reverse_only_s42", "train", "reverse_only", {}, "H3", ("H3",), POLICY_MODEL, "42", "planned", 51.0),
     CardPlan(
         "full_uniform_s42", "train", "full", {"RUN_SELECTION": "uniform"}, "H4", ("H4",), POLICY_MODEL, "42",
-        "planned", 39.0,
+        "planned", 51.0,
     ),
     CardPlan(
         "full_half_s42", "train", "full", {"RUN_SELECTION": "half"}, "H4", ("H4",), POLICY_MODEL, "42",
-        "planned", 39.0,
+        "planned", 51.0,
     ),
     CardPlan(
         "full_lambda_p0_s42", "train", "full", {"RUN_LAMBDA_P": "0"}, "H5", ("H5",), POLICY_MODEL, "42",
-        "planned", 39.0,
+        "planned", 51.0,
     ),
     CardPlan(
-        "h6_multi_s42", "train", "full", {"RUN_MULTI": "1"}, "H6", ("H6",), POLICY_MODEL, "42", "planned", 39.0,
+        "h6_multi_s42", "train", "full", {"RUN_MULTI": "1"}, "H6", ("H6",), POLICY_MODEL, "42", "planned", 51.0,
         detail="H6: RUN_MULTI=1 built 2026-09-03 (compositor, multi-family edges)",
     ),
     CardPlan(
         "edge_dpo_s42", "train", "edge_dpo", {}, "objective control", ("objective_isolation_edge_dpo",),
-        POLICY_MODEL, "42", "planned", 39.0,
+        POLICY_MODEL, "42", "planned", 51.0,
     ),
     CardPlan(
-        "full_qwen3_8b_s42", "train", "full", {}, "model axis", (), "Qwen/Qwen3-8B", "42", "planned", 78.0,
+        "full_qwen3_8b_s42", "train", "full", {}, "model axis", (), "Qwen/Qwen3-8B", "42", "planned", 102.0,
     ),
     CardPlan(
         "full_tulu3_8b_sft_s42", "train", "full", {}, "model axis", (), "allenai/Llama-3.1-Tulu-3-8B-SFT", "42",
-        "planned", 78.0,
+        "planned", 102.0,
     ),
     CardPlan(
         "full_olmo3_7b_sft_s42", "train", "full", {}, "model axis", (), "allenai/Olmo-3-7B-Instruct-SFT", "42",
-        "planned", 78.0,
+        "planned", 102.0,
     ),
     CardPlan(
-        "full_fullft_s42", "train", "full", {}, "full-FT point-check", (), POLICY_MODEL, "42", "planned", 46.0,
+        "full_fullft_s42", "train", "full", {}, "full-FT point-check", (), POLICY_MODEL, "42", "planned", 60.0,
         launch="RUN_ARM=full RUN_SEED=42 RUN_FULL_FT=1 RUN_OUT_DIR=runs/full_fullft_s42 bash local/train_fullft.sh",
     ),
 )

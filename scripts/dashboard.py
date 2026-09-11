@@ -910,7 +910,7 @@ def sum_numeric(cards: list[dict[str, str]], key: str) -> tuple[float, bool]:
 
 
 def _fmt_total(value: float, has_value: bool) -> str:
-    return f"{value:.4f}" if has_value else "pending"
+    return f"{value:,.4f}" if has_value else "pending"
 
 
 def build_totals_section(train_cards: list[dict[str, str]], eval_cards: list[dict[str, str]]) -> list[str]:
@@ -924,11 +924,11 @@ def build_totals_section(train_cards: list[dict[str, str]], eval_cards: list[dic
     return [
         "## 4. Totals",
         "",
-        f"Training: est {train_est:.4f} H100-h, actual {_fmt_total(train_actual, train_has)} H100-h.",
+        f"Training: est {train_est:,.4f} H100-h, actual {_fmt_total(train_actual, train_has)} H100-h.",
         "",
-        f"Evaluation: est {eval_est:.4f} H100-h, actual {_fmt_total(eval_actual, eval_has)} H100-h.",
+        f"Evaluation: est {eval_est:,.4f} H100-h, actual {_fmt_total(eval_actual, eval_has)} H100-h.",
         "",
-        f"Grand total: est {grand_est:.4f} H100-h, actual {_fmt_total(grand_actual, grand_has)} H100-h.",
+        f"Grand total: est {grand_est:,.4f} H100-h, actual {_fmt_total(grand_actual, grand_has)} H100-h.",
         "",
         f"Days on 2x H100 (est): {grand_est / 48:.4f}.",
         "",
@@ -944,11 +944,11 @@ def build_statistics_section() -> list[str]:
         "Intervals and bootstraps cost 0 GPU-hours (CPU, seconds, from the stored per-prompt verdicts).",
         "",
         "Seed replication is the only compute that buys statistical power: the 2 extra seeds on the "
-        "headline pair cost about 204 H100-h of training (full ConPO plus IF-RLVR matched to ConPO's "
-        "token budget at R = 3.52 passes over the subset) plus about 1 H100-h of eval and retention, "
-        "about 205 H100-h, about 4.3 days on 2x H100, already inside the total; each further seed on "
-        "the headline pair costs about 103 H100-h (one full ConPO pass plus one token-matched IF-RLVR "
-        "pass, plus eval and retention), about 2.1 days on 2x H100, and narrows the seed-level std "
+        "headline pair cost about 234 H100-h of training (full ConPO plus IF-RLVR matched to ConPO's "
+        "token budget at R = 3.61 passes over the subset) plus about 1 H100-h of eval and retention, "
+        "about 235 H100-h, about 4.9 days on 2x H100, already inside the total; each further seed on "
+        "the headline pair costs about 118 H100-h (one full ConPO pass plus one token-matched IF-RLVR "
+        "pass, plus eval and retention), about 2.4 days on 2x H100, and narrows the seed-level std "
         "only.",
         "",
         "The prompt-level bootstrap gets tighter only with more eval prompts, and IFBench_test has 300.",
