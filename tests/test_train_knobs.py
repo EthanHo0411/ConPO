@@ -353,3 +353,161 @@ def test_main_raises_before_loading_model_or_tokenizer(
     assert "prompts_per_update (16)" in message
     assert "RUN_LIMIT" in message
     assert not (out_dir / "run_metadata.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# scripts/train.py: RUN_RESUME (devbox 2026-09-11, node-local disk wiped
+# about every 48 hours, so a run must be resumable from its newest harvested
+# checkpoint instead of restarted cold on top of it).
+#
+# _find_checkpoints/_resolve_resume unit tests below never construct a model;
+# the two through main() at the bottom do (tiny, CPU), exercising the whole
+# RUN_RESUME contract: ConPOTrainer._save_conpo_state/_load_conpo_state,
+# trainer.train(resume_from_checkpoint=...), and run_metadata.json.
+# ---------------------------------------------------------------------------
+
+
+def _make_checkpoint(out_dir: Path, step: int, name: str | None = None) -> Path:
+    checkpoint_dir = out_dir / (name or f"checkpoint-{step}")
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / "trainer_state.json").write_text(json.dumps({"global_step": step}), encoding="utf-8")
+    return checkpoint_dir
+
+
+def test_find_checkpoints_reads_global_step_and_handles_missing_state(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    checkpoint_1 = _make_checkpoint(out_dir, step=1)
+    broken = out_dir / "checkpoint-broken"
+    broken.mkdir()  # no trainer_state.json: still "a checkpoint exists", step reads as 0
+
+    found = dict(train_script._find_checkpoints(out_dir))
+    assert found[checkpoint_1] == 1
+    assert found[broken] == 0
+
+
+def test_resolve_resume_fresh_run_raises_when_checkpoint_exists(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _make_checkpoint(out_dir, step=3)
+
+    with pytest.raises(SystemExit) as exc_info:
+        train_script._resolve_resume(out_dir, run_resume=False)
+    message = str(exc_info.value)
+    assert "RUN_RESUME" in message
+    assert "checkpoint" in message
+
+
+def test_resolve_resume_fresh_run_silent_when_out_dir_has_no_checkpoint(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"  # never created
+    assert train_script._resolve_resume(out_dir, run_resume=False) == (None, None)
+
+
+def test_resolve_resume_picks_newest_checkpoint_by_step_not_lexicographic_order(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _make_checkpoint(out_dir, step=9)
+    newest = _make_checkpoint(out_dir, step=10)  # "checkpoint-10" sorts before "checkpoint-9" as a string
+
+    checkpoint_dir, step = train_script._resolve_resume(out_dir, run_resume=True)
+    assert checkpoint_dir == newest
+    assert step == 10
+
+
+def test_resolve_resume_raises_when_nothing_to_resume(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"  # never created
+    with pytest.raises(SystemExit) as exc_info:
+        train_script._resolve_resume(out_dir, run_resume=True)
+    assert "RUN_RESUME=1" in str(exc_info.value)
+
+
+def _run_main_tiny(
+    data_dir: Path, out_dir: Path, monkeypatch: pytest.MonkeyPatch, steps: int, resume: bool
+) -> None:
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+    monkeypatch.setenv("RUN_ARM", "full")
+    monkeypatch.setenv("RUN_STEPS", str(steps))
+    # RUN_SAVE_STEPS (design choice, builder, 2026-09-11): checkpoint every
+    # step instead of every config.SAVE_STEPS (25), so this CPU test reaches
+    # a checkpoint in 1 step instead of 25.
+    monkeypatch.setenv("RUN_SAVE_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setenv("RUN_RESUME", "1" if resume else "0")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+    train_script.main()
+
+
+def test_main_resume_continues_from_saved_step_and_conpo_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_RESUME end to end: a fresh 1-step run checkpoints at
+    checkpoint-1, then a resumed invocation with RUN_STEPS=2 continues from
+    it instead of restarting -- exactly 2 per-step mechanism records total
+    (steps 0 and 1, never two step-0 records), the resume event's
+    edge_buffer_size/tokens_cumulative match what checkpoint-1 itself saved,
+    and run_metadata.json's resumed_from_step is 1."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    out_dir = tmp_path / "out"
+
+    _run_main_tiny(data_dir, out_dir, monkeypatch, steps=1, resume=False)
+
+    checkpoint_1 = out_dir / "checkpoint-1"
+    assert checkpoint_1.is_dir()
+    saved_state = json.loads((checkpoint_1 / "conpo_state.json").read_text(encoding="utf-8"))
+    saved_edges = sum(1 for _ in (checkpoint_1 / "conpo_edges.jsonl").open(encoding="utf-8"))
+
+    _run_main_tiny(data_dir, out_dir, monkeypatch, steps=2, resume=True)
+
+    lines = [
+        json.loads(line)
+        for line in (out_dir / "mechanism.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    step_records = [r for r in lines if "event" not in r]
+    assert sorted(r["step"] for r in step_records) == [0, 1]  # continued, not restarted at 0 twice
+
+    resume_records = [r for r in lines if r.get("event") == "resume"]
+    assert len(resume_records) == 1
+    assert resume_records[0]["resumed_from_step"] == 1
+    assert resume_records[0]["edge_buffer_size"] == saved_edges
+    assert resume_records[0]["tokens_cumulative"] == saved_state["meter_total"]
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["resumed_from_step"] == 1
+
+
+def test_main_fresh_run_refuses_out_dir_with_existing_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh run (RUN_RESUME unset) must fail loud, before loading any
+    model, if RUN_OUT_DIR already holds a checkpoint -- a node-local-disk
+    wipe followed by a plain restart must never silently start training
+    over on top of harvested data."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    def _fail_loader(*args: object, **kwargs: object) -> tuple[object, object]:
+        raise AssertionError("model loaded before the RUN_RESUME guard")
+
+    monkeypatch.setattr(train_script, "_real_model_and_tokenizer", _fail_loader)
+    monkeypatch.setattr(train_script, "_tiny_model_and_tokenizer", _fail_loader)
+
+    out_dir = tmp_path / "out"
+    _make_checkpoint(out_dir, step=1)
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.delenv("RUN_RESUME", raising=False)
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        train_script.main()
+    message = str(exc_info.value)
+    assert "RUN_RESUME" in message
+    assert "checkpoint" in message

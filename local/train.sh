@@ -28,9 +28,9 @@
 #
 # Ablations and batched-veto knobs: any RUN_SELECTION / RUN_NO_VETO /
 # RUN_NO_EXACTNESS / RUN_NO_DISTANCE / RUN_LAMBDA_P / RUN_JUDGE_MODE /
-# RUN_JUDGE_MODEL / RUN_VETO_PERIOD / RUN_MODEL / RUN_LIMIT set in the
-# calling shell's environment pass through unmodified (see the arm table in
-# conpo/experiments.md); this script does not set or validate them.
+# RUN_JUDGE_MODEL / RUN_VETO_PERIOD / RUN_MODEL / RUN_LIMIT / RUN_RESUME set
+# in the calling shell's environment pass through unmodified (see the arm
+# table in conpo/experiments.md); this script does not set or validate them.
 #
 # scripts/train.py's build_judge() picks the judge from RUN_NO_VETO /
 # RUN_JUDGE_MODE / RUN_USE_VLLM: RUN_NO_VETO=1 -> StaticJudge; RUN_JUDGE_MODE=
@@ -41,6 +41,17 @@
 # RUN_JUDGE_ENDPOINT already set by hand:
 #
 #   RUN_ARM=full RUN_JUDGE_MODE=http bash local/train.sh
+#
+# Resuming a run the node-local wipe cut short (RUN_RESUME, devbox
+# 2026-09-11): copy the harvested run back under CONPO_RUNS_DIR (or point
+# RUN_OUT_DIR at the harvested copy directly -- see local/harvest.sh's
+# --resume-check), then relaunch with RUN_RESUME=1 and the same RUN_OUT_DIR:
+#
+#   RUN_ARM=full RUN_SEED=42 RUN_RESUME=1 bash local/train.sh
+#
+# scripts/train.py fails loud instead: refuses a fresh run (RUN_RESUME unset)
+# whose RUN_OUT_DIR already holds a checkpoint-*, and refuses RUN_RESUME=1
+# when RUN_OUT_DIR holds none.
 #
 # Two-GPU variant: see local/train_fullft.sh, for the LoRA-vs-full-FT
 # point-check and the 7B/8B model-ablation replications. This script stays
@@ -57,6 +68,8 @@
 #   RUN_JUDGE_MODE    "batched" (default) or "http" (needs the judge server)
 #   RUN_USE_VLLM      "1" (default) or "0" for the HF-generate smoke path
 #   RUN_VETO_PERIOD   optimiser steps between veto bursts (default config.VETO_PERIOD_K)
+#   RUN_RESUME        "1" to resume from the newest checkpoint-N already under
+#                     RUN_OUT_DIR instead of starting fresh (default "0")
 
 set -euo pipefail
 source "$(dirname "$(readlink -f "$0")")/env.sh"
@@ -81,7 +94,7 @@ export RUN_SUBSET="${RUN_SUBSET:-${PROJECT}/subsets/train_15000_seed42.keys}"
 export RUN_OUT_DIR="${RUN_OUT_DIR:-${CONPO_RUNS_DIR}/${RUN_ARM}_s${RUN_SEED}}"
 mkdir -p "${RUN_OUT_DIR}"
 
-echo "arm=${RUN_ARM} seed=${RUN_SEED} steps=${RUN_STEPS} token_budget=${RUN_TOKEN_BUDGET} subset=${RUN_SUBSET} out=${RUN_OUT_DIR}"
+echo "arm=${RUN_ARM} seed=${RUN_SEED} steps=${RUN_STEPS} token_budget=${RUN_TOKEN_BUDGET} subset=${RUN_SUBSET} out=${RUN_OUT_DIR} resume=${RUN_RESUME:-0}"
 
 # Wait for the judge server's endpoint file and turn it into RUN_JUDGE_ENDPOINT
 # (conpo/judge.py:read_endpoint format: "hostname port jobid"). Only

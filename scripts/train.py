@@ -117,6 +117,51 @@ def _run_shape(tiny: bool) -> tuple[int, int, int]:
     return num_generations, max_completion_length, effective_batch
 
 
+def _find_checkpoints(out_dir: Path) -> list[tuple[Path, int]]:
+    """Every `checkpoint-*` directory directly under `out_dir`, paired with
+    its optimiser step (from `trainer_state.json`'s `global_step`, the same
+    file TRL's own `Trainer.train(resume_from_checkpoint=...)` reads; 0 for a
+    directory missing that file -- still counted as "a checkpoint exists"
+    for the fresh-run guard below). Empty when `out_dir` holds none.
+    """
+    found: list[tuple[Path, int]] = []
+    for candidate in sorted(out_dir.glob("checkpoint-*")):
+        if not candidate.is_dir():
+            continue
+        state_file = candidate / "trainer_state.json"
+        step = json.loads(state_file.read_text(encoding="utf-8"))["global_step"] if state_file.exists() else 0
+        found.append((candidate, step))
+    return found
+
+
+def _resolve_resume(out_dir: Path, run_resume: bool) -> tuple[Path | None, int | None]:
+    """RUN_RESUME knob (devbox 2026-09-11): the node-local disk is wiped
+    about every 48 hours, so a run must be resumable from its newest
+    harvested checkpoint rather than restarted cold on top of it.
+
+    RUN_RESUME unset/0 (fresh run): fails loud if `out_dir` already holds a
+    checkpoint -- a wiped-and-restarted job must never silently start over
+    on data a prior process already checkpointed there. RUN_RESUME=1:
+    fails loud if `out_dir` holds no checkpoint at all, otherwise returns
+    the newest one (by step) and its step number for `trainer.train(
+    resume_from_checkpoint=...)` and `run_metadata.json`'s `resumed_from_step`.
+    """
+    checkpoints = _find_checkpoints(out_dir) if out_dir.exists() else []
+    if run_resume:
+        if not checkpoints:
+            raise SystemExit(f"RUN_RESUME=1 but no checkpoint-* directory found under {out_dir}")
+        checkpoint_dir, step = max(checkpoints, key=lambda pair: pair[1])
+        return checkpoint_dir, step
+    if checkpoints:
+        raise SystemExit(
+            f"RUN_OUT_DIR {out_dir} already holds {len(checkpoints)} checkpoint-* director"
+            f"{'y' if len(checkpoints) == 1 else 'ies'}; refusing to start a fresh run on top of it "
+            "(a wiped-and-restarted job must not silently start over on harvested data). Set "
+            "RUN_RESUME=1 to resume from it, or point RUN_OUT_DIR at an empty directory."
+        )
+    return None, None
+
+
 def _check_dataset_size(dataset_size: int, prompts_per_update: int) -> None:
     """Fail loud (design 2026-09-04) instead of silently training nothing.
 
@@ -229,14 +274,20 @@ def main() -> None:
     parser.add_argument("--tiny", action="store_true", help="tiny random model + 4 rows, for smoke tests")
     args = parser.parse_args()
 
-    run_start = time.monotonic()
     arm_name = config.env("RUN_ARM", "full")
     seed = int(config.env("RUN_SEED", "0"))
     steps = int(config.env("RUN_STEPS", "1"))
     use_vllm = config.env("RUN_USE_VLLM", "0") == "1"
     model_name = config.env("RUN_MODEL", config.POLICY_MODEL)
     veto_period_k = int(config.env("RUN_VETO_PERIOD", str(config.VETO_PERIOD_K)))
+    # RUN_SAVE_STEPS (design choice, builder, 2026-09-11): overrides
+    # config.SAVE_STEPS the same way RUN_VETO_PERIOD overrides
+    # config.VETO_PERIOD_K -- config.py's locked value is untouched, this
+    # only lets a CPU test force a checkpoint every step instead of every 25.
+    save_steps = int(config.env("RUN_SAVE_STEPS", str(config.SAVE_STEPS)))
     out_dir = Path(config.env("RUN_OUT_DIR", "runs/tmp"))
+    run_resume = config.env("RUN_RESUME", "0") == "1"
+    resume_checkpoint_dir, resumed_from_step = _resolve_resume(out_dir, run_resume)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     random.seed(seed)
@@ -370,7 +421,7 @@ def main() -> None:
         # a production run outlives the node-local disk's 48-hour wipe only
         # through checkpoints harvested to NFS (local/harvest.sh).
         save_strategy="steps",
-        save_steps=config.SAVE_STEPS,
+        save_steps=save_steps,
         save_total_limit=2,
         seed=seed,
         report_to=[],
@@ -432,10 +483,11 @@ def main() -> None:
         out_dir=out_dir,
         peft_config=lora_config,
         callbacks=[pass1_callback],
+        resume_from=resume_checkpoint_dir,
     )
     pass1_callback.trainer = trainer
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=str(resume_checkpoint_dir) if resume_checkpoint_dir is not None else None)
     # The fourth flush condition (USER DECISIONS 2026-09-02): end of
     # training, so nothing sits unscored in trainer.pending_queue when the
     # run finishes normally (the other three -- period, queue size, and
@@ -454,7 +506,11 @@ def main() -> None:
         # Token budget stopped the run before the first full pass: record
         # how much of it completed instead of the (never-written) pass1.json.
         pass1_info["fraction_completed"] = min(1.0, trainer.state.global_step / pass1_callback.pass1_step)
-    wall_hours = (time.monotonic() - run_start) / 3600
+    # RUN_RESUME: cumulative_wall_seconds() adds this process's own elapsed
+    # time (since trainer construction) on top of whatever a prior process's
+    # conpo_state.json recorded, so actual_h100h reflects the whole run
+    # across every resumed process, not only this one.
+    wall_hours = trainer.cumulative_wall_seconds() / 3600
     run_metadata = {
         "arm": arm_name,
         "seed": seed,
@@ -479,6 +535,9 @@ def main() -> None:
         "judge_model": judge_model,
         "veto_period_k": veto_period_k,
         "row_limit": row_limit or None,
+        # RUN_RESUME (devbox 2026-09-11): the checkpoint step this run
+        # resumed from, or None for a fresh run.
+        "resumed_from_step": resumed_from_step,
         # Smoke-shape knobs (design 2026-09-04): what shape this run trained
         # with, whether or not RUN_NUM_GENERATIONS/
         # RUN_MAX_COMPLETION_TOKENS/RUN_EFFECTIVE_BATCH overrode the default.

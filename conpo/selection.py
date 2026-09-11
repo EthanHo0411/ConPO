@@ -92,6 +92,20 @@ class FamilyStats:
             + config.LAMBDA_C * self.C(family)
         )
 
+    def state_dict(self) -> dict[str, dict[str, float | int | None]]:
+        """Every field needed to resume FamilyStats exactly (RUN_RESUME,
+        conpo/trainer.py's checkpoint persistence). Unlike snapshot(), which
+        derives U_c/C_c/acquisition for logging, this round-trips unchanged
+        through load_state_dict."""
+        return {"p": dict(self._p), "n": dict(self._n), "t": dict(self._t), "last_probe_update": dict(self._last_probe_update)}
+
+    def load_state_dict(self, state: Mapping[str, Mapping[str, float | int | None]]) -> None:
+        """Inverse of state_dict; replaces every field in place."""
+        self._p = dict(state["p"])
+        self._n = dict(state["n"])
+        self._t = dict(state["t"])
+        self._last_probe_update = dict(state["last_probe_update"])
+
     def snapshot(self) -> dict[str, dict[str, float | int | None]]:
         """One dict per family seen so far, for logging."""
         families = set(self._p) | set(self._n) | set(self._t) | set(self._last_probe_update)

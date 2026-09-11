@@ -266,6 +266,7 @@ class ConPOTrainer(GRPOTrainer):
         veto_period_k: int = config.VETO_PERIOD_K,
         pending_queue_max: int = config.PENDING_QUEUE_MAX,
         out_dir: str | Path | None = None,
+        resume_from: str | Path | None = None,
         **kwargs: object,
     ) -> None:
         self.arm = arm
@@ -295,6 +296,16 @@ class ConPOTrainer(GRPOTrainer):
         # Lifetime count of edges admitted into edge_buffer, independent of the
         # buffer's own FIFO/age-cap eviction, for the cumulative mechanism-log rate.
         self.cumulative_admitted_edges = 0
+
+        # Wall-clock accumulation across RUN_RESUME processes (scripts/train.py):
+        # the node-local disk is wiped roughly every 48 hours, so one logical
+        # run can span several process restarts. wall_seconds_before_resume is
+        # whatever a prior process's conpo_state.json recorded (0.0 for a
+        # fresh run); cumulative_wall_seconds() adds this process's own
+        # elapsed time since construction on top, so run_metadata.json's
+        # actual_h100h reflects the whole run, not only the last process.
+        self._process_wall_start = time.monotonic()
+        self.wall_seconds_before_resume: float = 0.0
 
         # H6 part B (design 2026-09-04): a PairStats only exists at all when
         # overrides.multi is set (RUN_MULTI=1); reverse_batch's own
@@ -369,6 +380,13 @@ class ConPOTrainer(GRPOTrainer):
                 "(config.KL_BETA); set it nonzero or run with a PEFT adapter instead."
             )
         self.engine: Engine = engine_factory(self)
+
+        # RUN_RESUME (scripts/train.py): load ConPO's own state (everything
+        # this class keeps outside TRL) from the checkpoint TRL itself will
+        # resume from. Runs after every other piece of state above exists,
+        # so load_state_dict/load calls below have somewhere to write.
+        if resume_from is not None:
+            self._load_conpo_state(Path(resume_from))
 
     @contextlib.contextmanager
     def _reference_model(self, model: torch.nn.Module) -> Iterator[torch.nn.Module]:
@@ -904,10 +922,106 @@ class ConPOTrainer(GRPOTrainer):
         """Flush before every checkpoint save (USER DECISIONS 2026-09-02),
         so a saved edges.jsonl / resumed run never carries unscored pairs.
         Also persists pair_stats (H6 part B) so a resumed run's phi/count
-        table survives the restart instead of starting cold."""
+        table survives the restart instead of starting cold, and, after
+        TRL's own save, the rest of ConPO's state (RUN_RESUME) into the same
+        checkpoint directory it just created."""
         self.flush_pending_veto()
         self.save_pair_stats()
         super()._save_checkpoint(model, trial)
+        checkpoint_dir = Path(self._get_output_dir(trial)) / f"checkpoint-{self.state.global_step}"
+        self._save_conpo_state(checkpoint_dir)
+
+    _CONPO_STATE_FILENAME = "conpo_state.json"
+    _CONPO_EDGES_FILENAME = "conpo_edges.jsonl"
+    _CONPO_PAIR_STATS_FILENAME = "conpo_pair_stats.json"
+
+    def _save_conpo_state(self, checkpoint_dir: Path) -> None:
+        """Persist every piece of ConPO's own mutable state (outside TRL)
+        into `checkpoint_dir`, alongside TRL's own checkpoint files
+        (RUN_RESUME, scripts/train.py): the edge buffer, feasible buffer,
+        family/selection stats, PairStats (RUN_MULTI only), the TokenMeter's
+        totals, cumulative counters, the rng state, and cumulative wall time.
+
+        Called from _save_checkpoint, strictly after flush_pending_veto has
+        already drained pending_queue and resolved every pending-feasible
+        tracker (see flush_pending_veto's own docstring): pending_queue and
+        _pending_feasible_by_edge_id are therefore always empty here and
+        need no snapshot, and _steps_since_flush is always 0 right after a
+        flush -- none of the three need persisting.
+        """
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.edge_buffer.save(checkpoint_dir / self._CONPO_EDGES_FILENAME)
+        if self.pair_stats is not None:
+            self.pair_stats.save(checkpoint_dir / self._CONPO_PAIR_STATS_FILENAME)
+        version, internal_state, gauss_next = self.rng.getstate()
+        state: dict[str, object] = {
+            "meter_budget": self.meter.budget,
+            "meter_total": self.meter.total,
+            "family_stats": self.stats.state_dict(),
+            "feasible_buffer": self.feasible_buffer.state_dict(),
+            "cumulative_admitted_edges": self.cumulative_admitted_edges,
+            "cumulative_reverse_admitted": self._cumulative_reverse_admitted,
+            "cumulative_multi_reverse_admitted": self._cumulative_multi_reverse_admitted,
+            "veto_seen_by_direction": dict(self._veto_seen_by_direction),
+            "veto_rejected_by_direction": dict(self._veto_rejected_by_direction),
+            "rng_state": [version, list(internal_state), gauss_next],
+            "wall_seconds": self.cumulative_wall_seconds(),
+        }
+        (checkpoint_dir / self._CONPO_STATE_FILENAME).write_text(json.dumps(state), encoding="utf-8")
+
+    def _load_conpo_state(self, checkpoint_dir: Path) -> None:
+        """Inverse of _save_conpo_state, called once from __init__ when
+        `resume_from` is given. Fails loud when conpo_state.json is missing:
+        TRL's own resume would otherwise silently restore model/optimiser/
+        scheduler/rng/global_step and restart ConPO's own mechanism cold,
+        with an empty edge buffer and reset selection stats.
+        """
+        state_path = checkpoint_dir / self._CONPO_STATE_FILENAME
+        if not state_path.exists():
+            raise FileNotFoundError(
+                f"RUN_RESUME=1 but {state_path} is missing: this checkpoint has no ConPO state to "
+                "resume from (a TRL-only resume would silently restart the edge buffer, selection "
+                "stats and token budget empty)."
+            )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        edges_path = checkpoint_dir / self._CONPO_EDGES_FILENAME
+        if edges_path.exists():
+            self.edge_buffer.load(edges_path)
+        self.meter.budget = state["meter_budget"]
+        self.meter.total = state["meter_total"]
+        self.stats.load_state_dict(state["family_stats"])
+        self.feasible_buffer.load_state_dict(state["feasible_buffer"])
+        self.cumulative_admitted_edges = state["cumulative_admitted_edges"]
+        self._cumulative_reverse_admitted = state["cumulative_reverse_admitted"]
+        self._cumulative_multi_reverse_admitted = state["cumulative_multi_reverse_admitted"]
+        self._veto_seen_by_direction = Counter(state["veto_seen_by_direction"])
+        self._veto_rejected_by_direction = Counter(state["veto_rejected_by_direction"])
+        version, internal_state, gauss_next = state["rng_state"]
+        self.rng.setstate((version, tuple(internal_state), gauss_next))
+        self.wall_seconds_before_resume = state["wall_seconds"]
+        pair_stats_path = checkpoint_dir / self._CONPO_PAIR_STATS_FILENAME
+        if self.pair_stats is not None and pair_stats_path.exists():
+            self.pair_stats.load(pair_stats_path)
+
+        trainer_state_path = checkpoint_dir / "trainer_state.json"
+        resumed_step = None
+        if trainer_state_path.exists():
+            resumed_step = json.loads(trainer_state_path.read_text(encoding="utf-8"))["global_step"]
+        record = {
+            "event": "resume",
+            "checkpoint": str(checkpoint_dir),
+            "resumed_from_step": resumed_step,
+            "edge_buffer_size": len(self.edge_buffer),
+            "tokens_cumulative": self.meter.total,
+        }
+        with open(self.mechanism_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def cumulative_wall_seconds(self) -> float:
+        """Wall-clock seconds spent training this logical run, across every
+        RUN_RESUME process: whatever a prior process's conpo_state.json
+        recorded, plus this process's own elapsed time since construction."""
+        return self.wall_seconds_before_resume + (time.monotonic() - self._process_wall_start)
 
     def save_pair_stats(self) -> None:
         """Persist `self.pair_stats` to `<out_dir>/pair_stats.json` (H6 part

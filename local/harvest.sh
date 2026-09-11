@@ -14,8 +14,20 @@
 #   CONPO_RUNS_DIR    source directory (local/env.sh, node-local disk)
 #   KEEP_CHECKPOINTS  "1" to also copy checkpoint-*/ directories (default
 #                     "0": skipped, they are the largest and least useful
-#                     part of a harvested run)
+#                     part of a harvested run) -- REQUIRED for a resumable
+#                     copy: RUN_RESUME (scripts/train.py) needs a
+#                     checkpoint-N directory (weights, optimiser, and
+#                     ConPO's own conpo_state.json/conpo_edges.jsonl) to
+#                     resume from, and the default skips every one of them.
 #   DRY_RUN           "1" to print the rsync command lines only
+#
+# Resuming a harvested run (RUN_RESUME, devbox 2026-09-11): the node-local
+# disk is wiped about every 48 hours, so a run that outlives one wipe must
+# restart from a KEEP_CHECKPOINTS=1 harvest, either copied back under
+# CONPO_RUNS_DIR or pointed at directly with RUN_OUT_DIR=runs/<run>, then
+# relaunched with RUN_RESUME=1 (local/train.sh). To see the newest
+# checkpoint step a harvested run holds before resuming it:
+#   ls -d runs/<run>/checkpoint-*/ | sed 's#.*checkpoint-##;s#/##' | sort -n | tail -1
 
 set -euo pipefail
 source "$(dirname "$(readlink -f "$0")")/env.sh"

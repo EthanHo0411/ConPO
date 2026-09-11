@@ -63,6 +63,8 @@ export env only and never retype a value `scripts/train.py` can read from
 | `RUN_MAX_COMPLETION_TOKENS` | integer, default `config.MAX_COMPLETION_TOKENS` (1024) | `scripts/train.py`, also written to `run_metadata.json` as `max_completion_tokens`. Smoke and shape tests only -- cluster runs never set this. |
 | `RUN_EFFECTIVE_BATCH` | integer, default `config.EFFECTIVE_BATCH` (128) | `scripts/train.py`, also written to `run_metadata.json` as `effective_batch`. Smoke and shape tests only -- cluster runs never set this. |
 | `RUN_FULL_FT` | `1` | `scripts/train.py`, default `0` there: `1` trains every weight (`peft_config=None`) instead of a LoRA adapter, for the full-FT point-check (`local/train_fullft.sh`); recorded as `run_metadata.json`'s `full_ft`. Reference scoring runs under TRL's own `self.ref_model` instead of a disabled adapter (`conpo/trainer.py`'s `_reference_model`); see "What is verified on the devbox, and what is not". |
+| `RUN_RESUME` | `1` | `scripts/train.py`, default `0` there (fresh run): `1` resumes from the newest `checkpoint-N` under `RUN_OUT_DIR` (by `global_step` in its `trainer_state.json`), passed to `trainer.train(resume_from_checkpoint=...)` and to `ConPOTrainer(resume_from=...)`, which restores ConPO's own state (edge buffer, feasible buffer, family/selection stats, `PairStats`, token budget, cumulative counters, rng, wall time) from that checkpoint's `conpo_state.json`/`conpo_edges.jsonl`/`conpo_pair_stats.json`. Fails loud either way: a fresh run refuses a `RUN_OUT_DIR` that already holds a checkpoint (a wiped-and-restarted job must not silently start over), and `RUN_RESUME=1` refuses one that holds none. Recorded as `run_metadata.json`'s `resumed_from_step` (`null` for a fresh run); logs a `"resume"` event to `mechanism.jsonl`. Devbox 2026-09-11: the node-local disk is wiped about every 48 hours (see `local/harvest.sh`). |
+| `RUN_SAVE_STEPS` | integer, default `config.SAVE_STEPS` (25) | `scripts/train.py` (design choice, builder, 2026-09-11, same pattern as `RUN_VETO_PERIOD` overriding `config.VETO_PERIOD_K`): checkpoint cadence for `GRPOConfig(save_steps=...)`. Smoke and test knob only -- cluster runs never set it. |
 
 `conpo/arms.py:resolve_arm` and the `ConPOTrainer` it configures are
 exercised on CPU by `tests/test_trainer_tiny.py`, which constructs the
@@ -164,6 +166,12 @@ still wins over the default, as always.
    `$CONPO_RUNS_DIR/full_s42/`. Add ablation overrides the same way, e.g.
    `RUN_ARM=full RUN_NO_VETO=1 GPU=0 bash local/train.sh`. Once the run is
    worth keeping past the node-local wipe: `bash local/harvest.sh full_s42`.
+   If the node-local disk gets wiped mid-run, resume from that harvest
+   instead of restarting cold: `KEEP_CHECKPOINTS=1 bash local/harvest.sh
+   full_s42` (checkpoints are skipped by default), copy `runs/full_s42/`
+   back under `CONPO_RUNS_DIR` (or point `RUN_OUT_DIR` at it directly), then
+   `RUN_ARM=full RUN_SEED=42 RUN_RESUME=1 GPU=0 bash local/train.sh` -- see
+   the `RUN_RESUME` row above and `local/harvest.sh`'s header.
 
    **`RUN_JUDGE_MODE=http` fallback** (a resident judge server on the second
    H100, serialising every training run against it -- for comparison or
@@ -285,6 +293,9 @@ Still untested:
   `allenai/Olmo-3-7B-Instruct-SFT` and `allenai/Llama-3.1-Tulu-3-8B-SFT`
   are not staged.
 - `HFBatchedJudge` on a GPU (CPU tests only).
+- `RUN_RESUME` on the real devbox (unit- and CPU-tiny-tested only, `tests/
+  test_train_knobs.py`): resuming a real GPU checkpoint's LoRA adapter,
+  optimiser and scheduler state through TRL's own `resume_from_checkpoint`.
 
 Version note: trl 1.9.2 warns that it supports vLLM 0.17.0 to 0.25.1 while
 `uv.lock` pins vllm 0.26.0; colocate generation, the batched judge, and the

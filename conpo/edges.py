@@ -238,6 +238,15 @@ class FeasibleBuffer:
         if len(bucket) > self.per_prompt_cap:
             del bucket[0]
 
+    def state_dict(self) -> dict[str, list[str]]:
+        """JSON-safe snapshot of every prompt's response bucket (RUN_RESUME,
+        conpo/trainer.py's checkpoint persistence)."""
+        return {k: list(v) for k, v in self._by_prompt.items()}
+
+    def load_state_dict(self, state: Mapping[str, list[str]]) -> None:
+        """Inverse of state_dict; replaces this buffer's contents in place."""
+        self._by_prompt = {k: list(v) for k, v in state.items()}
+
     def sample_prompt(self, rng: random.Random) -> tuple[str, str]:
         prompt_id = rng.choice(list(self._by_prompt.keys()))
         response = rng.choice(self._by_prompt[prompt_id])
