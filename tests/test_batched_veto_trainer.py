@@ -388,19 +388,33 @@ def test_flush_pending_veto_burst_mean_edit_distance_averages_all_judged_pairs(t
     assert record["burst_mean_edit_distance"] == pytest.approx((0.1 + 0.3) / 2)
 
 
-def test_flush_pending_veto_dumps_up_to_8_judge_replies_with_expected_keys(tmp_path: Path) -> None:
+def _label_a_text(judge_request: str) -> str:
+    """Same technique as tests/test_judge.py's own `_label_a_text`: pull the
+    text build_veto_prompt put in the "Response A" slot, independent of
+    however the dumped record derived its own y_plus_label."""
+    start = judge_request.index("Response A:\n") + len("Response A:\n")
+    end = judge_request.index("\n\nResponse B:")
+    return judge_request[start:end]
+
+
+def test_flush_pending_veto_dumps_every_judged_pair_with_full_texts(tmp_path: Path) -> None:
+    """2026-09-11: extended from an 8-per-burst sample (design 2026-09-04
+    item 3) to a full per-burst audit log, so a rejected pair's texts (never
+    kept in edge_buffer) survive somewhere for a judge-prompt A/B test."""
     judge = _RecordingJudge(keep=True)
     trainer = _minimal_trainer(tmp_path, judge, out_dir=tmp_path)
     base_edge, base_req = _hand_built_edge(created_update=0)
+    reqs = []
     for i in range(10):
         edge = dataclasses.replace(base_edge, y_plus=f"response {i}")
         req = dataclasses.replace(base_req, y_plus=edge.y_plus)
+        reqs.append(req)
         trainer.pending_queue.push(PendingPair(edge=edge, request=req, direction="reverse"))
 
     trainer.flush_pending_veto()
 
     lines = [json.loads(line) for line in (tmp_path / "judge_replies.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert len(lines) == 8  # at most JUDGE_REPLY_DUMP_PER_BURST, not all 10
+    assert len(lines) == 10  # every judged pair, no cap
     expected_keys = {
         "step",
         "direction",
@@ -411,12 +425,30 @@ def test_flush_pending_veto_dumps_up_to_8_judge_replies_with_expected_keys(tmp_p
         "prompt_chars",
         "y_plus_chars",
         "y_minus_chars",
+        "prompt",
+        "y_plus",
+        "y_minus",
+        "judge_request",
+        "y_plus_label",
     }
-    for record in lines:
+    for record, req in zip(lines, reqs):  # pending_queue is FIFO, so order matches push order
         assert set(record.keys()) == expected_keys
         assert record["direction"] == "reverse"
         assert record["keep"] is True
         assert record["parse_ok"] is True
+        # Existing fields, unchanged.
+        assert record["prompt_chars"] == len(req.prompt)
+        assert record["y_plus_chars"] == len(req.y_plus)
+        assert record["y_minus_chars"] == len(req.y_minus)
+        # New fields: the full texts the judge saw, equal to the pair's own,
+        # plus which of Response A/B carried y_plus in judge_request.
+        assert record["prompt"] == req.prompt
+        assert record["y_plus"] == req.y_plus
+        assert record["y_minus"] == req.y_minus
+        assert req.prompt in record["judge_request"]
+        assert req.y_minus in record["judge_request"]
+        actual_label = "A" if _label_a_text(record["judge_request"]) == req.y_plus else "B"
+        assert record["y_plus_label"] == actual_label
 
 
 def test_flush_pending_veto_dump_does_not_pad_below_the_pair_count(tmp_path: Path) -> None:

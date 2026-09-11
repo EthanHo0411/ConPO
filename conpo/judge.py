@@ -196,6 +196,17 @@ def _prompt_seed(req: VetoRequest) -> int:
     return zlib.crc32(key.encode())
 
 
+def veto_plus_label(req: VetoRequest) -> str:
+    """The letter ("A" or "B") that carries y_plus in build_veto_prompt(req).
+
+    One source of truth for the per-request swap decision, shared by
+    build_veto_prompt and ConPOTrainer._dump_judge_replies, so a reader of
+    a judge reply can tell which response the verdict was about.
+    """
+    swap = random.Random(_prompt_seed(req)).random() < 0.5
+    return "B" if swap else "A"
+
+
 def build_veto_prompt(req: VetoRequest) -> str:
     """Build the veto prompt, showing y_plus/y_minus as Response A/B.
 
@@ -205,7 +216,7 @@ def build_veto_prompt(req: VetoRequest) -> str:
     text then names the letter carrying y_minus explicitly, so the judge is
     told exactly which response to evaluate rather than asked to infer it.
     """
-    swap = random.Random(_prompt_seed(req)).random() < 0.5
+    swap = veto_plus_label(req) == "B"
     a_text, b_text = (req.y_minus, req.y_plus) if swap else (req.y_plus, req.y_minus)
     minus_label, plus_label = ("A", "B") if swap else ("B", "A")
     ignore_list = "\n".join(f"- {d}" for d in req.descriptions)

@@ -44,15 +44,9 @@ from conpo.data import PoolRow, TokenMeter
 from conpo.distance import token_distance
 from conpo.edges import Edge, EdgeBuffer, FeasibleBuffer
 from conpo.engine import Engine
-from conpo.judge import PendingPair, PendingQueue, Verdict, VetoRequest, strip_think
+from conpo.judge import PendingPair, PendingQueue, Verdict, VetoRequest, build_veto_prompt, strip_think, veto_plus_label
 from conpo.selection import FamilyStats
 from conpo.verifiers import feasible, verifier_vector
-
-
-# Design 2026-09-04, item 3: at most this many judged pairs per burst get a
-# raw-reply sample written to RUN_OUT_DIR/judge_replies.jsonl -- a sample for
-# eyeballing judge behaviour, not a full audit log of every verdict.
-JUDGE_REPLY_DUMP_PER_BURST = 8
 
 
 def _pair_edit_distance(pair: PendingPair) -> float:
@@ -845,18 +839,34 @@ class ConPOTrainer(GRPOTrainer):
         return burst_seconds
 
     def _dump_judge_replies(self, pairs: Sequence[PendingPair], verdicts: Sequence[Verdict]) -> None:
-        """Append the first JUDGE_REPLY_DUMP_PER_BURST judged pairs of this
-        burst to `<out_dir>/judge_replies.jsonl` (design 2026-09-04, item 3):
-        a raw-reply sample for eyeballing judge behaviour on a small judge
-        model, not a full audit log of every verdict. No-op when `out_dir`
-        was never given to the constructor.
+        """Append every judged pair of this burst to `<out_dir>/judge_replies.jsonl`.
+
+        Extended 2026-09-11 from design 2026-09-04 item 3's 8-pair-per-burst
+        sample to a full per-burst audit log: a rejected pair never reaches
+        edge_buffer, so its texts existed nowhere else once dropped from
+        pending_queue, leaving no fixed corpus to A/B test a judge-prompt
+        change against. Every record now also carries the full texts the
+        judge saw -- `prompt`, `y_plus`, `y_minus`, and the exact rendered
+        `judge_request` -- plus `y_plus_label` ("A" or "B"): build_veto_prompt
+        swaps which letter carries y_plus per request (judge.py's
+        build_veto_prompt docstring), so a reader of `raw` otherwise cannot
+        tell which letter the judge's verdict was about. `judge_request` is
+        reproduced via build_veto_prompt(pair.request) rather than stored on
+        PendingPair: build_veto_prompt is a pure function of `request`'s own
+        fields (deterministic per pair, same swap decision every call -- see
+        judge.py's _prompt_seed), so this is exactly the string the judge
+        was sent. `step` (already present below) doubles as the burst index:
+        one flush writes one contiguous run of records at the same step.
+        No-op when `out_dir` was never given to the constructor.
         """
         if self.out_dir is None:
             return
         path = self.out_dir / "judge_replies.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
-            for pair, verdict in zip(pairs[:JUDGE_REPLY_DUMP_PER_BURST], verdicts[:JUDGE_REPLY_DUMP_PER_BURST]):
+            for pair, verdict in zip(pairs, verdicts):
+                judge_request = build_veto_prompt(pair.request)
+                y_plus_label = veto_plus_label(pair.request)
                 record = {
                     "step": self.state.global_step,
                     "direction": pair.direction,
@@ -867,6 +877,11 @@ class ConPOTrainer(GRPOTrainer):
                     "prompt_chars": len(pair.request.prompt),
                     "y_plus_chars": len(pair.request.y_plus),
                     "y_minus_chars": len(pair.request.y_minus),
+                    "prompt": pair.request.prompt,
+                    "y_plus": pair.request.y_plus,
+                    "y_minus": pair.request.y_minus,
+                    "judge_request": judge_request,
+                    "y_plus_label": y_plus_label,
                 }
                 f.write(json.dumps(record) + "\n")
 
