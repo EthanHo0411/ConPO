@@ -350,6 +350,12 @@ class ConPOTrainer(GRPOTrainer):
         # mechanism.jsonl record.
         self._phase_seconds: dict[str, float] = {}
         self._step_t0: float | None = None
+        # Engine-time breakdown (Ethan devbox perf pass, 2026-09-11): set to
+        # a zeroed dict only by _install_vllm_reload_guard,
+        # only when a colocated vLLM engine exists -- stays None for
+        # HFEngine/FakeEngine runs, so the per-step record's "engine_seconds"
+        # key is absent (not zeroed) for them. See _install_vllm_reload_guard.
+        self._engine_seconds: dict[str, float] | None = None
 
         reward_func = self.reward_conjunctive if arm.reward == "conjunctive" else self.reward_additive
         callbacks = list(kwargs.pop("callbacks", None) or [])
@@ -438,6 +444,19 @@ class ConPOTrainer(GRPOTrainer):
     # -----------------------------------------------------------------
 
     def _generate_and_score_completions(self, inputs: list[dict[str, object]]) -> dict[str, object]:
+        # Reset before super()'s own call, not after (unlike _phase_seconds
+        # below): TRL's rollout generation happens inside that call, through
+        # the same wrapped vllm_generation.generate/llm.wake_up/sleep the
+        # guard installed, so the accumulator must already read zero when
+        # that call starts or the rollout's own timings would be lost.
+        if self._engine_seconds is not None:
+            self._engine_seconds = {
+                "wake_reload_resync": 0.0,
+                "generate_only": 0.0,
+                "sleep": 0.0,
+                "generate_calls": 0,
+                "reload_calls": 0,
+            }
         t0 = time.perf_counter()
         output = super()._generate_and_score_completions(inputs)
         # Reset here, not in on_step_begin: TRL's own generation-batch cache
@@ -672,6 +691,11 @@ class ConPOTrainer(GRPOTrainer):
                 else 0.0
             ),
         }
+        # Not a copy, same reasoning as "phase_seconds" above: a same-step
+        # flush_pending_veto's _wake_engine() call may still touch the
+        # wrapped llm.wake_up after this dict is built.
+        if self._engine_seconds is not None:
+            record["engine_seconds"] = self._engine_seconds
         if self.pair_stats is not None and current_update % config.PROBE_PERIOD_S == 0:
             record["pair_stats_top_pairs"] = [list(row) for row in self.pair_stats.top_pairs(5)]
         # Stashed, not written here -- see the __init__ comment on
@@ -1001,6 +1025,48 @@ class ConPOTrainer(GRPOTrainer):
         `collective_rpc` receives (including one `sync_weights()` itself
         might make, e.g. `"load_weights"`) is forwarded to the original
         `collective_rpc` unchanged and does not re-trigger a resync.
+
+        Perf-pass instrumentation (Ethan devbox, 2026-09-11), logging only --
+        no change to what TRL/vLLM do: also wraps
+        `vllm_generation.generate` and `llm.wake_up`/`llm.sleep` (installed
+        together with the reload guard above, same marker, same early
+        returns) to fill `self._engine_seconds`, so the per-step mechanism
+        record can show where a step's time goes inside this path.
+        `VLLMGeneration.generate`'s colocate-mode body (vllm_generation.py
+        lines 536-548, 650-702) always runs, in order: `llm.wake_up(tags=
+        ["weights"])`, `collective_rpc("reload_weights")` (the guard above),
+        then, only under TP > 1, a distributed gather; `llm.wake_up(tags=
+        ["kv_cache"])`; the actual `llm.generate(...)` sampling call (not
+        wrapped -- vLLM's own `LLM.generate`, a different method from
+        `vllm_generation.generate`); `llm.sleep(level=2)`. So the call
+        (`tags=["kv_cache"])`'s wake_up marks the boundary between
+        "everything before sampling" and "sampling": `wake_reload_resync`
+        accumulates wall time from `vllm_generation.generate`'s own entry
+        through that call's return (covering the weights wake, the reload
+        rpc, the guard's resync above, and the kv_cache wake_up call
+        itself); `generate_only` accumulates from that same return to
+        `llm.sleep`'s start; `sleep` accumulates time spent inside
+        `llm.sleep` itself. `generate_calls` counts every
+        `vllm_generation.generate` call (TRL's own rollout and every
+        `VLLMColocateEngine.generate` call alike, conpo/engine.py -- the
+        same object either way); `reload_calls` counts every
+        `"reload_weights"` the guard above resynced after.
+        `enable_sleep_mode=False` (vllm_enable_sleep_mode off) means TRL
+        never calls wake_up/collective_rpc/sleep at all: no kv_cache wake
+        ever fires that call, so the whole call is attributed to
+        `generate_only` instead (the fallback branch in `_timed_generate`
+        below) rather than left unmeasured.
+        # ponytail: an exception raised between the kv_cache wake_up and
+        # llm.sleep (mid-sampling) leaves that slice of wall time
+        # unattributed -- accept the undercount for a logging-only counter
+        # rather than a try/finally that would also have to guess which
+        # bucket an interrupted call belongs in.
+        `wake_up`/`sleep`/`generate` are wrapped defensively (`getattr` +
+        `callable`, independently of each other): a caller-supplied fake
+        `llm`/`vllm_generation` (tests/test_vllm_reload_guard.py's minimal
+        `_FakeLLM`, which predates this change and defines only
+        `collective_rpc`) still gets the reload guard with no
+        AttributeError, only no engine_seconds timing.
         """
         vllm_generation = getattr(self, "vllm_generation", None)
         llm = getattr(vllm_generation, "llm", None)
@@ -1010,14 +1076,83 @@ class ConPOTrainer(GRPOTrainer):
         if getattr(llm, "_conpo_reload_guard_installed", False):
             return
 
+        self._engine_seconds = {
+            "wake_reload_resync": 0.0,
+            "generate_only": 0.0,
+            "sleep": 0.0,
+            "generate_calls": 0,
+            "reload_calls": 0,
+        }
+        # Per-call markers the wake_up/sleep/generate wrappers below hand off
+        # through: generate() calls never overlap (one training process, no
+        # concurrent sampling), so instance attributes are enough state.
+        self._engine_gen_t0: float | None = None
+        self._engine_kv_wake_done_t: float | None = None
+        self._engine_kv_wake_seen = False
+
         def _reload_then_resync(method: str, *args: Any, **kwargs: Any) -> Any:
             result = original_collective_rpc(method, *args, **kwargs)
             if method == "reload_weights":
                 vllm_generation.sync_weights()
+                self._engine_seconds["reload_calls"] += 1  # type: ignore[index]
             return result
 
         llm.collective_rpc = _reload_then_resync
         llm._conpo_reload_guard_installed = True
+
+        original_wake_up = getattr(llm, "wake_up", None)
+        original_sleep = getattr(llm, "sleep", None)
+        original_generate = getattr(vllm_generation, "generate", None)
+
+        if callable(original_wake_up):
+
+            def _timed_wake_up(*args: Any, **kwargs: Any) -> Any:
+                tags = kwargs.get("tags") or (args[0] if args else None)
+                is_kv_cache_wake = self._engine_gen_t0 is not None and bool(tags) and "kv_cache" in tags
+                result = original_wake_up(*args, **kwargs)
+                if is_kv_cache_wake:
+                    now = time.perf_counter()
+                    self._engine_seconds["wake_reload_resync"] += (  # type: ignore[index]
+                        now - self._engine_gen_t0
+                    )
+                    self._engine_kv_wake_done_t = now
+                    self._engine_kv_wake_seen = True
+                return result
+
+            llm.wake_up = _timed_wake_up
+
+        if callable(original_sleep):
+
+            def _timed_sleep(*args: Any, **kwargs: Any) -> Any:
+                t0 = time.perf_counter()
+                if self._engine_kv_wake_done_t is not None:
+                    self._engine_seconds["generate_only"] += t0 - self._engine_kv_wake_done_t  # type: ignore[index]
+                    self._engine_kv_wake_done_t = None
+                result = original_sleep(*args, **kwargs)
+                self._engine_seconds["sleep"] += time.perf_counter() - t0  # type: ignore[index]
+                return result
+
+            llm.sleep = _timed_sleep
+
+        if callable(original_generate):
+
+            def _timed_generate(*args: Any, **kwargs: Any) -> Any:
+                self._engine_seconds["generate_calls"] += 1  # type: ignore[index]
+                self._engine_gen_t0 = time.perf_counter()
+                self._engine_kv_wake_seen = False
+                self._engine_kv_wake_done_t = None
+                try:
+                    return original_generate(*args, **kwargs)
+                finally:
+                    if not self._engine_kv_wake_seen:
+                        # Sleep mode disabled this call: no wake/reload/sleep
+                        # boundary fired, so the whole call is generation work.
+                        self._engine_seconds["generate_only"] += (  # type: ignore[index]
+                            time.perf_counter() - self._engine_gen_t0
+                        )
+                    self._engine_gen_t0 = None
+
+            vllm_generation.generate = _timed_generate
 
     def _save_checkpoint(self, model: torch.nn.Module, trial: object) -> None:
         """Flush before every checkpoint save (USER DECISIONS 2026-09-02),
@@ -1342,6 +1477,16 @@ class ConPOTrainer(GRPOTrainer):
         total = config.LAMBDA_G * clean
         current_update = self.state.global_step
         stats: dict[str, float] = {"clean_loss": clean.item()}
+        # Perf-pass instrumentation (Ethan devbox, 2026-09-11): wall time and
+        # forward-pass count for this micro-batch's own pair-loss scoring
+        # below (_score_edge_pairs, _prompt_margins), one model(...) forward
+        # per score_response call at batch size 1 each (conpo/losses.py's
+        # sequence_logprobs). Local, not accumulated across the accumulation
+        # cycle's other micro-batches: matches how "stats" above already
+        # only reaches the mechanism record from the one micro-batch that
+        # finds _pending_mechanism_record set (see the write below).
+        pair_scoring_seconds = 0.0
+        pair_scoring_forwards = 0
 
         # config.EDGE_PAIRS_PER_STEP / PROMPT_PAIRS_PER_STEP are per-OPTIMISER-step
         # budgets (config.py), but compute_loss runs once per micro-batch under
@@ -1361,7 +1506,10 @@ class ConPOTrainer(GRPOTrainer):
         if self.arm.resp_loss and len(self.edge_buffer) > 0:
             resp_edges = self.edge_buffer.sample(edge_n, current_update, self.rng, balanced=True)
             if resp_edges:
+                _t_score = time.perf_counter()
                 delta, ages = self._score_edge_pairs(model, resp_edges)
+                pair_scoring_seconds += time.perf_counter() - _t_score
+                pair_scoring_forwards += 2 * len(resp_edges)  # score_response(y_plus), score_response(y_minus)
                 loss_resp, resp_stats = losses.resp_loss(
                     delta, ages, tau=config.TAU, gamma=config.GAMMA, kappa=config.KAPPA
                 )
@@ -1397,7 +1545,14 @@ class ConPOTrainer(GRPOTrainer):
                 # out. Only the weighted contribution to `total` is gated on
                 # lambda_p > 0 -- that is what "ablates L_prompt's
                 # contribution" (arms.py's Overrides docstring) means.
+                _t_score = time.perf_counter()
                 m_plus, m_minus = self._prompt_margins(model, prompt_edges)
+                pair_scoring_seconds += time.perf_counter() - _t_score
+                # Per edge: score_response(x+,y+), score_response(x+,y-),
+                # score_response(x-,y+), score_response(x-,y-), and the two
+                # ref_model score_response calls for (x-,y+)/(x-,y-) --
+                # _prompt_margins' x+ side reuses the edge's cached logp_ref_*.
+                pair_scoring_forwards += 6 * len(prompt_edges)
                 loss_prompt, prompt_stats = losses.prompt_loss(
                     m_plus, m_minus, tau_p=config.TAU_P, lambda_0=config.LAMBDA_0
                 )
@@ -1412,6 +1567,8 @@ class ConPOTrainer(GRPOTrainer):
 
         if self._pending_mechanism_record is not None:
             self._pending_mechanism_record.update({k: v for k, v in stats.items() if k.startswith("prompt_")})
+            self._pending_mechanism_record["pair_scoring_seconds"] = pair_scoring_seconds
+            self._pending_mechanism_record["pair_scoring_forwards"] = pair_scoring_forwards
             with open(self.mechanism_log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(self._pending_mechanism_record) + "\n")
             self._pending_mechanism_record = None

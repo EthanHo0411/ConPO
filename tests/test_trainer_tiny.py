@@ -415,6 +415,7 @@ def test_compute_loss_halves_edge_sample_and_runs_probe_once_per_step(
     # cadence from the counterfactual-construction machinery.
     arm = ArmSpec(reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=True)
     edge_buffer = EdgeBuffer()
+    mechanism_log_path = tmp_path / "mechanism.jsonl"
 
     trainer = ConPOTrainer(
         model=model,
@@ -429,7 +430,7 @@ def test_compute_loss_halves_edge_sample_and_runs_probe_once_per_step(
         judge=StaticJudge(keep=True),
         engine_factory=_engine_factory,
         meter=TokenMeter(budget=0),
-        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        mechanism_log_path=mechanism_log_path,
         seed=0,
         overrides=Overrides(),
         peft_config=_lora_config(),
@@ -472,6 +473,24 @@ def test_compute_loss_halves_edge_sample_and_runs_probe_once_per_step(
     # Both compute_loss calls share global_step == 0 (it advances only after
     # the optimizer step completes), so the probe must fire exactly once.
     assert probe_calls == [0]
+
+    # Round2 finding 2: pair_scoring_seconds/pair_scoring_forwards
+    # (conpo/trainer.py's compute_loss) cover _score_edge_pairs's
+    # score_response calls -- 2 forwards per resp edge (y_plus, y_minus).
+    # Only the accumulation cycle's first compute_loss call's local totals
+    # reach the mechanism record (compute_loss clears
+    # _pending_mechanism_record right after writing it), and that call
+    # samples the same 2 resp_edges as the second (sample_calls == [2, 2]
+    # above), so the expected count does not depend on which micro-batch's
+    # record survives. This arm has prompt_loss=False, so no
+    # 6*len(prompt_edges) term applies.
+    records = [
+        json.loads(line) for line in mechanism_log_path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    records = [r for r in records if "event" not in r]
+    assert len(records) == 1
+    assert records[0]["pair_scoring_forwards"] == 4
+    assert records[0]["pair_scoring_seconds"] > 0.0
 
 
 # ---------------------------------------------------------------------------

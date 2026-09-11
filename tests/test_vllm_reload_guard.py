@@ -14,10 +14,16 @@ fast, real ConPOTrainer on CPU), then a fake `vllm_generation` is attached
 after construction to exercise the guard's wrapping behaviour in isolation.
 GPU-side verification (the reload restoring the right log-probs) lives
 outside pytest, in scripts/diag_logp.py.
+
+Perf-pass instrumentation (Ethan devbox, 2026-09-11): `_FakeLLM`/
+`_FakeVLLMGeneration` also stand in for `wake_up`/`sleep`/`generate`, so
+`test_engine_seconds_accumulates_across_generate_calls` below can exercise
+the same guard's `self._engine_seconds` timing without a GPU either.
 """
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -106,13 +112,20 @@ def _build_trainer(tmp_path: Path) -> ConPOTrainer:
 
 
 class _FakeLLM:
-    """Stand-in for `vllm.LLM`: records every `collective_rpc` method name."""
+    """Stand-in for `vllm.LLM`: records every `collective_rpc` method name,
+    plus (perf-pass instrumentation, 2026-09-11) `wake_up`/`sleep` calls."""
 
     def __init__(self) -> None:
         self.calls: list[str] = []
 
     def collective_rpc(self, method: str, *args: Any, **kwargs: Any) -> None:
         self.calls.append(method)
+
+    def wake_up(self, *args: Any, **kwargs: Any) -> None:
+        self.calls.append(f"wake_up:{kwargs.get('tags')}")
+
+    def sleep(self, *args: Any, **kwargs: Any) -> None:
+        self.calls.append("sleep")
 
 
 class _FakeVLLMGeneration:
@@ -123,6 +136,18 @@ class _FakeVLLMGeneration:
 
     def sync_weights(self) -> None:
         self.llm.calls.append("sync")
+
+    def generate(self, *args: Any, **kwargs: Any) -> str:
+        """Mimics `VLLMGeneration.generate`'s colocate-mode body (trl
+        vllm_generation.py lines 536-548, 650-702): wake weights, reload,
+        wake kv_cache, sample (here: a few ms sleep standing in for vLLM's
+        own `llm.generate` call), then sleep(level=2)."""
+        self.llm.wake_up(tags=["weights"])
+        self.llm.collective_rpc("reload_weights")
+        self.llm.wake_up(tags=["kv_cache"])
+        time.sleep(0.005)
+        self.llm.sleep(level=2)
+        return "generated"
 
 
 def test_reload_weights_triggers_resync(tmp_path: Path) -> None:
@@ -164,3 +189,37 @@ def test_trainer_without_vllm_generation_installs_nothing(tmp_path: Path) -> Non
     assert not hasattr(trainer, "vllm_generation")  # RUN_USE_VLLM=0: trl never sets it
 
     trainer._install_vllm_reload_guard()  # must not raise
+    # HFEngine run: no colocated vLLM engine ever existed, so the per-step
+    # record must never carry an "engine_seconds" key (2026-09-11 perf pass).
+    assert trainer._engine_seconds is None
+
+
+def test_engine_seconds_accumulates_across_generate_calls(tmp_path: Path) -> None:
+    """`_install_vllm_reload_guard`'s wake_up/sleep/generate wrapping
+    (Ethan devbox perf pass, 2026-09-11): two `generate()` calls, each
+    going through the real trl colocate sequence via `_FakeVLLMGeneration`
+    above (wake weights, reload, wake kv_cache, ~5ms of "sampling", sleep),
+    accumulate wake_reload_resync/generate_only/sleep seconds and bump
+    generate_calls/reload_calls -- the same wrapped callables
+    conpo/engine.py's `VLLMColocateEngine.generate` and TRL's own rollout
+    both call through in a real run."""
+    trainer = _build_trainer(tmp_path)
+    llm = _FakeLLM()
+    trainer.vllm_generation = _FakeVLLMGeneration(llm)
+    trainer._install_vllm_reload_guard()
+
+    trainer.vllm_generation.generate()
+    trainer.vllm_generation.generate()
+
+    seconds = trainer._engine_seconds
+    assert seconds is not None
+    assert seconds["generate_calls"] == 2
+    assert seconds["reload_calls"] == 2
+    # Two ~5ms "sampling" sleeps, each between the kv_cache wake and
+    # llm.sleep -- time.sleep(x) never returns before x seconds elapse.
+    assert seconds["generate_only"] >= 0.008
+    assert seconds["wake_reload_resync"] >= 0.0
+    assert seconds["sleep"] >= 0.0
+    # The reload guard's own effect (test_reload_weights_triggers_resync's
+    # assertion) still holds with the extra wrapping installed.
+    assert llm.calls.count("sync") == 2
