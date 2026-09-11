@@ -32,24 +32,52 @@ from pathlib import Path
 from typing import Any
 
 from conpo import config
-from conpo.judge import VLLMBatchedJudge, Verdict, _fail_closed_verdict, parse_verdict, strip_think
+from conpo.judge import VETO_JSON_INSTRUCTION, VLLMBatchedJudge, Verdict, _fail_closed_verdict, parse_verdict, strip_think
 
 # ---------------------------------------------------------------------------
 # Prompt variants: each is a pure function of the rendered judge_request
 # string, doing surgery on one of build_veto_prompt's (conpo/judge.py) fixed
-# anchors. Every anchor below is copied here as a literal (or a regex over
-# the two possible A/B swaps) rather than imported, so a wording change in
-# build_veto_prompt is caught loudly here instead of silently inserting a
+# anchors. The JSON-instruction anchor is VETO_JSON_INSTRUCTION, imported
+# from conpo.judge rather than copied here, so it always matches the
+# checklist instruction build_veto_prompt actually renders (user decision
+# 2026-09-11). The A/B-swap sentences below are still copied as a literal
+# (or a regex over the two possible swaps) rather than imported, so a
+# wording change there is caught loudly here instead of silently inserting a
 # variant sentence in the wrong place, or not at all.
 # ---------------------------------------------------------------------------
 
 _MISSING_ANCHOR_SUFFIX = "; check conpo/judge.py's build_veto_prompt for a wording change."
 
-# The final paragraph's exact text, fixed regardless of the A/B swap.
-_JSON_INSTRUCTION_ANCHOR = (
+# The pre-2026-09-11 two-key instruction. build_veto_prompt no longer renders
+# this, so it is no longer an anchor to detect -- it is the legacy_json
+# variant's replacement text, and the signature `_require_json_anchor` below
+# checks for to recognize a legacy (pre-checklist) judge_replies log.
+_LEGACY_JSON_INSTRUCTION = (
     "Answer with a single JSON object and nothing else: "
     '{"degenerate": true or false, "reason": "one short sentence"}'
 )
+
+_LEGACY_LOG_ERROR = (
+    "judge_request carries the pre-2026-09-11 two-key JSON instruction, not "
+    "VETO_JSON_INSTRUCTION: this is a legacy judge_replies log from before the "
+    "checklist instruction change and cannot be re-judged with this variant."
+)
+
+
+def _require_json_anchor(text: str) -> None:
+    """Raise loud if `text` lacks the current JSON-instruction anchor
+    (VETO_JSON_INSTRUCTION), distinguishing a legacy (pre-checklist) log --
+    one that instead carries _LEGACY_JSON_INSTRUCTION -- from an unrelated
+    wording change in build_veto_prompt."""
+    if VETO_JSON_INSTRUCTION in text:
+        return
+    if _LEGACY_JSON_INSTRUCTION in text:
+        raise ValueError(_LEGACY_LOG_ERROR)
+    raise ValueError(
+        "judge_request is missing build_veto_prompt's JSON-format instruction "
+        f"anchor paragraph verbatim{_MISSING_ANCHOR_SUFFIX}"
+    )
+
 
 # build_veto_prompt swaps which letter carries y_minus per request
 # (judge.py's veto_plus_label), so the paragraph naming "Response X is a
@@ -83,29 +111,18 @@ _EXPLICIT_EXCLUSIONS_TEMPLATE = (
     "expected and must be answered degenerate=false.\n\n"
 )
 
-_CHECKLIST_JSON_INSTRUCTION = (
-    "Answer with a single JSON object and nothing else: "
-    '{"truncated": true or false, "garbled": true or false, '
-    '"off_task": true or false, "meaning_changed_beyond_constraints": true or false, '
-    '"degenerate": true or false, "reason": "one short sentence"}. '
-    "Set degenerate to true only if at least one of the four checks is true."
-)
+# checklist_json has no constant of its own any more: build_veto_prompt's
+# baseline already renders VETO_JSON_INSTRUCTION (the four-key checklist), so
+# checklist_json is now the identity variant (see VARIANT_FUNCS below).
 
-# checklist_json with one binding sentence inserted before the JSON object,
-# tying the four checks explicitly to the listed-constraint exclusions.
+# checklist_inline_exclusions' binding sentence, tying the four checks
+# explicitly to the listed-constraint exclusions. Inserted before
+# VETO_JSON_INSTRUCTION, same pattern as _IGNORE_CONSTRAINTS_SENTENCE.
 _CHECKLIST_INLINE_EXCLUSIONS_SENTENCE = (
     "A difference that consists only of satisfying or violating one of the listed constraints "
     "(a missing or added keyword, a changed first or last word, punctuation, letter case, a "
     "heading, a postscript, paragraph or section breaks, bullet formatting, length, language, "
     "a quoted or wrapped answer) counts as none of the four checks."
-)
-_CHECKLIST_INLINE_EXCLUSIONS_INSTRUCTION = (
-    "Answer with a single JSON object and nothing else: "
-    f"{_CHECKLIST_INLINE_EXCLUSIONS_SENTENCE} "
-    '{"truncated": true or false, "garbled": true or false, '
-    '"off_task": true or false, "meaning_changed_beyond_constraints": true or false, '
-    '"degenerate": true or false, "reason": "one short sentence"}. '
-    "Set degenerate to true only if at least one of the four checks is true."
 )
 
 # Generic worked examples (not from any real pair), under 80 words each, in
@@ -129,12 +146,8 @@ _EXAMPLE_2 = (
 
 
 def _apply_ignore_constraints(text: str) -> str:
-    if _JSON_INSTRUCTION_ANCHOR not in text:
-        raise ValueError(
-            "judge_request is missing build_veto_prompt's JSON-format instruction "
-            f"anchor paragraph verbatim{_MISSING_ANCHOR_SUFFIX}"
-        )
-    return text.replace(_JSON_INSTRUCTION_ANCHOR, f"{_IGNORE_CONSTRAINTS_SENTENCE}\n\n{_JSON_INSTRUCTION_ANCHOR}", 1)
+    _require_json_anchor(text)
+    return text.replace(VETO_JSON_INSTRUCTION, f"{_IGNORE_CONSTRAINTS_SENTENCE}\n\n{VETO_JSON_INSTRUCTION}", 1)
 
 
 def _apply_explicit_exclusions(text: str) -> str:
@@ -148,22 +161,18 @@ def _apply_explicit_exclusions(text: str) -> str:
     return text[: match.start()] + replacement + text[match.end() :]
 
 
-def _apply_checklist_json(text: str) -> str:
-    if _JSON_INSTRUCTION_ANCHOR not in text:
-        raise ValueError(
-            "judge_request is missing build_veto_prompt's JSON-format instruction "
-            f"anchor paragraph verbatim{_MISSING_ANCHOR_SUFFIX}"
-        )
-    return text.replace(_JSON_INSTRUCTION_ANCHOR, _CHECKLIST_JSON_INSTRUCTION, 1)
+def _apply_legacy_json(text: str) -> str:
+    """Replace the current checklist instruction with the pre-2026-09-11
+    two-key instruction, to A/B the old wording against the new baseline."""
+    _require_json_anchor(text)
+    return text.replace(VETO_JSON_INSTRUCTION, _LEGACY_JSON_INSTRUCTION, 1)
 
 
 def _apply_checklist_inline_exclusions(text: str) -> str:
-    if _JSON_INSTRUCTION_ANCHOR not in text:
-        raise ValueError(
-            "judge_request is missing build_veto_prompt's JSON-format instruction "
-            f"anchor paragraph verbatim{_MISSING_ANCHOR_SUFFIX}"
-        )
-    return text.replace(_JSON_INSTRUCTION_ANCHOR, _CHECKLIST_INLINE_EXCLUSIONS_INSTRUCTION, 1)
+    _require_json_anchor(text)
+    return text.replace(
+        VETO_JSON_INSTRUCTION, f"{_CHECKLIST_INLINE_EXCLUSIONS_SENTENCE}\n\n{VETO_JSON_INSTRUCTION}", 1
+    )
 
 
 def _apply_two_examples(text: str) -> str:
@@ -181,10 +190,17 @@ def _apply_two_examples(text: str) -> str:
 VARIANT_FUNCS: dict[str, Callable[[str], str]] = {
     "ignore_constraints": _apply_ignore_constraints,
     "explicit_exclusions": _apply_explicit_exclusions,
-    "checklist_json": _apply_checklist_json,
+    # The baseline (build_veto_prompt) already renders VETO_JSON_INSTRUCTION,
+    # the four-key checklist, so checklist_json is now a no-op -- kept as a
+    # named variant so existing --variant invocations and reports stay valid.
+    "checklist_json": lambda t: t,
+    "legacy_json": _apply_legacy_json,
     "two_examples": _apply_two_examples,
     "ignore_plus_exclusions": lambda t: _apply_ignore_constraints(_apply_explicit_exclusions(t)),
-    "checklist_plus_exclusions": lambda t: _apply_checklist_json(_apply_explicit_exclusions(t)),
+    # checklist_json is now a no-op, so this is just explicit_exclusions
+    # applied to the (already checklist-shaped) baseline -- same result as
+    # before on logs rendered after the 2026-09-11 checklist change.
+    "checklist_plus_exclusions": _apply_explicit_exclusions,
     "checklist_inline_exclusions": _apply_checklist_inline_exclusions,
 }
 VARIANT_NAMES: tuple[str, ...] = tuple(VARIANT_FUNCS)

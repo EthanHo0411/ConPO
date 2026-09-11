@@ -207,6 +207,22 @@ def veto_plus_label(req: VetoRequest) -> str:
     return "B" if swap else "A"
 
 
+# The verdict instruction (user decision 2026-09-11 after the judge template
+# smoke test on 302 logged pairs scored against reader labels): four explicit
+# checks before the verdict halved the false-veto rate on constraint-only
+# pairs (1.00 -> 0.51) without losing a real degeneracy, where the plain
+# "ignore the constraints" reminder barely helped (0.84) and worked examples
+# hurt. Kept as one constant so scripts/rejudge.py can anchor its variants
+# on it; the legacy instruction lives there as the `legacy_json` variant.
+VETO_JSON_INSTRUCTION = (
+    "Answer with a single JSON object and nothing else: "
+    '{"truncated": true or false, "garbled": true or false, '
+    '"off_task": true or false, "meaning_changed_beyond_constraints": true or false, '
+    '"degenerate": true or false, "reason": "one short sentence"}. '
+    "Set degenerate to true only if at least one of the four checks is true."
+)
+
+
 def build_veto_prompt(req: VetoRequest) -> str:
     """Build the veto prompt, showing y_plus/y_minus as Response A/B.
 
@@ -234,8 +250,7 @@ def build_veto_prompt(req: VetoRequest) -> str:
         "DEGENERATE: truncated, garbled, off-task, or changed in meaning "
         f"beyond the ignored constraints above, compared with response "
         f"{plus_label}.\n\n"
-        "Answer with a single JSON object and nothing else: "
-        '{"degenerate": true or false, "reason": "one short sentence"}'
+        + VETO_JSON_INSTRUCTION
     )
 
 

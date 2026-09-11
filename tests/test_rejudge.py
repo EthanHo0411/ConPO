@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from conpo import config
-from conpo.judge import VetoRequest, Verdict, build_veto_prompt, veto_plus_label
+from conpo.judge import VETO_JSON_INSTRUCTION, VetoRequest, Verdict, build_veto_prompt, veto_plus_label
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
@@ -65,17 +65,44 @@ def test_apply_variant_unknown_variant_raises() -> None:
         rejudge.apply_variant("anything", "not_a_real_variant")
 
 
-@pytest.mark.parametrize("variant", rejudge.VARIANT_NAMES)
-def test_apply_variant_missing_anchor_raises_for_every_known_variant(variant: str) -> None:
+# checklist_json is the one variant that never inspects the JSON-instruction
+# anchor (it is the identity transform), so it is excluded from the
+# missing-anchor parametrization below and gets its own identity test.
+_ANCHOR_REQUIRED_VARIANTS = tuple(v for v in rejudge.VARIANT_NAMES if v != "checklist_json")
+
+
+@pytest.mark.parametrize("variant", _ANCHOR_REQUIRED_VARIANTS)
+def test_apply_variant_missing_anchor_raises_for_every_anchor_required_variant(variant: str) -> None:
     with pytest.raises(ValueError):
         rejudge.apply_variant("no anchor text here at all", variant)
+
+
+def test_checklist_json_is_the_identity_variant() -> None:
+    # build_veto_prompt's baseline already renders VETO_JSON_INSTRUCTION, so
+    # checklist_json has nothing left to do -- not even on text with no
+    # recognizable anchor at all.
+    assert rejudge.apply_variant("no anchor text here at all", "checklist_json") == "no anchor text here at all"
+    request, _, _ = _rendered_and_labels()
+    assert rejudge.apply_variant(request, "checklist_json") == request
+
+
+@pytest.mark.parametrize("variant", ["ignore_constraints", "legacy_json", "checklist_inline_exclusions", "ignore_plus_exclusions"])
+def test_legacy_instruction_request_fails_loud_naming_legacy_logs(variant: str) -> None:
+    """A judge_request carrying the pre-2026-09-11 two-key instruction (a
+    legacy judge_replies log) must fail loud, with a message that names it
+    as a legacy log, rather than the generic missing-anchor message."""
+    request, _, _ = _rendered_and_labels()
+    legacy_request = request.replace(VETO_JSON_INSTRUCTION, rejudge._LEGACY_JSON_INSTRUCTION)
+    assert legacy_request != request  # the replacement actually did something
+    with pytest.raises(ValueError, match="legacy"):
+        rejudge.apply_variant(legacy_request, variant)
 
 
 def test_ignore_constraints_inserts_sentence_once_before_json_anchor() -> None:
     request, _, _ = _rendered_and_labels()
     out = rejudge.apply_variant(request, "ignore_constraints")
     assert out.count(rejudge._IGNORE_CONSTRAINTS_SENTENCE) == 1
-    assert out.index(rejudge._IGNORE_CONSTRAINTS_SENTENCE) < out.index(rejudge._JSON_INSTRUCTION_ANCHOR)
+    assert out.index(rejudge._IGNORE_CONSTRAINTS_SENTENCE) < out.index(VETO_JSON_INSTRUCTION)
     assert "Rivers flow, apple trees grow" in out  # rest of the prompt intact
 
 
@@ -86,14 +113,14 @@ def test_explicit_exclusions_replaces_judge_only_sentence_once_with_correct_labe
     assert out.count(expected) == 1
     assert "DEGENERATE: truncated, garbled, off-task, or changed in meaning" not in out
     assert f"Response {minus} is a deliberately modified variant of response {plus}." in out  # first sentence intact
-    assert rejudge._JSON_INSTRUCTION_ANCHOR in out  # untouched
+    assert VETO_JSON_INSTRUCTION in out  # untouched
 
 
-def test_checklist_json_replaces_json_instruction_once() -> None:
+def test_legacy_json_replaces_checklist_instruction_with_old_two_key_instruction_once() -> None:
     request, _, _ = _rendered_and_labels()
-    out = rejudge.apply_variant(request, "checklist_json")
-    assert out.count(rejudge._CHECKLIST_JSON_INSTRUCTION) == 1
-    assert rejudge._JSON_INSTRUCTION_ANCHOR not in out
+    out = rejudge.apply_variant(request, "legacy_json")
+    assert out.count(rejudge._LEGACY_JSON_INSTRUCTION) == 1
+    assert VETO_JSON_INSTRUCTION not in out
 
 
 def test_two_examples_inserts_both_examples_once_before_lead_sentence() -> None:
@@ -113,27 +140,29 @@ def test_ignore_plus_exclusions_applies_variants_1_and_2_together() -> None:
     assert "DEGENERATE: truncated, garbled, off-task, or changed in meaning" not in out
 
 
-def test_checklist_plus_exclusions_applies_explicit_exclusions_then_checklist_json_once() -> None:
+def test_checklist_plus_exclusions_is_explicit_exclusions_on_the_checklist_baseline() -> None:
+    # checklist_json is now a no-op (the baseline already carries
+    # VETO_JSON_INSTRUCTION), so checklist_plus_exclusions collapses to
+    # exactly explicit_exclusions -- same result as before on logs rendered
+    # after the 2026-09-11 checklist change.
     request, minus, plus = _rendered_and_labels()
     original = request
     out = rejudge.apply_variant(request, "checklist_plus_exclusions")
     excl = rejudge._EXPLICIT_EXCLUSIONS_TEMPLATE.format(minus=minus, plus=plus)
     assert out.count(excl) == 1
-    assert out.count(rejudge._CHECKLIST_JSON_INSTRUCTION) == 1
-    assert out.index(excl) < out.index(rejudge._CHECKLIST_JSON_INSTRUCTION)  # applied in order
-    assert rejudge._JSON_INSTRUCTION_ANCHOR not in out
+    assert out == rejudge.apply_variant(request, "explicit_exclusions")
+    assert VETO_JSON_INSTRUCTION in out  # checklist instruction untouched
     assert "DEGENERATE: truncated, garbled, off-task, or changed in meaning" not in out
     assert request == original  # baseline untouched
 
 
-def test_checklist_inline_exclusions_inserts_binding_sentence_before_json_object_once() -> None:
+def test_checklist_inline_exclusions_inserts_binding_sentence_before_anchor_once() -> None:
     request, _, _ = _rendered_and_labels()
     original = request
     out = rejudge.apply_variant(request, "checklist_inline_exclusions")
-    assert out.count(rejudge._CHECKLIST_INLINE_EXCLUSIONS_INSTRUCTION) == 1
     assert out.count(rejudge._CHECKLIST_INLINE_EXCLUSIONS_SENTENCE) == 1
-    assert out.index(rejudge._CHECKLIST_INLINE_EXCLUSIONS_SENTENCE) < out.index('"truncated"')  # sentence before the JSON object
-    assert rejudge._JSON_INSTRUCTION_ANCHOR not in out
+    assert out.index(rejudge._CHECKLIST_INLINE_EXCLUSIONS_SENTENCE) < out.index(VETO_JSON_INSTRUCTION)
+    assert out.count(VETO_JSON_INSTRUCTION) == 1  # untouched, just preceded by the sentence
     assert request == original  # baseline untouched
 
 
@@ -326,7 +355,7 @@ def _reply_record(index: int, step: int, direction: str, keep: bool, families: l
         "prompt": f"prompt {request_id}",
         "y_plus": "plus text",
         "y_minus": "minus text",
-        "judge_request": f"record {request_id} body.\n\n{rejudge._JSON_INSTRUCTION_ANCHOR}",
+        "judge_request": f"record {request_id} body.\n\n{VETO_JSON_INSTRUCTION}",
         "y_plus_label": "A",
     }
 
@@ -338,7 +367,10 @@ def _build_fake_judge(
     variant_keeps: dict[str, list[bool]],
 ) -> tuple[rejudge.JudgeFn, list[list[str]]]:
     """A judge_fn keyed by exact rendered-prompt text, plus the list of
-    prompt-list arguments it was called with (to assert one combined call)."""
+    prompt-list arguments it was called with (to assert one combined call).
+    Do not pass "checklist_json" here: it is the identity variant, so its
+    rendered text collides with the baseline's and would overwrite it in
+    this dict."""
     verdict_by_prompt: dict[str, Verdict] = {}
     for i, rec in enumerate(records):
         base = rec["judge_request"]
@@ -368,9 +400,9 @@ def test_judge_records_runs_one_combined_burst_for_baseline_and_every_variant() 
     baseline_keep = [False, True, True, True, False, False]
     variant_keeps = {
         "ignore_constraints": [True, False, True, False, False, True],
-        "checklist_json": [False, False, True, True, False, True],
+        "legacy_json": [False, False, True, True, False, True],
     }
-    variants = ["ignore_constraints", "checklist_json"]
+    variants = ["ignore_constraints", "legacy_json"]
     fake, calls = _build_fake_judge(records, variants, baseline_keep, variant_keeps)
 
     outcomes = rejudge.judge_records(records, variants, "fake-model", judge_fn=fake)
@@ -381,15 +413,15 @@ def test_judge_records_runs_one_combined_burst_for_baseline_and_every_variant() 
     expected_prompts = (
         [r["judge_request"] for r in records]
         + [rejudge.apply_variant(r["judge_request"], "ignore_constraints") for r in records]
-        + [rejudge.apply_variant(r["judge_request"], "checklist_json") for r in records]
+        + [rejudge.apply_variant(r["judge_request"], "legacy_json") for r in records]
     )
     assert calls[0] == expected_prompts
 
     assert [o["index"] for o in outcomes] == [0, 1, 2, 3, 4, 5]
     assert outcomes[0]["baseline"] == {"keep": False, "reason": "baseline reason 0", "parse_ok": True}
     assert outcomes[0]["variants"]["ignore_constraints"]["keep"] is True
-    assert outcomes[0]["variants"]["checklist_json"]["keep"] is False
-    assert set(outcomes[0]["variants"]) == {"ignore_constraints", "checklist_json"}
+    assert outcomes[0]["variants"]["legacy_json"]["keep"] is False
+    assert set(outcomes[0]["variants"]) == {"ignore_constraints", "legacy_json"}
 
 
 def test_report_arithmetic_multi_variant_mixed_directions_and_flips() -> None:
@@ -404,9 +436,9 @@ def test_report_arithmetic_multi_variant_mixed_directions_and_flips() -> None:
     baseline_keep = [False, True, True, True, False, False]
     variant_keeps = {
         "ignore_constraints": [True, False, True, False, False, True],
-        "checklist_json": [False, False, True, True, False, True],
+        "legacy_json": [False, False, True, True, False, True],
     }
-    variants = ["ignore_constraints", "checklist_json"]
+    variants = ["ignore_constraints", "legacy_json"]
     fake, _ = _build_fake_judge(records, variants, baseline_keep, variant_keeps)
     outcomes = rejudge.judge_records(records, variants, "fake-model", judge_fn=fake)
 
@@ -437,7 +469,7 @@ def test_report_arithmetic_multi_variant_mixed_directions_and_flips() -> None:
         assert f["baseline_reason"].startswith("baseline reason")
         assert f["variant_reason"].startswith("ignore_constraints reason")
 
-    cj = report["variants"]["checklist_json"]
+    cj = report["variants"]["legacy_json"]
     assert cj["overall"]["keep_rate"] == pytest.approx(3 / 6)
     assert cj["overall"]["agreement_with_original"] == pytest.approx(4 / 6)
     assert cj["overall"]["original_veto_to_variant_keep"] == 1
@@ -469,6 +501,9 @@ def test_judge_records_no_variants_leaves_variants_dict_empty() -> None:
 
 
 def test_judge_records_attaches_checklist_only_when_present_in_the_raw_reply() -> None:
+    # Uses ignore_constraints, not checklist_json: checklist_json's rendered
+    # text is now identical to the baseline's (it is the identity variant),
+    # which would make the exact-text branch below match both slots.
     records = [_reply_record(0, 1, "forward", True, ["keywords:existence"], "c0")]
     checklist_raw = (
         '{"truncated": true, "garbled": false, "off_task": false, '
@@ -484,9 +519,9 @@ def test_judge_records_attaches_checklist_only_when_present_in_the_raw_reply() -
                 verdicts.append(Verdict(keep=False, reason="checklist says degenerate", raw=checklist_raw, parse_ok=True))
         return verdicts
 
-    outcomes = rejudge.judge_records(records, ["checklist_json"], "fake-model", judge_fn=fake)
+    outcomes = rejudge.judge_records(records, ["ignore_constraints"], "fake-model", judge_fn=fake)
     assert "checklist" not in outcomes[0]["baseline"]
-    assert outcomes[0]["variants"]["checklist_json"]["checklist"] == {
+    assert outcomes[0]["variants"]["ignore_constraints"]["checklist"] == {
         "truncated": True,
         "garbled": False,
         "off_task": False,
