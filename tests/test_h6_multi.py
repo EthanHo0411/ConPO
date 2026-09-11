@@ -510,7 +510,7 @@ def test_tiny_trainer_multi_writes_mechanism_fields_and_pair_stats(
     lines = [
         json.loads(line) for line in (tmp_path / "mechanism.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()
     ]
-    step_records = [r for r in lines if r.get("event") != "veto_flush"]
+    step_records = [r for r in lines if "event" not in r]  # per-step records only: veto_flush, step_timing and resume events sit beside them
     assert len(step_records) == 2
     for r in step_records:
         assert "multi_attempted" in r

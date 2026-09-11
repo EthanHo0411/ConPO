@@ -44,8 +44,9 @@
 #
 # Resuming a run the node-local wipe cut short (RUN_RESUME, devbox
 # 2026-09-11): copy the harvested run back under CONPO_RUNS_DIR (or point
-# RUN_OUT_DIR at the harvested copy directly -- see local/harvest.sh's
-# --resume-check), then relaunch with RUN_RESUME=1 and the same RUN_OUT_DIR:
+# RUN_OUT_DIR at the harvested copy directly; local/harvest.sh's header shows
+# how to find its newest checkpoint step), then relaunch with RUN_RESUME=1 and
+# the same RUN_OUT_DIR:
 #
 #   RUN_ARM=full RUN_SEED=42 RUN_RESUME=1 bash local/train.sh
 #

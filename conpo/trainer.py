@@ -924,7 +924,7 @@ class ConPOTrainer(GRPOTrainer):
         Also persists pair_stats (H6 part B) so a resumed run's phi/count
         table survives the restart instead of starting cold, and, after
         TRL's own save, the rest of ConPO's state (RUN_RESUME) into the same
-        checkpoint directory it just created."""
+        checkpoint directory super()._save_checkpoint created."""
         self.flush_pending_veto()
         self.save_pair_stats()
         super()._save_checkpoint(model, trial)
