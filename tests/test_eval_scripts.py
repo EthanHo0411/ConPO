@@ -197,8 +197,8 @@ def test_build_vllm_engine_memoises_per_model_adapter(
     calls: list[tuple[str, bool]] = []
 
     class FakeLLM:
-        def __init__(self, model: str, enable_lora: bool) -> None:
-            calls.append((model, enable_lora))
+        def __init__(self, model: str, enable_lora: bool, max_lora_rank: int) -> None:
+            calls.append((model, enable_lora, max_lora_rank))
 
     fake_vllm = types.ModuleType("vllm")
     fake_vllm.LLM = FakeLLM  # type: ignore[attr-defined]
@@ -210,7 +210,7 @@ def test_build_vllm_engine_memoises_per_model_adapter(
 
     assert first is second
     assert first is not third
-    assert calls == [("model-a", False), ("model-a", True)]
+    assert calls == [("model-a", False, 64), ("model-a", True, 64)]
 
 
 def test_eval_external_score_only_ifeval_hand_written_records(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

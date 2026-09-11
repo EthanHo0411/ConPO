@@ -99,7 +99,10 @@ def _build_vllm_engine(model_name: str, adapter: str | None) -> Any:
     building it twice."""
     from vllm import LLM
 
-    return LLM(model=model_name, enable_lora=adapter is not None)
+    # max_lora_rank: vLLM's default is 16 and refuses a rank-64 adapter at load
+    # time ("LoRA rank 64 is greater than max_lora_rank 16", pipeline probe
+    # 2026-09-11); the trained adapters are config.LORA_R.
+    return LLM(model=model_name, enable_lora=adapter is not None, max_lora_rank=config.LORA_R)
 
 
 def _generate_vllm(model_name: str, adapter: str | None, prompts: Sequence[str], max_tokens: int) -> list[str]:
