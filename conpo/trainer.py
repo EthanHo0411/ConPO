@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import gc
 import json
 import math
 import random
@@ -766,6 +767,15 @@ class ConPOTrainer(GRPOTrainer):
 
         t0 = time.perf_counter()
         slept = self._sleep_engine_if_enabled()
+        if torch.cuda.is_available():
+            # Release the caching allocator's reserved-but-free blocks so the
+            # judge child (a separate CUDA context) sees them as free: the
+            # end-of-training flush found only 39 of 79 GiB free next to the
+            # finished trainer and its judge died at vLLM start-up
+            # (2026-09-11); VLLMBatchedJudge._fit_fraction adapts to what is
+            # left after this.
+            gc.collect()
+            torch.cuda.empty_cache()
         verdicts = self.judge.veto_many(requests)
         if slept:
             self._wake_engine()

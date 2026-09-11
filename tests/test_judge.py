@@ -264,3 +264,16 @@ def test_http_judge_fail_loud_on_server_error() -> None:
             j.veto(_req())
         assert j.counts["keep"] == 0
         assert j.counts["discard"] == 0
+
+
+def test_fit_gpu_fraction_caps_at_free_memory_minus_margin() -> None:
+    from conpo.judge import fit_gpu_fraction
+
+    gib = 1 << 30
+    # 39.4 GiB free of 79.2 (the 2026-09-11 end-of-training flush): 0.6 does not fit.
+    assert abs(fit_gpu_fraction(0.6, int(39.4 * gib), int(79.2 * gib)) - (38.4 / 79.2)) < 1e-6
+    # plenty free: the requested value is returned unchanged
+    assert fit_gpu_fraction(0.6, 70 * gib, 80 * gib) == 0.6
+    # nothing free: never negative
+    assert fit_gpu_fraction(0.6, 0, 80 * gib) == 0.0
+    assert fit_gpu_fraction(0.6, 10, 0) == 0.0

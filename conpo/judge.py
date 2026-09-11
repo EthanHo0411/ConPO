@@ -502,6 +502,25 @@ def _burst_entry(
         conn.close()
 
 
+_JUDGE_MIN_FRACTION = 0.45
+
+
+def fit_gpu_fraction(requested: float, free_bytes: int, total_bytes: int, margin_bytes: int = 1 << 30) -> float:
+    """The vLLM gpu_memory_utilization a judge burst can ask for right now.
+
+    vLLM refuses to start when the free memory on the device is below
+    gpu_memory_utilization x total (seen 2026-09-11: the end-of-training
+    flush found 39.4 of 79.2 GiB free next to the finished trainer and asked
+    for 0.6, so the child died). The requested fraction is capped at what is
+    free minus a margin, so the burst adapts to whatever the parent holds
+    instead of failing on a fixed number; the caller decides the floor.
+    """
+    if total_bytes <= 0:
+        return 0.0
+    available = (free_bytes - margin_bytes) / total_bytes
+    return max(0.0, min(requested, available))
+
+
 class VLLMBatchedJudge:
     """Quality-veto judge run with vllm.LLM in a freshly spawned child
     process, one process per flush burst.
@@ -559,6 +578,31 @@ class VLLMBatchedJudge:
     def veto(self, req: VetoRequest) -> Verdict:
         return self.veto_many([req])[0]
 
+    def _fit_fraction(self) -> float:
+        """gpu_memory_utilization for this burst: the configured value capped
+        by the device's free memory (fit_gpu_fraction), or the configured
+        value unchanged when no CUDA device is visible (tests, CPU runs).
+        Fails loud below _JUDGE_MIN_FRACTION (Qwen3-14B bf16 weights alone
+        take about 0.35 of an 80 GB card and 0.35 left no room for KV blocks
+        on 2026-09-08, so 0.45 keeps about 8 GiB for the cache) instead of
+        letting the child OOM with vLLM's own message.
+        """
+        try:
+            import torch
+        except ImportError:
+            return self.gpu_memory_utilization
+        if not torch.cuda.is_available():
+            return self.gpu_memory_utilization
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        fraction = fit_gpu_fraction(self.gpu_memory_utilization, free_bytes, total_bytes)
+        if fraction < _JUDGE_MIN_FRACTION:
+            raise RuntimeError(
+                f"judge burst cannot fit: {free_bytes / 2**30:.1f} of {total_bytes / 2**30:.1f} GiB free "
+                f"gives gpu_memory_utilization {fraction:.2f} < {_JUDGE_MIN_FRACTION}; "
+                "the trainer must release memory (empty_cache, sleeping engine) before the burst"
+            )
+        return fraction
+
     def _run_burst(self, prompts: list[str]) -> list[str]:
         """Spawn a fresh child process to run one vLLM burst and return its
         raw reply texts, in order.
@@ -580,11 +624,12 @@ class VLLMBatchedJudge:
         hook joins every live child, so such a child can delay the
         interpreter's exit. No user-space code can bound that.
         """
+        fraction = self._fit_fraction()
         ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         proc = ctx.Process(
             target=_burst_entry,
-            args=(child_conn, self.model_name, self.max_model_len, self.gpu_memory_utilization, self.quantization, prompts),
+            args=(child_conn, self.model_name, self.max_model_len, fraction, self.quantization, prompts),
         )
         proc.start()
         child_conn.close()
