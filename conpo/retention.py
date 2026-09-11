@@ -253,8 +253,7 @@ def score_bbh(response: str, target: str, group: str | None = None) -> bool:
       target-agnostic last-line fallback), a prediction whose first
       token is "x" or "(x)". A bare letter merely appearing inside
       ordinary prose ("...it could be a tough call", "I am not sure...")
-      is never accepted -- the model must have actually committed via a
-      marker.
+      is never accepted -- the model must have committed via a marker.
     - `target` made only of bracket/space characters: see
       `_bracket_suffix_match` (dyck_languages leniency).
     """
