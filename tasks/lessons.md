@@ -38,3 +38,8 @@
 - **What went wrong**: full_s42 was resumed from checkpoint-25 with RUN_SAVE_STEPS=15 and saved nothing at step 30. transformers copies args.save_steps into TrainerState, then replaces the state with the checkpoint's trainer_state.json (only a warning: "save_steps: 15 (from args) != 25 (from trainer_state.json)"), and DefaultFlowCallback saves on state.save_steps.
 - **Rule**: a launch knob that lives in TrainerState (save_steps, logging_steps) must be re-asserted in on_train_begin (scripts/train.py SaveCadenceCallback, c390297). After any resume, read the launch log for that transformers warning and confirm the first expected checkpoint lands.
 - **Category**: implementation
+
+### 2026-09-11 | Node-local keeps only the last two checkpoints
+- **What went wrong**: a diagnostic eval of full_s42's checkpoint-50 pointed at the node-local run directory and crashed: `save_total_limit=2` (scripts/train.py) had already deleted checkpoints 25 and 50 when 75 and 90 were written.
+- **Rule**: evaluate or resume older checkpoints from the NFS harvest (`runs/<run>/checkpoint-N`, kept by `KEEP_CHECKPOINTS=1 bash local/harvest.sh <run>` every tick); node-local holds only the newest two.
+- **Category**: implementation
