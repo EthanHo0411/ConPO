@@ -569,9 +569,9 @@ def test_statistics_compute_section_present(cards_dir: Path) -> None:
     out = dashboard.render_dashboard(cards, "2026-09-03")
     assert "## 5. Statistics compute" in out
     assert "Intervals and bootstraps cost 0 GPU-hours" in out
-    assert "48 H100-h" in out
-    assert "about 1.1 days on 2x H100" in out
-    assert "about 27 H100-h" in out
+    assert "about 204 H100-h" in out
+    assert "about 4.3 days on 2x H100" in out
+    assert "about 103 H100-h" in out
     assert "IFBench_test has 300" in out
 
 

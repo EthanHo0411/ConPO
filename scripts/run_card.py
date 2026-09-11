@@ -128,9 +128,9 @@ POLICY_MODEL = cfg.POLICY_MODEL
 
 
 PLANNED_RUNS: tuple[CardPlan, ...] = (
-    CardPlan("full_s42", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "42", "planned", 18.0),
-    CardPlan("full_s43", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "43", "planned", 18.0),
-    CardPlan("full_s44", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "44", "planned", 18.0),
+    CardPlan("full_s42", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "42", "planned", 39.0),
+    CardPlan("full_s43", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "43", "planned", 39.0),
+    CardPlan("full_s44", "train", "full", {}, "hub", ("H1", "H3", "H4", "H5"), POLICY_MODEL, "44", "planned", 39.0),
     # The untrained base policy: never trains (arm kept out of conpo.arms.ARMS
     # on purpose), so its status is derived from its own eval_dir alone
     # (see render_card's _EVAL_ONLY_STATUS_RUN_IDS branch) rather than from
@@ -140,54 +140,54 @@ PLANNED_RUNS: tuple[CardPlan, ...] = (
         detail="eval hours are counted in the eval job rows.",
         launch="N/A: this policy never trains; bash local/eval.sh and bash local/retention.sh with no adapter",
     ),
-    CardPlan("ifrlvr_s42", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "42", "planned", 6.0),
-    CardPlan("ifrlvr_s43", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "43", "planned", 6.0),
-    CardPlan("ifrlvr_s44", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "44", "planned", 6.0),
-    CardPlan("solve_only_s42", "train", "solve_only", {}, "H1 attribution", ("H1",), POLICY_MODEL, "42", "planned", 6.0),
+    CardPlan("ifrlvr_s42", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "42", "planned", 63.0),
+    CardPlan("ifrlvr_s43", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "43", "planned", 63.0),
+    CardPlan("ifrlvr_s44", "train", "ifrlvr", {}, "H1", ("H1",), POLICY_MODEL, "44", "planned", 63.0),
+    CardPlan("solve_only_s42", "train", "solve_only", {}, "H1 attribution", ("H1",), POLICY_MODEL, "42", "planned", 18.0),
     CardPlan(
         "full_no_exactness_s42", "train", "full", {"RUN_NO_EXACTNESS": "1"}, "H2", ("H2",), POLICY_MODEL, "42",
-        "planned", 18.0,
+        "planned", 39.0,
     ),
     CardPlan(
         "full_no_distance_s42", "train", "full", {"RUN_NO_DISTANCE": "1"}, "H2", ("H2",), POLICY_MODEL, "42",
-        "planned", 18.0,
+        "planned", 39.0,
     ),
-    CardPlan("vf_dpo_s42", "train", "vf_dpo", {}, "H2", ("H2",), POLICY_MODEL, "42", "planned", 6.0),
-    CardPlan("forward_only_s42", "train", "forward_only", {}, "H3", ("H3",), POLICY_MODEL, "42", "planned", 18.0),
-    CardPlan("reverse_only_s42", "train", "reverse_only", {}, "H3", ("H3",), POLICY_MODEL, "42", "planned", 18.0),
+    CardPlan("vf_dpo_s42", "train", "vf_dpo", {}, "H2", ("H2",), POLICY_MODEL, "42", "planned", 18.0),
+    CardPlan("forward_only_s42", "train", "forward_only", {}, "H3", ("H3",), POLICY_MODEL, "42", "planned", 39.0),
+    CardPlan("reverse_only_s42", "train", "reverse_only", {}, "H3", ("H3",), POLICY_MODEL, "42", "planned", 39.0),
     CardPlan(
         "full_uniform_s42", "train", "full", {"RUN_SELECTION": "uniform"}, "H4", ("H4",), POLICY_MODEL, "42",
-        "planned", 18.0,
+        "planned", 39.0,
     ),
     CardPlan(
         "full_half_s42", "train", "full", {"RUN_SELECTION": "half"}, "H4", ("H4",), POLICY_MODEL, "42",
-        "planned", 18.0,
+        "planned", 39.0,
     ),
     CardPlan(
         "full_lambda_p0_s42", "train", "full", {"RUN_LAMBDA_P": "0"}, "H5", ("H5",), POLICY_MODEL, "42",
-        "planned", 18.0,
+        "planned", 39.0,
     ),
     CardPlan(
-        "h6_multi_s42", "train", "full", {"RUN_MULTI": "1"}, "H6", ("H6",), POLICY_MODEL, "42", "planned", 18.0,
+        "h6_multi_s42", "train", "full", {"RUN_MULTI": "1"}, "H6", ("H6",), POLICY_MODEL, "42", "planned", 39.0,
         detail="H6: RUN_MULTI=1 built 2026-09-03 (compositor, multi-family edges)",
     ),
     CardPlan(
         "edge_dpo_s42", "train", "edge_dpo", {}, "objective control", ("objective_isolation_edge_dpo",),
-        POLICY_MODEL, "42", "planned", 18.0,
+        POLICY_MODEL, "42", "planned", 39.0,
     ),
     CardPlan(
-        "full_qwen3_8b_s42", "train", "full", {}, "model axis", (), "Qwen/Qwen3-8B", "42", "planned", 36.0,
+        "full_qwen3_8b_s42", "train", "full", {}, "model axis", (), "Qwen/Qwen3-8B", "42", "planned", 78.0,
     ),
     CardPlan(
         "full_tulu3_8b_sft_s42", "train", "full", {}, "model axis", (), "allenai/Llama-3.1-Tulu-3-8B-SFT", "42",
-        "planned", 36.0,
+        "planned", 78.0,
     ),
     CardPlan(
         "full_olmo3_7b_sft_s42", "train", "full", {}, "model axis", (), "allenai/Olmo-3-7B-Instruct-SFT", "42",
-        "planned", 36.0,
+        "planned", 78.0,
     ),
     CardPlan(
-        "full_fullft_s42", "train", "full", {}, "full-FT point-check", (), POLICY_MODEL, "42", "planned", 21.0,
+        "full_fullft_s42", "train", "full", {}, "full-FT point-check", (), POLICY_MODEL, "42", "planned", 46.0,
         launch="RUN_ARM=full RUN_SEED=42 RUN_FULL_FT=1 RUN_OUT_DIR=runs/full_fullft_s42 bash local/train_fullft.sh",
     ),
 )
@@ -195,20 +195,21 @@ PLANNED_RUNS: tuple[CardPlan, ...] = (
 PLANNED_EVALS: tuple[CardPlan, ...] = (
     CardPlan(
         "eval_standard", "eval", "IFEval, IFBench, internal PAcc", {},
-        "28 checkpoints: 21 runs + 3 IF-RLVR pass1 + 4 untrained", (), "none", "none", "planned", 20.0,
+        "28 checkpoints: 21 runs + 3 IF-RLVR pass1 + 4 untrained", (), "none", "none", "planned", 6.72,
         detail=(
             "IFEval 541, IFBench_test 300, internal eval_i 1500 / eval_ii 2952 / eval_iii 6947; "
-            "about 0.7 H100-h per checkpoint."
+            "about 0.24 H100-h per checkpoint."
         ),
     ),
     CardPlan(
         # The retention suite's fourth benchmark was dropped (user decision
-        # 2026-09-04); est_h100h down from 7.0 to 4.0 with it. retention.py
+        # 2026-09-04). est_h100h is 7 checkpoints x 0.04 H100-h measured on
+        # 2026-09-11 (2.4 min per checkpoint). retention.py
         # / scripts/eval_retention.py are wired as of wave 1, so the detail
         # no longer says "not wired" (design choice, builder, 2026-09-04).
         "eval_retention", "eval", "GSM8K, MMLU, BBH", {},
-        "7 checkpoints: full x3, ifrlvr token-matched x3, untrained", (), "none", "none", "planned", 4.0,
-        detail="about 0.6 H100-h per checkpoint.",
+        "7 checkpoints: full x3, ifrlvr token-matched x3, untrained", (), "none", "none", "planned", 0.28,
+        detail="about 0.04 H100-h per checkpoint.",
     ),
 )
 

@@ -536,8 +536,8 @@ def test_planned_writes_exactly_24_files_with_listed_run_ids(tmp_path: Path) -> 
 def test_planned_estimates_sum_to_documented_totals(tmp_path: Path) -> None:
     training_total = sum(p.est_h100h for p in run_card.PLANNED_RUNS)
     eval_total = sum(p.est_h100h for p in run_card.PLANNED_EVALS)
-    assert training_total == 375.0  # "untrained" adds 0.0, sum unchanged
-    assert eval_total == 24.0  # eval_retention 7.0 -> 4.0 (suite's fourth benchmark dropped)
+    assert training_total == 973.0  # "untrained" adds 0.0; measured 2026-09-11 (handoff hackmd/conpo-plan.md section 6)
+    assert eval_total == 7.0  # 28 x 0.24 + 7 x 0.04, measured 2026-09-11 (handoff hackmd/conpo-details.md section 5)
 
 
 def test_planned_h6_multi_is_planned(tmp_path: Path) -> None:

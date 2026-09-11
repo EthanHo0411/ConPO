@@ -944,10 +944,12 @@ def build_statistics_section() -> list[str]:
         "Intervals and bootstraps cost 0 GPU-hours (CPU, seconds, from the stored per-prompt verdicts).",
         "",
         "Seed replication is the only compute that buys statistical power: the 2 extra seeds on the "
-        "headline pair cost 48 H100-h of training (2 x (18 + 6)) plus about 4 H100-h of eval and "
-        "retention, about 52 H100-h, about 1.1 days on 2x H100, already inside the total; each further "
-        "seed on the headline pair costs about 27 H100-h (24 training, 3 eval), about 0.6 days on 2x "
-        "H100, and narrows the seed-level std only.",
+        "headline pair cost about 204 H100-h of training (full ConPO plus IF-RLVR matched to ConPO's "
+        "token budget at R = 3.52 passes over the subset) plus about 1 H100-h of eval and retention, "
+        "about 205 H100-h, about 4.3 days on 2x H100, already inside the total; each further seed on "
+        "the headline pair costs about 103 H100-h (one full ConPO pass plus one token-matched IF-RLVR "
+        "pass, plus eval and retention), about 2.1 days on 2x H100, and narrows the seed-level std "
+        "only.",
         "",
         "The prompt-level bootstrap gets tighter only with more eval prompts, and IFBench_test has 300.",
         "",
@@ -960,7 +962,8 @@ def render_dashboard(cards: list[dict[str, str]], as_of: str, manifest_path: Pat
     lines = [
         "# ConPO runs dashboard",
         "",
-        f"Updated {as_of}. Estimates are pre-M0, factor-of-two accuracy. "
+        f"Updated {as_of}. Compute measured 2026-09-11 from the headline runs; the model-axis and "
+        "full-FT rows are estimates. "
         "Hours are H100-hours; days are on 2x H100 with the batched veto.",
         "",
     ]
