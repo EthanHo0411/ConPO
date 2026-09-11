@@ -23,3 +23,8 @@
 - **What went wrong**: `source local/env.sh` was denied because `env.sh` computed its root with `cd "$(dirname ...)/.." && pwd`; the PreToolUse guard scans sourced files and refuses a `cd` whose target is a command substitution.
 - **Rule**: launcher scripts on this box derive paths with `readlink -f` and `dirname`, never `cd $(...)`. Probe a candidate command against the guard's stdin before wiring it into a launcher (see `/home/dev/project/ethan/SERVER.md` §3).
 - **Category**: implementation
+
+### 2026-09-11 | Two builders hung for 40 minutes on node-local writes typed on the command line
+- **What went wrong**: Builder E launched its smoke with a chained `rm -rf /node-local-cache/... && mkdir -p ... && nohup bash local/train.sh` and builder G wrote a keys file with `mkdir -p /node-local-cache/... && cat > ...`; the devbox guard turns any write under `/node-local-cache` typed on a command line into an "ask" prompt, which no one could answer with Ethan away, so both tool calls waited forever while both GPUs sat idle.
+- **Rule**: Subagent briefs say it in words: never `mkdir`, `rm`, `cp`, `cat >` or `tee` into `/node-local-cache` from a command line; launchers create `RUN_OUT_DIR` themselves, helper files (key lists, configs) go in the session scratchpad, and a stuck subagent is detected by an untouched transcript file plus an idle GPU, then stopped and its work resumed by the session.
+- **Category**: implementation
