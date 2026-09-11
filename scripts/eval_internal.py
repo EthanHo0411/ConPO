@@ -29,8 +29,9 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 def left_truncate_prompt(tokenizer: Any, prompt: str, max_tokens: int) -> tuple[str, bool]:
     """Left-truncate `prompt`'s tokenisation (policy tokenizer) to its last
-    `max_tokens` tokens, mirroring TRL GRPOConfig.max_prompt_length's left
-    truncation that training applies via config.MAX_PROMPT_TOKENS.
+    `max_tokens` tokens, the eval-side counterpart of the load-time cap
+    training applies through conpo/prompts.py's cap_pool_rows (TRL 1.9.2's
+    GRPOConfig has no max_prompt_length, so ConPO caps prompts itself).
 
     Duplicated from scripts/eval_external.py (see that copy's docstring for
     why vllm 0.26.0's offline SamplingParams cannot do this at generation

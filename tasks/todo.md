@@ -194,9 +194,9 @@ Running as of 2026-09-11 (outputs under /node-local-cache/cache/conpo-runs):
 - staging of the two ablation models into the shared hub; reference clones of allenai/open-instruct and allenai/IFBench under /home/dev/project/ethan/refs.
 
 Plan (Sonnet 5 xhigh builders, xhigh reviewers, fresh verifier):
-- [ ] A. local/: `CONPO_RUNS_DIR` (node-local) as the default output root for every launcher, logs beside it, venv self-heal after a wipe, `local/harvest.sh` to copy finished runs into `runs/`; fetch_data.py stages the ablation models; README updated.
-- [ ] B. handoff docs: resolve the two flagged inconsistencies, retire 2507 everywhere it is called ConPO's model, fix the stale rows, details note scheduler/environment rows, publish scripts read the token from our config; resume point 2026-09-11.
-- [ ] C. IF-RLVR pipeline audit written to handoff/ifrlvr-pipeline-audit.md.
+- [x] A. local/: (e6af63b) `CONPO_RUNS_DIR` (node-local) as the default output root for every launcher, logs beside it, venv self-heal after a wipe, `local/harvest.sh` to copy finished runs into `runs/`; fetch_data.py stages the ablation models; README updated.
+- [x] B. handoff docs: (handoff 318efd7, 051d345) resolve the two flagged inconsistencies, retire 2507 everywhere it is called ConPO's model, fix the stale rows, details note scheduler/environment rows, publish scripts read the token from our config; resume point 2026-09-11.
+- [x] C. IF-RLVR pipeline audit (handoff 4f5eb9e) written to handoff/ifrlvr-pipeline-audit.md.
 - [ ] D. After the probe: record steps/hour, peak memory, tokens/step; launch `full_s42` on GPU 0; keep GPU 1 on evals (retention on base, then eval of every finished adapter).
 - [ ] E. Full-FT point-check last; AlpacaEval 2 held.
 

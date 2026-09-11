@@ -14,8 +14,8 @@
 # left None here).
 #
 #   bash local/eval.sh                                # base model
-#   bash local/eval.sh runs/full_s42/adapter           # one adapter
-#   EVAL_BACKEND=hf bash local/eval.sh runs/full_s42/adapter
+#   bash local/eval.sh "$CONPO_RUNS_DIR/full_s42/adapter"   # one adapter (runs/... after harvest)
+#   EVAL_BACKEND=hf bash local/eval.sh "$CONPO_RUNS_DIR/full_s42/adapter"
 #
 # Env:
 #   GPU           GPU index for CUDA_VISIBLE_DEVICES (default 0)

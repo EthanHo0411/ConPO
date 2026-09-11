@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs local/eval.sh for the base model plus every runs/*/adapter directory,
+# Runs local/eval.sh for the base model plus every ${CONPO_RUNS_DIR}/*/adapter directory,
 # and (RETENTION=1) local/retention.sh for the base model and for each run
 # id in RETENTION_RUNS. Sequential, in the foreground: each launcher owns
 # whichever GPU it is given (GPU env, default 0) until it exits, since this

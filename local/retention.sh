@@ -10,8 +10,8 @@
 # one adapter directory, vLLM backend, on whichever GPU is selected.
 #
 #   bash local/retention.sh                                # base model
-#   bash local/retention.sh runs/full_s42/adapter           # one adapter
-#   EVAL_BACKEND=hf bash local/retention.sh runs/full_s42/adapter
+#   bash local/retention.sh "$CONPO_RUNS_DIR/full_s42/adapter"   # one adapter (runs/... after harvest)
+#   EVAL_BACKEND=hf bash local/retention.sh "$CONPO_RUNS_DIR/full_s42/adapter"
 #
 # Env:
 #   GPU           GPU index for CUDA_VISIBLE_DEVICES (default 0)
