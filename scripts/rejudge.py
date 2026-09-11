@@ -91,6 +91,23 @@ _CHECKLIST_JSON_INSTRUCTION = (
     "Set degenerate to true only if at least one of the four checks is true."
 )
 
+# checklist_json with one binding sentence inserted before the JSON object,
+# tying the four checks explicitly to the listed-constraint exclusions.
+_CHECKLIST_INLINE_EXCLUSIONS_SENTENCE = (
+    "A difference that consists only of satisfying or violating one of the listed constraints "
+    "(a missing or added keyword, a changed first or last word, punctuation, letter case, a "
+    "heading, a postscript, paragraph or section breaks, bullet formatting, length, language, "
+    "a quoted or wrapped answer) counts as none of the four checks."
+)
+_CHECKLIST_INLINE_EXCLUSIONS_INSTRUCTION = (
+    "Answer with a single JSON object and nothing else: "
+    f"{_CHECKLIST_INLINE_EXCLUSIONS_SENTENCE} "
+    '{"truncated": true or false, "garbled": true or false, '
+    '"off_task": true or false, "meaning_changed_beyond_constraints": true or false, '
+    '"degenerate": true or false, "reason": "one short sentence"}. '
+    "Set degenerate to true only if at least one of the four checks is true."
+)
+
 # Generic worked examples (not from any real pair), under 80 words each, in
 # the same A/B form as the main prompt: one constraint-only difference
 # (degenerate=false) and one truncation (degenerate=true).
@@ -140,6 +157,15 @@ def _apply_checklist_json(text: str) -> str:
     return text.replace(_JSON_INSTRUCTION_ANCHOR, _CHECKLIST_JSON_INSTRUCTION, 1)
 
 
+def _apply_checklist_inline_exclusions(text: str) -> str:
+    if _JSON_INSTRUCTION_ANCHOR not in text:
+        raise ValueError(
+            "judge_request is missing build_veto_prompt's JSON-format instruction "
+            f"anchor paragraph verbatim{_MISSING_ANCHOR_SUFFIX}"
+        )
+    return text.replace(_JSON_INSTRUCTION_ANCHOR, _CHECKLIST_INLINE_EXCLUSIONS_INSTRUCTION, 1)
+
+
 def _apply_two_examples(text: str) -> str:
     match = _MODIFIED_VARIANT_LEAD_RE.search(text)
     if match is None:
@@ -158,6 +184,8 @@ VARIANT_FUNCS: dict[str, Callable[[str], str]] = {
     "checklist_json": _apply_checklist_json,
     "two_examples": _apply_two_examples,
     "ignore_plus_exclusions": lambda t: _apply_ignore_constraints(_apply_explicit_exclusions(t)),
+    "checklist_plus_exclusions": lambda t: _apply_checklist_json(_apply_explicit_exclusions(t)),
+    "checklist_inline_exclusions": _apply_checklist_inline_exclusions,
 }
 VARIANT_NAMES: tuple[str, ...] = tuple(VARIANT_FUNCS)
 

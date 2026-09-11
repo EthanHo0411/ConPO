@@ -113,6 +113,30 @@ def test_ignore_plus_exclusions_applies_variants_1_and_2_together() -> None:
     assert "DEGENERATE: truncated, garbled, off-task, or changed in meaning" not in out
 
 
+def test_checklist_plus_exclusions_applies_explicit_exclusions_then_checklist_json_once() -> None:
+    request, minus, plus = _rendered_and_labels()
+    original = request
+    out = rejudge.apply_variant(request, "checklist_plus_exclusions")
+    excl = rejudge._EXPLICIT_EXCLUSIONS_TEMPLATE.format(minus=minus, plus=plus)
+    assert out.count(excl) == 1
+    assert out.count(rejudge._CHECKLIST_JSON_INSTRUCTION) == 1
+    assert out.index(excl) < out.index(rejudge._CHECKLIST_JSON_INSTRUCTION)  # applied in order
+    assert rejudge._JSON_INSTRUCTION_ANCHOR not in out
+    assert "DEGENERATE: truncated, garbled, off-task, or changed in meaning" not in out
+    assert request == original  # baseline untouched
+
+
+def test_checklist_inline_exclusions_inserts_binding_sentence_before_json_object_once() -> None:
+    request, _, _ = _rendered_and_labels()
+    original = request
+    out = rejudge.apply_variant(request, "checklist_inline_exclusions")
+    assert out.count(rejudge._CHECKLIST_INLINE_EXCLUSIONS_INSTRUCTION) == 1
+    assert out.count(rejudge._CHECKLIST_INLINE_EXCLUSIONS_SENTENCE) == 1
+    assert out.index(rejudge._CHECKLIST_INLINE_EXCLUSIONS_SENTENCE) < out.index('"truncated"')  # sentence before the JSON object
+    assert rejudge._JSON_INSTRUCTION_ANCHOR not in out
+    assert request == original  # baseline untouched
+
+
 # ---------------------------------------------------------------------------
 # parse_variants
 # ---------------------------------------------------------------------------
