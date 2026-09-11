@@ -335,7 +335,7 @@ class ConPOTrainer(GRPOTrainer):
 
         # Per-step phase timing (design choice, Ethan devbox perf pass,
         # 2026-09-11): _generate_and_score_completions fills _phase_seconds
-        # fresh each time it actually runs (TRL's own generation-batch
+        # fresh each time it runs (TRL's own generation-batch
         # caching skips it on every micro-batch but the first of an
         # accumulation cycle -- see trl/trainer/grpo_trainer.py's
         # _prepare_inputs); _StepTimingCallback reads it at on_step_end to
@@ -422,7 +422,7 @@ class ConPOTrainer(GRPOTrainer):
         output = super()._generate_and_score_completions(inputs)
         # Reset here, not in on_step_begin: TRL's own generation-batch cache
         # means this method (and therefore this step's forward/reverse work)
-        # only actually runs on the first micro-batch of an accumulation
+        # runs only on the first micro-batch of an accumulation
         # cycle, so phase timing must start from that same call.
         self._phase_seconds = {
             "trl_generation": time.perf_counter() - t0,
@@ -615,7 +615,7 @@ class ConPOTrainer(GRPOTrainer):
             "family_stats": self.stats.snapshot(),
             # Perf-pass instrumentation (Ethan devbox, 2026-09-11): phase_seconds
             # covers everything this method measured directly this step
-            # ("veto_burst" is 0.0 unless the periodic flush below actually
+            # ("veto_burst" is 0.0 unless the periodic flush below
             # fires this step); optimiser_update_seconds and peak_memory_gb
             # land in a separate "step_timing" record instead (see
             # _StepTimingCallback) since they aren't knowable until after
@@ -1024,7 +1024,7 @@ class ConPOTrainer(GRPOTrainer):
         exact call the real `clean` already goes through), which also
         appends to `self._metrics[mode]` and, when adaptive entropy is on,
         mutates `self.entropy_coef` / `self._entropy_window_stats` /
-        `self._last_world_entropy` -- real training state, not just a
+        `self._last_world_entropy` -- real training state, not only a
         return value. This extra call is a probe-only side computation, so
         every one of those is snapshotted before and restored after: the
         subsample must contribute to T_c, never to logged metrics or the

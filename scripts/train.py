@@ -365,6 +365,13 @@ def main() -> None:
         # (see _vllm_sleep_mode). UNTESTED: no GPU in this environment.
         vllm_enable_sleep_mode=_vllm_sleep_mode(use_vllm, judge_mode),
         max_steps=steps,
+        # Checkpoint every SAVE_STEPS optimiser steps (equal to the veto
+        # period, so each save follows a veto flush) and keep the last two:
+        # a production run outlives the node-local disk's 48-hour wipe only
+        # through checkpoints harvested to NFS (local/harvest.sh).
+        save_strategy="steps",
+        save_steps=config.SAVE_STEPS,
+        save_total_limit=2,
         seed=seed,
         report_to=[],
         logging_steps=1,

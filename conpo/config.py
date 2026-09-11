@@ -305,6 +305,7 @@ PROMPT_PAIRS_PER_STEP = 8  # DEV_SET
 
 # Optimiser steps between veto bursts (RUN_VETO_PERIOD overrides). DEV_SET.
 VETO_PERIOD_K = 25  # DEV_SET
+SAVE_STEPS = 25  # checkpoint cadence in optimiser steps; equal to VETO_PERIOD_K so every save follows a veto flush (devbox 2026-09-11: node-local disk is wiped about every 48 h, checkpoints are harvested to NFS between saves)
 # Forces an early burst once the pending queue grows this large. DEV_SET.
 PENDING_QUEUE_MAX = 2000  # DEV_SET
 # RUN_JUDGE_MODE default: "batched" (VLLMBatchedJudge/HFBatchedJudge, no

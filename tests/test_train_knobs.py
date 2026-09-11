@@ -244,6 +244,7 @@ def test_main_tiny_run_full_ft_writes_flag_and_no_adapter_config(
     assert metadata["full_ft"] is True
     assert not (out_dir / "adapter" / "adapter_config.json").exists()
     mechanism_lines = (out_dir / "mechanism.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    mechanism_lines = [line for line in mechanism_lines if "event" not in json.loads(line)]  # step_timing records live beside the per-step record
     assert len(mechanism_lines) == 1
 
 
