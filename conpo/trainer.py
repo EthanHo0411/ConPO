@@ -31,6 +31,7 @@ import warnings
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import torch
 from accelerate.utils import is_peft_model
@@ -361,6 +362,12 @@ class ConPOTrainer(GRPOTrainer):
             callbacks=callbacks,
             **kwargs,
         )
+        # Root-cause fix for the vLLM weight overwrite (builder 2026-09-11):
+        # self.vllm_generation exists from here on if RUN_USE_VLLM=1 (trl
+        # 1.9.2 grpo_trainer.py sets it inside super().__init__() above,
+        # only when self.use_vllm), so this is the earliest point the guard
+        # can inspect it.
+        self._install_vllm_reload_guard()
         # RUN_FULL_FT=1 (design choice, builder 2026-09-04): GRPOTrainer builds
         # self.ref_model via create_reference_model only when the policy isn't
         # PEFT and beta != 0.0 (trl 1.9.2 grpo_trainer.py); config.KL_BETA is
@@ -932,6 +939,75 @@ class ConPOTrainer(GRPOTrainer):
 
     def _wake_engine(self) -> None:
         self.engine.trainer.vllm_generation.llm.wake_up()  # type: ignore[attr-defined]
+
+    def _install_vllm_reload_guard(self) -> None:
+        """Wrap `self.vllm_generation.llm.collective_rpc` so the policy is
+        the last thing written into the vLLM engine before every
+        `generate()` call, whatever TRL does around it.
+
+        Root cause (verified 2026-09-11, all line numbers against the
+        installed trl==1.9.2 / vllm==0.26.0): `VLLMGeneration.generate`
+        (trl/generation/vllm_generation.py lines 540-548) wakes the engine's
+        weights and, with sleep mode on, calls
+        `self.llm.collective_rpc("reload_weights")` on every single call
+        ("work around for vllm issue 29341") before sampling, and ends with
+        `self.llm.sleep(level=2)` (line 702). `reload_weights` with no
+        arguments (`vllm/v1/worker/gpu_worker.py` line 444 ->
+        `vllm/v1/worker/gpu_model_runner.py` line 5480) reloads the
+        *original* model from disk, unconditionally. `sync_weights`
+        (vllm_generation.py lines 444-484) had already merged the PEFT
+        adapter and pushed every parameter earlier in the same optimiser
+        step (trl/trainer/grpo_trainer.py lines 1791-1793, gated on
+        `_last_loaded_step`), so every `generate()` call was silently
+        replacing that pushed policy with the base model before sampling
+        from it -- GRPO rollouts, ConPO's forward repair, and its reverse
+        corruption all sample through this same path
+        (`conpo/engine.py`'s `VLLMColocateEngine.generate`), several times
+        per step.
+
+        The fix: after TRL's own `collective_rpc("reload_weights")` call
+        runs (unchanged -- this does not remove TRL's workaround for vllm
+        issue 29341, nor change any sleep level), also call
+        `sync_weights()`, which wakes weights idempotently, re-merges the
+        adapter, pushes every parameter, and unmerges. Cost: one extra
+        merge/push/unmerge per `generate()` call (a few seconds), several
+        times per optimiser step. Cheaper alternative not taken: sleep
+        level 1 (keeps weights resident, only frees the KV cache) plus
+        skipping TRL's `reload_weights` call entirely -- rejected because
+        it means patching around TRL's own upstream workaround rather than
+        living with it, and level-1 sleep frees less GPU memory during the
+        veto burst that `_sleep_engine_if_enabled` relies on.
+
+        Installs only once (idempotent: checked via a marker attribute on
+        `llm` itself, not on `self`, since the object being wrapped is what
+        must not be double-wrapped) and only when a colocated vLLM engine
+        with a callable `collective_rpc` exists: a no-op for
+        RUN_USE_VLLM=0 (no `self.vllm_generation` at all -- trl only sets
+        it when `self.use_vllm`), for `vllm_mode="server"` (no `self.llm`,
+        only `self.vllm_client`), and for HFEngine/FakeEngine runs.
+
+        Re-entrant by construction, not by special-casing: the wrapper only
+        reacts to the method name `"reload_weights"`, so any other call
+        `collective_rpc` receives (including one `sync_weights()` itself
+        might make, e.g. `"load_weights"`) is forwarded to the original
+        `collective_rpc` unchanged and does not re-trigger a resync.
+        """
+        vllm_generation = getattr(self, "vllm_generation", None)
+        llm = getattr(vllm_generation, "llm", None)
+        original_collective_rpc = getattr(llm, "collective_rpc", None)
+        if llm is None or not callable(original_collective_rpc):
+            return
+        if getattr(llm, "_conpo_reload_guard_installed", False):
+            return
+
+        def _reload_then_resync(method: str, *args: Any, **kwargs: Any) -> Any:
+            result = original_collective_rpc(method, *args, **kwargs)
+            if method == "reload_weights":
+                vllm_generation.sync_weights()
+            return result
+
+        llm.collective_rpc = _reload_then_resync
+        llm._conpo_reload_guard_installed = True
 
     def _save_checkpoint(self, model: torch.nn.Module, trial: object) -> None:
         """Flush before every checkpoint save (USER DECISIONS 2026-09-02),
