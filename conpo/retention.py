@@ -168,28 +168,38 @@ def _extract_bbh_marker_prediction(response: str) -> str | None:
     return _clean_marker_text(text) or None
 
 
-def extract_bbh_prediction(response: str, target: str | None = None) -> str | None:
+_LIST_MARKER_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
+
+
+def _strip_list_marker(line: str) -> str:
+    """Strip a leading markdown bullet ("-", "*", "+") or numbering
+    ("1.", "2)") from `line`, for word_sorting responses that list one
+    word per line with list formatting."""
+    return _LIST_MARKER_RE.sub("", line)
+
+
+def extract_bbh_prediction(response: str, group: str | None = None) -> str | None:
     """The model's committed BBH answer, normalised (strip, lowercase,
     drop a trailing full stop, collapse whitespace, strip surrounding
-    quotes):
+    quotes). Never consults the gold target -- comparison to gold stays
+    in `score_bbh`.
 
     1. `_extract_bbh_marker_prediction` (a `\\boxed{...}` or a "Final
        Answer:" / "Answer:" line), when present.
-    2. Otherwise, ONLY when `target` is given and is itself more than
-       one word (a word_sorting-shaped gold, Task F point 4): the final
-       non-empty line, and the non-empty lines directly above it, are
-       joined with spaces if they are each a single whitespace-free
-       token (word_sorting responses that put one word per line) -- up
-       to as many trailing lines as `target` has words, so an unrelated
-       single-word line further up (e.g. a "Reasoning." lead-in before a
-       True/False line) is never pulled in by accident. A single-line,
+    2. Otherwise, ONLY when `group` is "word_sorting": the final
+       non-empty line, and the contiguous run of non-empty lines
+       directly above it, are joined with spaces if they are each a
+       single whitespace-free token once a leading markdown bullet or
+       numbering is stripped (word_sorting responses that put one word
+       per line) -- the whole contiguous run, no length cap, so an
+       unrelated single-word line further up (e.g. a "Reasoning."
+       lead-in) would need its own space to be excluded. A single-line,
        comma-separated list is accepted the same way, but ONLY when
        every comma-separated part is itself a single token -- ordinary
        prose with an incidental comma (seen in truncated
        logical_deduction_seven_objects responses) is left alone.
-    3. Otherwise (no marker, no multi-word `target`, or the list checks
-       above did not apply): the final non-empty line as-is -- the
-       original, target-agnostic behaviour, unchanged.
+    3. Otherwise (no marker, `group` is not "word_sorting", or the list
+       checks above did not apply): the final non-empty line as-is.
 
     None if `response` has no non-empty line and no marker."""
     marker = _extract_bbh_marker_prediction(response)
@@ -199,16 +209,14 @@ def extract_bbh_prediction(response: str, target: str | None = None) -> str | No
     if not non_empty:
         return None
     last = non_empty[-1]
-    target_words = _normalise_bbh_line(target).split() if target else []
-    if len(target_words) > 1:
-        if " " not in last:
+    if group == "word_sorting":
+        if " " not in _strip_list_marker(last):
             tokens: list[str] = []
             for line in reversed(non_empty):
-                if " " in line:
+                token = _strip_list_marker(line)
+                if " " in token:
                     break
-                tokens.append(line)
-                if len(tokens) >= len(target_words):
-                    break
+                tokens.append(token)
             tokens.reverse()
             if tokens:
                 return _normalise_bbh_line(" ".join(tokens))
@@ -233,18 +241,24 @@ def _bracket_suffix_match(prediction: str, target: str) -> bool:
     return bool(compact_target) and prediction.replace(" ", "").endswith(compact_target)
 
 
-def score_bbh(response: str, target: str) -> bool:
-    """`extract_bbh_prediction(response)` compared to the
+def score_bbh(response: str, target: str, group: str | None = None) -> bool:
+    """`extract_bbh_prediction(response, group)` compared to the
     same-normalised `target`, with two labelled exceptions:
 
     - `target` of the form "(X)": also accept a prediction that merely
-      CONTAINS "(x)" (unchanged: a fuller sentence around the letter),
-      or that contains the bare letter "x" as its own token (Task F
-      point 3 -- chat models often drop the parens BBH's gold keeps).
+      CONTAINS "(x)" (unchanged: a fuller sentence around the letter);
+      a prediction whose whole normalised text IS the bare letter "x";
+      or, only when `response` carries a `_extract_bbh_marker_prediction`
+      commitment (a `\\boxed{...}` / "Final Answer:" line, not the
+      target-agnostic last-line fallback), a prediction whose first
+      token is "x" or "(x)". A bare letter merely appearing inside
+      ordinary prose ("...it could be a tough call", "I am not sure...")
+      is never accepted -- the model must have actually committed via a
+      marker.
     - `target` made only of bracket/space characters: see
       `_bracket_suffix_match` (dyck_languages leniency).
     """
-    prediction = extract_bbh_prediction(response, target) or ""
+    prediction = extract_bbh_prediction(response, group) or ""
     norm_target = _normalise_bbh_line(target)
     if prediction == norm_target:
         return True
@@ -252,7 +266,13 @@ def score_bbh(response: str, target: str) -> bool:
         letter = norm_target.strip("()")
         if norm_target in prediction:
             return True
-        return bool(re.search(rf"(?<![a-z]){re.escape(letter)}(?![a-z])", prediction))
+        if prediction == letter:
+            return True
+        if _extract_bbh_marker_prediction(response) is not None:
+            tokens = prediction.split()
+            if tokens and tokens[0] in (letter, f"({letter})"):
+                return True
+        return False
     if target and all(ch in "()[]{}<> \t" for ch in target):
         return _bracket_suffix_match(prediction, target)
     return False
@@ -266,7 +286,7 @@ def extract_prediction(row: RetentionRow, response: str) -> str | None:
     if row.benchmark == "mmlu":
         return extract_mmlu_prediction(response)
     if row.benchmark == "bbh":
-        return extract_bbh_prediction(response, row.target)
+        return extract_bbh_prediction(response, row.group)
     raise ValueError(f"unknown benchmark {row.benchmark!r}")
 
 
@@ -277,5 +297,5 @@ def score(row: RetentionRow, response: str) -> bool:
     if row.benchmark == "mmlu":
         return score_mmlu(response, row.target)
     if row.benchmark == "bbh":
-        return score_bbh(response, row.target)
+        return score_bbh(response, row.target, row.group)
     raise ValueError(f"unknown benchmark {row.benchmark!r}")

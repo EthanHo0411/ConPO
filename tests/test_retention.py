@@ -101,6 +101,21 @@ def test_score_bbh_wrong_answer() -> None:
     assert score_bbh("Reasoning.\nFalse.", "True") is False
 
 
+def test_score_bbh_paren_letter_bare_letter_inside_prose_stays_wrong() -> None:
+    # Regression, Task F3 finding 2: the old bare-letter fallback matched any
+    # standalone lowercase letter anywhere in the prediction, so target "(A)"
+    # scored True against a sentence merely containing the word "a".
+    response = "I am not sure which option is correct, it could be a tough call."
+    assert score_bbh(response, "(A)") is False
+
+
+def test_score_bbh_paren_letter_sentence_starting_with_letter_word_stays_wrong() -> None:
+    # Same bug, target "(I)": the sentence's leading "I" is not a committed
+    # marker answer, so it must not match either.
+    response = "I am not sure which option is correct, it could be a tough call."
+    assert score_bbh(response, "(I)") is False
+
+
 # --- score_bbh: robust extractor, Task F point 2 (real Qwen3-4B responses) -----
 # Every response string below is copied verbatim (full response, or a verbatim
 # tail when the full response is long prose) from
@@ -131,7 +146,7 @@ def test_score_bbh_dyck_languages_whole_sequence_repeat(response: str, gold: str
         # "Final Answer:" with the value on the same line, more text follows.
         "### Final Answer: **No**  \nElanor does **not** tell the truth.",
         # last marker in the text wins even when an earlier empty marker exists.
-        "### Final Answer:\n\n**No, Shalonda does not tell the truth.**  \n**Shalonda lies.**\n\n**Answer: No**",
+        "### ✅ Final Answer:\n\n**No, Shalonda does not tell the truth.**  \n**Shalonda lies.**\n\n**Answer: No**",
         # marker line is not the last line of the response.
         "### Final Answer: **No**  \n**Ka does not tell the truth.**",
     ],
@@ -161,7 +176,7 @@ def test_score_bbh_web_of_lies_truncated_response_no_marker_stays_wrong() -> Non
 
 
 def test_score_bbh_word_sorting_one_word_per_line() -> None:
-    assert score_bbh("syndrome  \ntherefrom", "syndrome therefrom") is True
+    assert score_bbh("syndrome  \ntherefrom", "syndrome therefrom", "word_sorting") is True
 
 
 def test_extract_bbh_prediction_word_sorting_comma_separated_list() -> None:
@@ -170,11 +185,11 @@ def test_extract_bbh_prediction_word_sorting_comma_separated_list() -> None:
         "splutter, subsist, thrill, drumhead, onus, obstetric, malton, guru, damp, entirety"
     )
     gold = "barn damp delmarva dot drumhead embezzle entirety greene guru it&t malton obstetric onus panicking prod same scorch splutter subsist thrill"
-    # Comma-list is accepted and space-joined (point 4) once `target` shows a
-    # multi-word gold is expected...
-    assert extract_bbh_prediction(response, gold) == response.replace(", ", " ")
+    # Comma-list is accepted and space-joined (point 4) once `group` is
+    # word_sorting -- the extractor never sees `gold`...
+    assert extract_bbh_prediction(response, "word_sorting") == response.replace(", ", " ")
     # ...but the model's order does not match the sorted gold, so it still scores wrong.
-    assert score_bbh(response, gold) is False
+    assert score_bbh(response, gold, "word_sorting") is False
 
 
 @pytest.mark.parametrize(
@@ -205,7 +220,7 @@ def test_score_bbh_logical_deduction_marker_value_on_next_line_still_matches() -
     # No-regression check: this sample already scored correct under the old
     # last-line extractor via paren-containment; confirm the new marker path
     # (empty "Final Answer:" line, value on the next line) still finds it.
-    response = "Third-to-last is **5th place**.\n\n### Final Answer:\n**(B) Eve finished third-to-last**."
+    response = "Third-to-last is **5th place** → **Eve**.\n\n### Final Answer:\n**(B) Eve finished third-to-last**."
     assert score_bbh(response, "(B)") is True
 
 
