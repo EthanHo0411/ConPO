@@ -284,3 +284,85 @@ def test_repair_failed_group_merges_edges_across_responses() -> None:
     assert all(len(sources) == 1 for sources in result.endpoint_sources)  # one edge per single-step trajectory
     assert result.proposals == 2 * 2
     assert meter.total == result.generated_tokens
+
+
+def test_repair_failed_group_batches_identically_to_sequential_repair() -> None:
+    """repair_failed_group batches every still-active response's proposals
+    into one engine.generate call per repair step (design choice, Ethan
+    devbox perf pass, 2026-09-11) instead of the old one-call-per-response
+    walk. `fixer` is a pure function of message content -- ignorant of call
+    order and the shared per-step seed -- so it stands in for a real engine
+    identically whichever way responses are grouped into calls. This proves
+    the batched path admits exactly the same edges, per response, as
+    replaying the pre-batching algorithm (one `repair_trajectory` call per
+    response, merged in order) would.
+    """
+
+    def fixer(messages: list[dict[str, str]], n: int) -> list[str]:
+        y_t = messages[1]["content"]
+        if "," in y_t:
+            candidate = y_t.replace(",", "")
+        elif not y_t.islower():
+            candidate = y_t.lower()
+        else:
+            candidate = y_t  # unreachable: an already-feasible response gets no engine call
+        return [candidate] * n
+
+    row = _row()
+    responses = [
+        Y0,  # fails NO_COMMA and LOWERCASE: 2 repair steps
+        "The platform rotates at a constant velocity.",  # fails only LOWERCASE: 1 step
+        "the platform rotates at a constant velocity.",  # already feasible: 0 engine calls
+    ]
+
+    def sequential_reference(responses: list[str]) -> RepairResult:
+        """The pre-batching repair_failed_group: repair_trajectory once per
+        response, merged in response order."""
+        merged = RepairResult()
+        for response in responses:
+            r = repair_trajectory(
+                row,
+                response,
+                FakeEngine(fixer),
+                StaticJudge(keep=True),
+                random.Random(0),
+                TokenMeter(budget=0),
+                current_update=5,
+                max_steps=3,
+                max_candidates=2,
+            )
+            merged.edges.extend(r.edges)
+            merged.feasible_endpoints.extend(r.feasible_endpoints)
+            merged.endpoint_sources.extend(r.endpoint_sources)
+            merged.proposals += r.proposals
+            merged.admitted += r.admitted
+            merged.generated_tokens += r.generated_tokens
+            merged.reasons.update(r.reasons)
+        return merged
+
+    sequential = sequential_reference(responses)
+    batched = repair_failed_group(
+        row,
+        responses,
+        FakeEngine(fixer),
+        StaticJudge(keep=True),
+        random.Random(0),
+        TokenMeter(budget=0),
+        current_update=5,
+        max_steps=3,
+        max_candidates=2,
+    )
+
+    def edge_key(edges: list) -> list[tuple[str, str, list[str], int]]:
+        return sorted((e.y_minus, e.y_plus, sorted(e.families), e.step) for e in edges)
+
+    # Batching only changes the interleaving of DIFFERENT responses' edges
+    # (step-major instead of response-major); every response's own admitted
+    # edges, and every aggregate count, must match exactly.
+    assert edge_key(sequential.edges) == edge_key(batched.edges)
+    assert sequential.admitted == batched.admitted == 3
+    assert sequential.proposals == batched.proposals
+    assert sorted(sequential.feasible_endpoints) == sorted(batched.feasible_endpoints) == sorted(
+        ["the platform rotates at a constant velocity."] * 3
+    )
+    assert dict(sequential.reasons) == dict(batched.reasons)

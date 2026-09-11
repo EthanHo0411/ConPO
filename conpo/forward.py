@@ -117,6 +117,53 @@ class RepairResult:
     reasons: Counter[str] = field(default_factory=Counter)
 
 
+def _admit_candidates(
+    row: PoolRow,
+    y_t: str,
+    before: Sequence[bool],
+    failed_idx: Sequence[int],
+    proposals: Sequence[str],
+    judge: Judge,
+    veto: bool,
+    distance_gate: bool,
+    reasons: Counter[str],
+) -> tuple[str | None, tuple[bool, ...], str, float]:
+    """Try `proposals` in order against `monotone_admit` then the veto (section
+    2.2's inner candidate loop, factored out so repair_trajectory and
+    repair_failed_group's lock-step batch share one admission path -- design
+    choice, Ethan devbox perf pass, 2026-09-11).
+
+    Every rejection (`monotone_admit` reason, or "veto") is tallied into
+    `reasons` as it happens; the winning candidate's "admitted" reason is
+    left for the caller to add once, matching the single post-loop tally the
+    unbatched version always used. Returns (None, (), "", 0.0) when nothing
+    in `proposals` is admitted.
+    """
+    for candidate in proposals:
+        d = token_distance(y_t, candidate)
+        after = verifier_vector(row.constraints, candidate)
+        ok, reason = monotone_admit(row.constraints, before, after, d, distance_gate=distance_gate)
+        if not ok:
+            reasons[reason] += 1
+            continue
+        if veto:
+            newly = [row.constraints[i] for i in failed_idx if after[i]]
+            verdict = judge.veto(
+                VetoRequest(
+                    prompt=row.prompt,
+                    y_plus=candidate,
+                    y_minus=y_t,
+                    families=tuple(c.iid for c in newly),
+                    descriptions=tuple(description(c) for c in newly),
+                )
+            )
+            if not verdict.keep:
+                reasons["veto"] += 1
+                continue
+        return candidate, after, reason, d
+    return None, (), "", 0.0
+
+
 def repair_trajectory(
     row: PoolRow,
     response: str,
@@ -164,34 +211,9 @@ def repair_trajectory(
         meter.add(n_tokens)
         result.generated_tokens += n_tokens
 
-        admitted_y: str | None = None
-        admitted_after: tuple[bool, ...] = ()
-        admitted_reason = ""
-        admitted_distance = 0.0
-        for candidate in proposals:
-            d = token_distance(y_t, candidate)
-            after = verifier_vector(row.constraints, candidate)
-            ok, reason = monotone_admit(row.constraints, before, after, d, distance_gate=distance_gate)
-            if not ok:
-                result.reasons[reason] += 1
-                continue
-            newly = [row.constraints[i] for i in failed_idx if after[i]]
-            if veto:
-                verdict = judge.veto(
-                    VetoRequest(
-                        prompt=row.prompt,
-                        y_plus=candidate,
-                        y_minus=y_t,
-                        families=tuple(c.iid for c in newly),
-                        descriptions=tuple(description(c) for c in newly),
-                    )
-                )
-                if not verdict.keep:
-                    result.reasons["veto"] += 1
-                    continue
-            admitted_y, admitted_after, admitted_reason, admitted_distance = candidate, after, reason, d
-            break
-
+        admitted_y, admitted_after, admitted_reason, admitted_distance = _admit_candidates(
+            row, y_t, before, failed_idx, proposals, judge, veto, distance_gate, result.reasons
+        )
         if admitted_y is None:
             break
 
@@ -223,6 +245,18 @@ def repair_trajectory(
     return result
 
 
+@dataclass
+class _Trajectory:
+    """One response's mutable repair state inside repair_failed_group's
+    lock-step batch: the same y_t/before/edges a repair_trajectory call
+    would carry as locals, kept per-response so every trajectory can advance
+    independently between shared batched engine.generate calls."""
+
+    y_t: str
+    before: tuple[bool, ...]
+    edges: list[Edge] = field(default_factory=list)
+
+
 def repair_failed_group(
     row: PoolRow,
     responses: Sequence[str],
@@ -236,19 +270,96 @@ def repair_failed_group(
     veto: bool = True,
     distance_gate: bool = True,
 ) -> RepairResult:
-    """Run `repair_trajectory` on every failed response of one clean group
-    and merge the results (section 2.2). `distance_gate` passes straight
-    through to every `repair_trajectory` call."""
+    """Run repair on every failed response of one clean group, lock-step
+    across responses (section 2.2).
+
+    Design choice (Ethan devbox perf pass, 2026-09-11): at each repair step,
+    every still-active trajectory's proposals are drawn in ONE
+    `engine.generate` call (messages_batch holding one entry per active
+    response) instead of the one-call-per-response-per-step the old
+    per-response loop made -- `engine.generate`'s own contract returns
+    completions in `messages_batch` order, so this changes only how many
+    engine round trips a step costs, never which candidates a response sees:
+    each trajectory's own gate checks, veto calls and admitted edges are
+    produced by the same `_admit_candidates` path repair_trajectory uses,
+    fed that trajectory's own proposals in the same per-step order. A
+    trajectory drops out of the batch the first step it has nothing left to
+    admit or is already fully feasible, exactly when repair_trajectory would
+    have `break` / stopped looping for it.
+
+    tests/test_forward.py's FakeEngine-based equivalence test pins this: a
+    content-keyed FakeEngine (ignores call order and the shared per-step
+    seed) admits identical edges whether responses are repaired one at a
+    time or batched this way.
+    """
+    trajs = [_Trajectory(y_t=r, before=tuple(verifier_vector(row.constraints, r))) for r in responses]
+    active = [i for i, t in enumerate(trajs) if not all(t.before)]
     merged = RepairResult()
-    for response in responses:
-        r = repair_trajectory(
-            row, response, engine, judge, rng, meter, current_update, max_steps, max_candidates, veto, distance_gate
+
+    for step in range(max_steps):
+        if not active:
+            break
+        failed_idx_by_pos: list[list[int]] = []
+        messages_batch = []
+        for i in active:
+            t = trajs[i]
+            failed_idx = [j for j, ok in enumerate(t.before) if not ok]
+            failed = [(row.constraints[j], describe_failure(row.constraints[j], t.y_t)) for j in failed_idx]
+            messages_batch.append(build_repair_messages(row, t.y_t, failed))
+            failed_idx_by_pos.append(failed_idx)
+
+        all_proposals = engine.generate(
+            messages_batch,
+            max_candidates,
+            config.MAX_COMPLETION_TOKENS,
+            config.TEMPERATURE,
+            config.TOP_P,
+            rng.randint(0, 2**31 - 1),
         )
-        merged.edges.extend(r.edges)
-        merged.feasible_endpoints.extend(r.feasible_endpoints)
-        merged.endpoint_sources.extend(r.endpoint_sources)
-        merged.proposals += r.proposals
-        merged.admitted += r.admitted
-        merged.generated_tokens += r.generated_tokens
-        merged.reasons.update(r.reasons)
+
+        still_active: list[int] = []
+        for pos, i in enumerate(active):
+            t = trajs[i]
+            failed_idx = failed_idx_by_pos[pos]
+            proposals = all_proposals[pos]
+            merged.proposals += len(proposals)
+            n_tokens = engine.count_tokens(proposals)
+            meter.add(n_tokens)
+            merged.generated_tokens += n_tokens
+
+            admitted_y, admitted_after, admitted_reason, admitted_distance = _admit_candidates(
+                row, t.y_t, t.before, failed_idx, proposals, judge, veto, distance_gate, merged.reasons
+            )
+            if admitted_y is None:
+                continue
+
+            merged.reasons[admitted_reason] += 1
+            merged.admitted += 1
+            edge = Edge(
+                prompt_id=row.key,
+                prompt=row.prompt,
+                y_plus=admitted_y,
+                y_minus=t.y_t,
+                families=frozenset(row.constraints[j].iid for j in failed_idx if admitted_after[j]),
+                direction="forward",
+                step=step,
+                logp_ref_plus=float("nan"),
+                logp_ref_minus=float("nan"),
+                len_plus=0,
+                len_minus=0,
+                created_update=current_update,
+                meta={"reason": admitted_reason, "distance": admitted_distance},
+            )
+            t.edges.append(edge)
+            merged.edges.append(edge)
+            t.y_t = admitted_y
+            t.before = admitted_after
+            if not all(t.before):
+                still_active.append(i)
+        active = still_active
+
+    for t in trajs:
+        if all(t.before):
+            merged.feasible_endpoints.append(t.y_t)
+            merged.endpoint_sources.append(list(t.edges))
     return merged

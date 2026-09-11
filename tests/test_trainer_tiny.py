@@ -276,7 +276,11 @@ def test_full_arm_two_optimizer_steps(tmp_path: Path, monkeypatch: pytest.Monkey
     lora_after = {name: p.detach() for name, p in trainer.model.named_parameters() if "lora_" in name}
     assert any(not torch.equal(lora_before[name], lora_after[name]) for name in lora_before)
 
+    # "event"-tagged lines are the separate step_timing/veto_flush records
+    # (Ethan devbox perf pass, 2026-09-11); this test's per-step assertions
+    # below are about the compute_loss record, which carries no "event" key.
     records = [json.loads(line) for line in mechanism_log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    records = [r for r in records if "event" not in r]
     assert len(records) == 2
     expected_keys = {
         "step",
@@ -456,7 +460,7 @@ def test_compute_loss_halves_edge_sample_and_runs_probe_once_per_step(
     monkeypatch.setattr(EdgeBuffer, "sample", spy_sample)
 
     probe_calls: list[int] = []
-    trainer._run_probe = lambda model, clean, current_update: probe_calls.append(current_update)
+    trainer._run_probe = lambda model, inputs, clean, current_update: probe_calls.append(current_update)
 
     trainer.train()
 
@@ -468,6 +472,93 @@ def test_compute_loss_halves_edge_sample_and_runs_probe_once_per_step(
     # Both compute_loss calls share global_step == 0 (it advances only after
     # the optimizer step completes), so the probe must fire exactly once.
     assert probe_calls == [0]
+
+
+# ---------------------------------------------------------------------------
+# _run_probe's memory bound (task H, Ethan devbox, 2026-09-11): the clean
+# side is now a fresh, small resample of the step's own batch instead of a
+# retain_graph=True differentiation of the full-batch `clean` tensor.
+# ---------------------------------------------------------------------------
+
+
+def test_run_probe_records_a_cosine(tmp_path: Path) -> None:
+    """The real (unstubbed) probe -- resampled clean-side gradient, both
+    gradients taken with retain_graph=False -- runs end to end on CPU and
+    records a finite T_c cosine for whichever family it picks. This does
+    not prove no extra CUDA graph is kept alive (this suite is CPU-only, no
+    memory introspection available), only that the resample path is real
+    and correct enough to run and record, per task H's own fallback bar.
+    """
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A, ROW_B]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=1,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    arm = ArmSpec(reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=True)
+    edge_buffer = EdgeBuffer()
+    stats = FamilyStats()
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=edge_buffer,
+        feasible_buffer=FeasibleBuffer(),
+        stats=stats,
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=Overrides(),
+        peft_config=_lora_config(),
+        # probe_enabled defaults True: the real probe path runs, unstubbed.
+    )
+
+    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+    with torch.no_grad(), unwrapped.disable_adapter():
+        for edge in _hand_built_edges():
+            logp_plus, len_plus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_plus)
+            logp_minus, len_minus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_minus)
+            edge_buffer.push(
+                dataclasses.replace(
+                    edge,
+                    logp_ref_plus=logp_plus.item(),
+                    logp_ref_minus=logp_minus.item(),
+                    len_plus=len_plus,
+                    len_minus=len_minus,
+                )
+            )
+
+    trainer.train()
+
+    probed_families = [f for f in (NO_COMMA.iid, LOWERCASE.iid) if stats.last_probe_update(f) is not None]
+    assert probed_families  # the probe fired and picked one of the two families
+    for family in probed_families:
+        assert stats.last_probe_update(family) == 0
+        assert math.isfinite(stats.t_c(family))
 
 
 # ---------------------------------------------------------------------------
@@ -634,14 +725,18 @@ def test_prompt_gamma_theta_logged_when_lambda_p_zero(tmp_path: Path, monkeypatc
     # The per-step mechanism record (mechanism.jsonl) carries the same
     # diagnostic, not only the in-memory last_loss_stats: compute_loss merges
     # its prompt_* stats into the record before it is written.
+    # "event"-tagged lines are the separate step_timing/veto_flush records
+    # (Ethan devbox perf pass, 2026-09-11); the per-step compute_loss record
+    # this test checks carries no "event" key.
     records = [
         json.loads(line)
         for line in (tmp_path / "mechanism.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert records
-    assert "prompt_gamma_theta" in records[-1]
-    assert math.isfinite(records[-1]["prompt_gamma_theta"])
+    step_records = [r for r in records if "event" not in r]
+    assert step_records
+    assert "prompt_gamma_theta" in step_records[-1]
+    assert math.isfinite(step_records[-1]["prompt_gamma_theta"])
 
 
 # ---------------------------------------------------------------------------

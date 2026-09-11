@@ -34,6 +34,7 @@ from pathlib import Path
 
 import torch
 from accelerate.utils import is_peft_model
+from transformers import TrainerCallback
 from trl import GRPOTrainer
 
 from conpo import config, forward, losses, prompts, reverse, selection
@@ -169,6 +170,62 @@ def score_response(
     return logp, length
 
 
+class _StepTimingCallback(TrainerCallback):
+    """Per-optimiser-step wall clock and peak CUDA memory (design choice,
+    Ethan devbox perf pass, 2026-09-11): `on_step_end` fires only after
+    `accelerator.backward` and the optimiser's own `.step()` have both run
+    for every micro-batch of the accumulation cycle -- strictly later than
+    `compute_loss`'s own mechanism.jsonl write (USER DECISIONS / design
+    2026-09-04, see the class docstring) -- so this can never be folded into
+    that record and is appended as its own "step_timing" JSONL line instead,
+    the same convention `flush_pending_veto`'s "veto_flush" record already
+    uses. `on_step_begin`/`on_step_end` each fire exactly once per optimiser
+    step (HF Trainer's own accumulation-boundary contract), matching the
+    granularity of `current_update`/`self.state.global_step` everywhere else
+    in this module.
+
+    optimiser_update_seconds is total_step_seconds minus every phase
+    ConPOTrainer measured directly this step (`trainer._phase_seconds`:
+    TRL generation, forward repair, reverse corruption, the periodic veto
+    burst when it fires) -- a remainder, so it also folds in compute_loss's
+    own forward/backward passes across every micro-batch of the
+    accumulation cycle, not a direct measurement of optimizer.step() alone.
+    # ponytail: remainder-based, not a dedicated compute_loss/backward
+    # timer; split further only if that breakdown is ever needed.
+    """
+
+    def __init__(self, trainer: "ConPOTrainer") -> None:
+        self.trainer = trainer
+
+    def on_step_begin(self, args: object, state: object, control: object, **kwargs: object) -> None:
+        self.trainer._step_t0 = time.perf_counter()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def on_step_end(self, args: object, state: object, control: object, **kwargs: object) -> None:
+        trainer = self.trainer
+        if trainer._step_t0 is None:
+            return
+        total_seconds = time.perf_counter() - trainer._step_t0
+        trainer._step_t0 = None
+        peak_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+        measured = sum(trainer._phase_seconds.values())
+        record = {
+            "event": "step_timing",
+            # global_step has already advanced past this step's own
+            # current_update by the time on_step_end fires (HF Trainer
+            # increments it right before this callback), so subtract 1 to
+            # tag the same step number the per-step generate/compute_loss
+            # record used.
+            "step": max(0, state.global_step - 1),  # type: ignore[attr-defined]
+            "total_step_seconds": total_seconds,
+            "optimiser_update_seconds": max(0.0, total_seconds - measured),
+            "peak_memory_gb": peak_gb,
+        }
+        with open(trainer.mechanism_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+
 class ConPOTrainer(GRPOTrainer):
     """GRPOTrainer subclass implementing ConPO.
 
@@ -276,13 +333,27 @@ class ConPOTrainer(GRPOTrainer):
         self._veto_seen_by_direction: Counter[str] = Counter()
         self._veto_rejected_by_direction: Counter[str] = Counter()
 
+        # Per-step phase timing (design choice, Ethan devbox perf pass,
+        # 2026-09-11): _generate_and_score_completions fills _phase_seconds
+        # fresh each time it actually runs (TRL's own generation-batch
+        # caching skips it on every micro-batch but the first of an
+        # accumulation cycle -- see trl/trainer/grpo_trainer.py's
+        # _prepare_inputs); _StepTimingCallback reads it at on_step_end to
+        # compute optimiser_update_seconds and write the "step_timing"
+        # mechanism.jsonl record.
+        self._phase_seconds: dict[str, float] = {}
+        self._step_t0: float | None = None
+
         reward_func = self.reward_conjunctive if arm.reward == "conjunctive" else self.reward_additive
+        callbacks = list(kwargs.pop("callbacks", None) or [])
+        callbacks.append(_StepTimingCallback(self))
         super().__init__(
             model=model,
             reward_funcs=reward_func,
             args=args,
             train_dataset=train_dataset,
             processing_class=processing_class,
+            callbacks=callbacks,
             **kwargs,
         )
         # RUN_FULL_FT=1 (design choice, builder 2026-09-04): GRPOTrainer builds
@@ -347,7 +418,18 @@ class ConPOTrainer(GRPOTrainer):
     # -----------------------------------------------------------------
 
     def _generate_and_score_completions(self, inputs: list[dict[str, object]]) -> dict[str, object]:
+        t0 = time.perf_counter()
         output = super()._generate_and_score_completions(inputs)
+        # Reset here, not in on_step_begin: TRL's own generation-batch cache
+        # means this method (and therefore this step's forward/reverse work)
+        # only actually runs on the first micro-batch of an accumulation
+        # cycle, so phase timing must start from that same call.
+        self._phase_seconds = {
+            "trl_generation": time.perf_counter() - t0,
+            "forward_repair": 0.0,
+            "reverse_corruption": 0.0,
+            "veto_burst": 0.0,
+        }
 
         tokens_before_step = self.meter.total
         keys = [str(row["key"]) for row in inputs]
@@ -401,6 +483,7 @@ class ConPOTrainer(GRPOTrainer):
             if self.arm.forward and failed_responses:
                 veto_flag = not self.overrides.no_veto
                 collector = _QueueingVetoCollector() if veto_flag else None
+                _t_forward = time.perf_counter()
                 result = forward.repair_failed_group(
                     row,
                     failed_responses,
@@ -412,6 +495,7 @@ class ConPOTrainer(GRPOTrainer):
                     veto=veto_flag,
                     distance_gate=not self.overrides.no_distance,
                 )
+                self._phase_seconds["forward_repair"] += time.perf_counter() - _t_forward
                 if veto_flag:
                     # Register a tracker for every trajectory-derived endpoint
                     # BEFORE pushing its edges below (round2 finding 1): a
@@ -440,6 +524,7 @@ class ConPOTrainer(GRPOTrainer):
         if self.arm.reverse and len(self.feasible_buffer) > 0:
             veto_flag = not self.overrides.no_veto
             collector = _QueueingVetoCollector() if veto_flag else None
+            _t_reverse = time.perf_counter()
             results = reverse.reverse_batch(
                 self.rows_by_key,
                 self.feasible_buffer,
@@ -454,6 +539,7 @@ class ConPOTrainer(GRPOTrainer):
                 veto=veto_flag,
                 pair_stats=self.pair_stats,
             )
+            self._phase_seconds["reverse_corruption"] += time.perf_counter() - _t_reverse
             # A comma-joined ReverseResult.family (reverse.py's own
             # multi-vs-single-family signal) marks a multi-family attempt,
             # whatever it was ultimately admitted, distance-gated or vetoed.
@@ -527,6 +613,22 @@ class ConPOTrainer(GRPOTrainer):
             "edge_buffer_size": len(self.edge_buffer),
             "feasible_buffer_size": len(self.feasible_buffer),
             "family_stats": self.stats.snapshot(),
+            # Perf-pass instrumentation (Ethan devbox, 2026-09-11): phase_seconds
+            # covers everything this method measured directly this step
+            # ("veto_burst" is 0.0 unless the periodic flush below actually
+            # fires this step); optimiser_update_seconds and peak_memory_gb
+            # land in a separate "step_timing" record instead (see
+            # _StepTimingCallback) since they aren't knowable until after
+            # this step's backward pass and optimiser step have both run,
+            # strictly later than this record's own write in compute_loss.
+            # Not a copy: the periodic flush below (still inside this method
+            # call) may still add to "veto_burst" after this dict is built,
+            # and record/self._pending_mechanism_record must see that update
+            # before compute_loss serialises it -- see the reassignment (not
+            # in-place clear) at this method's top for why the next step's
+            # reset never mutates this same dict object retroactively.
+            "phase_seconds": self._phase_seconds,
+            "tokens_generated_step": tokens_this_step,
             # Raw anchors behind the ratios above (edges_per_million_tokens_*):
             # both are monotone non-decreasing over a run's lifetime, unlike
             # edge_buffer_size, so a reader can recompute any windowed rate
@@ -567,7 +669,7 @@ class ConPOTrainer(GRPOTrainer):
         # per-step method.
         self._steps_since_flush += 1
         if self._steps_since_flush >= self.veto_period_k:
-            self.flush_pending_veto()
+            self._phase_seconds["veto_burst"] += self.flush_pending_veto()
 
         if self.meter.exhausted():
             self.control.should_training_stop = True
@@ -613,25 +715,28 @@ class ConPOTrainer(GRPOTrainer):
             self.flush_pending_veto()
         self.pending_queue.push(pair)
 
-    def flush_pending_veto(self) -> None:
+    def flush_pending_veto(self) -> float:
         """Score every pending pair in one burst (USER DECISIONS 2026-09-02).
 
-        No-op (nothing scored, no JSONL line) when the queue is empty, so a
-        flush-condition check that finds nothing pending costs nothing and
-        never adds an empty record to mechanism_log_path. Otherwise: confirm
-        the colocated vLLM engine is asleep if configured to
-        (_sleep_engine_if_enabled -- it never calls `.sleep()` itself, only
-        reports the invariant TRL's own generate() already establishes),
-        score the whole drained queue with one self.judge.veto_many call,
-        wake the engine back up, then score reference log-probs and push
-        every kept edge into edge_buffer exactly as the old inline path did
-        -- rejected pairs are dropped, nothing more. Always resets the
-        veto_period_k step counter, flushed or not.
+        No-op (nothing scored, no JSONL line, returns 0.0) when the queue is
+        empty, so a flush-condition check that finds nothing pending costs
+        nothing and never adds an empty record to mechanism_log_path.
+        Otherwise: confirm the colocated vLLM engine is asleep if configured
+        to (_sleep_engine_if_enabled -- it never calls `.sleep()` itself,
+        only reports the invariant TRL's own generate() already
+        establishes), score the whole drained queue with one
+        self.judge.veto_many call, wake the engine back up, then score
+        reference log-probs and push every kept edge into edge_buffer
+        exactly as the old inline path did -- rejected pairs are dropped,
+        nothing more. Always resets the veto_period_k step counter, flushed
+        or not. Returns the burst's wall-clock seconds (0.0 when a no-op),
+        for _generate_and_score_completions's own phase_seconds["veto_burst"]
+        tally (Ethan devbox perf pass, 2026-09-11).
         """
         self._steps_since_flush = 0
         pending_size_before = len(self.pending_queue)
         if pending_size_before == 0:
-            return
+            return 0.0
 
         pairs = self.pending_queue.drain()
         requests = [p.request for p in pairs]
@@ -719,6 +824,7 @@ class ConPOTrainer(GRPOTrainer):
         }
         with open(self.mechanism_log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
+        return burst_seconds
 
     def _dump_judge_replies(self, pairs: Sequence[PendingPair], verdicts: Sequence[Verdict]) -> None:
         """Append the first JUDGE_REPLY_DUMP_PER_BURST judged pairs of this
@@ -906,15 +1012,76 @@ class ConPOTrainer(GRPOTrainer):
 
         return torch.stack(m_plus_terms), torch.stack(m_minus_terms)
 
-    def _run_probe(self, model: torch.nn.Module, clean: torch.Tensor, current_update: int) -> None:
-        """T_c gradient-alignment probe (ConPO.pdf section 2.6): cosine between
-        L_resp's gradient on a probe batch of the due family and L_clean's
-        gradient on the current inputs, w.r.t. the LoRA parameters only.
+    def _resample_clean_loss(self, model: torch.nn.Module, inputs: dict[str, object]) -> torch.Tensor:
+        """Fresh GRPO loss over a `config.PROBE_SIZE`-sequence (seeded off
+        `self.rng`) subsample of this step's own `inputs` -- the T_c probe's
+        clean-side ESTIMATE (task H design choice, see `_run_probe`'s
+        docstring). Any `inputs` value that is a tensor batch-aligned with
+        `completion_ids` is index-selected down to the subsample; everything
+        else (None, scalars, unrelated shapes) passes through unchanged.
 
-        `torch.autograd.grad` (not `.backward()`) never touches `.grad`
-        attributes, so this has no optimiser side effects; `retain_graph`
-        keeps both graphs alive for the real `total.backward()` still to come.
+        `super().compute_loss` is TRL's own GRPOTrainer.compute_loss (the
+        exact call the real `clean` already goes through), which also
+        appends to `self._metrics[mode]` and, when adaptive entropy is on,
+        mutates `self.entropy_coef` / `self._entropy_window_stats` /
+        `self._last_world_entropy` -- real training state, not just a
+        return value. This extra call is a probe-only side computation, so
+        every one of those is snapshotted before and restored after: the
+        subsample must contribute to T_c, never to logged metrics or the
+        entropy controller.
         """
+        batch_size = inputs["completion_ids"].shape[0]  # type: ignore[union-attr]
+        k = min(config.PROBE_SIZE, batch_size)
+        idx = torch.tensor(self.rng.sample(range(batch_size), k), device=inputs["completion_ids"].device)  # type: ignore[union-attr]
+        sub_inputs = {
+            key: value.index_select(0, idx)
+            if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == batch_size
+            else value
+            for key, value in inputs.items()
+        }
+
+        mode = "train" if model.training else "eval"
+        metrics_before = {k_: list(v) for k_, v in self._metrics[mode].items()}
+        entropy_coef_before = self.entropy_coef
+        entropy_window_before = self._entropy_window_stats
+        last_world_entropy_before = self._last_world_entropy
+        try:
+            return super().compute_loss(model, sub_inputs, return_outputs=False)
+        finally:
+            self._metrics[mode].clear()
+            self._metrics[mode].update(metrics_before)
+            self.entropy_coef = entropy_coef_before
+            self._entropy_window_stats = entropy_window_before
+            self._last_world_entropy = last_world_entropy_before
+
+    def _run_probe(
+        self, model: torch.nn.Module, inputs: dict[str, object], clean: torch.Tensor, current_update: int
+    ) -> None:
+        """T_c gradient-alignment probe (ConPO.pdf section 2.6): cosine between
+        L_resp's gradient on a probe batch of the due family and an estimate
+        of L_clean's gradient, w.r.t. the LoRA parameters only.
+
+        Memory bound (task H design choice, Ethan devbox, 2026-09-11): the
+        clean side used to differentiate the full-batch `clean` tensor with
+        `retain_graph=True`, so the full accumulation-batch graph, the
+        probe-edge graph and both gradient sets were all alive at once --
+        with long prompts that hit 96.5 GB on an 80 GB card
+        (promptcap_smoke, task E2+H notes). Neither gradient here is needed
+        after this method returns (`total.backward()` still differentiates
+        the real, unmodified `clean`, which never has `retain_graph` called
+        on it), so both are now taken with `retain_graph=False` from graphs
+        that never duplicate the full batch: the probe-edge graph is its own
+        small `PROBE_SIZE`-edge forward, and the clean side is a fresh,
+        separate, PROBE_SIZE-sequence-or-fewer forward over a seeded
+        subsample of `inputs` (`_resample_clean_loss`) rather than the exact
+        full-batch `clean` -- an ESTIMATE, not the true full-batch gradient.
+        T_c itself (cosine between two LoRA gradients) is unchanged.
+        `clean` is still accepted (unused below) so callers do not have to
+        special-case this signature; `torch.cuda.empty_cache()` after the
+        probe returns whatever the two freed graphs held to the allocator
+        before the real forward/backward pass runs.
+        """
+        del clean  # kept for signature stability; the clean side is resampled below
         families = sorted(self.edge_buffer.counts_by_family())
         if not families:
             return
@@ -930,14 +1097,21 @@ class ConPOTrainer(GRPOTrainer):
         if not lora_params:
             return
 
-        delta, ages = self._score_edge_pairs(model, probe_edges)
-        probe_loss, _ = losses.resp_loss(delta, ages, tau=config.TAU, gamma=config.GAMMA, kappa=config.KAPPA)
-        probe_grad = torch.autograd.grad(probe_loss, lora_params, retain_graph=True, allow_unused=True)
-        clean_grad = torch.autograd.grad(clean, lora_params, retain_graph=True, allow_unused=True)
-        probe_grad = [g if g is not None else torch.zeros_like(p) for g, p in zip(probe_grad, lora_params)]
-        clean_grad = [g if g is not None else torch.zeros_like(p) for g, p in zip(clean_grad, lora_params)]
-        cosine = selection.grad_cosine(probe_grad, clean_grad)
-        self.stats.record_probe(family, cosine, current_update)
+        try:
+            delta, ages = self._score_edge_pairs(model, probe_edges)
+            probe_loss, _ = losses.resp_loss(delta, ages, tau=config.TAU, gamma=config.GAMMA, kappa=config.KAPPA)
+            probe_grad = torch.autograd.grad(probe_loss, lora_params, retain_graph=False, allow_unused=True)
+            probe_grad = [g if g is not None else torch.zeros_like(p) for g, p in zip(probe_grad, lora_params)]
+
+            clean_sample = self._resample_clean_loss(model, inputs)
+            clean_grad = torch.autograd.grad(clean_sample, lora_params, retain_graph=False, allow_unused=True)
+            clean_grad = [g if g is not None else torch.zeros_like(p) for g, p in zip(clean_grad, lora_params)]
+
+            cosine = selection.grad_cosine(probe_grad, clean_grad)
+            self.stats.record_probe(family, cosine, current_update)
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def compute_loss(
         self,
@@ -1018,7 +1192,7 @@ class ConPOTrainer(GRPOTrainer):
                 stats.update({f"prompt_{k}": v for k, v in prompt_stats.items()})
 
         if self.probe_enabled and len(self.edge_buffer) > 0 and current_update != self._last_probe_step:
-            self._run_probe(model, clean, current_update)
+            self._run_probe(model, inputs, clean, current_update)
             self._last_probe_step = current_update
 
         if self._pending_mechanism_record is not None:
