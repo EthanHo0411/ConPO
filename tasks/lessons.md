@@ -33,3 +33,8 @@
 - **What went wrong**: Builder E launched its smoke with a chained `rm -rf /node-local-cache/... && mkdir -p ... && nohup bash local/train.sh` and builder G wrote a keys file with `mkdir -p /node-local-cache/... && cat > ...`; the devbox guard turns any write under `/node-local-cache` typed on a command line into an "ask" prompt, which no one could answer with Ethan away, so both tool calls waited forever while both GPUs sat idle.
 - **Rule**: Subagent briefs say it in words: never `mkdir`, `rm`, `cp`, `cat >` or `tee` into `/node-local-cache` from a command line; launchers create `RUN_OUT_DIR` themselves, helper files (key lists, configs) go in the session scratchpad, and a stuck subagent is detected by an untouched transcript file plus an idle GPU, then stopped and its work resumed by the session.
 - **Category**: implementation
+
+### 2026-09-11 | Resumed run kept the old checkpoint cadence
+- **What went wrong**: full_s42 was resumed from checkpoint-25 with RUN_SAVE_STEPS=15 and saved nothing at step 30. transformers copies args.save_steps into TrainerState, then replaces the state with the checkpoint's trainer_state.json (only a warning: "save_steps: 15 (from args) != 25 (from trainer_state.json)"), and DefaultFlowCallback saves on state.save_steps.
+- **Rule**: a launch knob that lives in TrainerState (save_steps, logging_steps) must be re-asserted in on_train_begin (scripts/train.py SaveCadenceCallback, c390297). After any resume, read the launch log for that transformers warning and confirm the first expected checkpoint lands.
+- **Category**: implementation
