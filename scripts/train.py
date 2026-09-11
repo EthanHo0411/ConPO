@@ -32,6 +32,7 @@ from conpo.data import PoolRow, TokenMeter, keys_digest, load_subset
 from conpo.edges import EdgeBuffer, FeasibleBuffer
 from conpo.engine import Engine, HFEngine, VLLMColocateEngine
 from conpo.judge import build_judge
+from conpo.prompts import cap_pool_rows
 from conpo.selection import FamilyStats
 from conpo.trainer import ConPOTrainer
 from conpo.verifiers import Constraint
@@ -251,6 +252,26 @@ def main() -> None:
     if row_limit:
         rows = rows[:row_limit]
     subset_sha256 = keys_digest(subset_path) if subset_path else None
+
+    # TASK G (design choice, builder, 2026-09-11): TRL's GRPOConfig has no
+    # max_prompt_length in this trl version, so nothing upstream ever caps a
+    # prompt before it reaches an engine -- cap every row's prompt here, once,
+    # before rows_by_key/dataset are built, so every downstream consumer
+    # (TRL generation via `dataset` below, conpo/forward.py's repair prompts,
+    # conpo/reverse.py's corruption and conpo/prompts.counterfactual_prompts_set,
+    # conpo/judge.py's veto prompt) reads the same already-capped
+    # `row.prompt` (conpo/prompts.py's cap_prompt_messages/cap_pool_rows).
+    # A throwaway tokenizer load here (the real one loads again below with
+    # the model) keeps this independent of _real_model_and_tokenizer/
+    # _tiny_model_and_tokenizer's own tokenizer, at the cost of loading it
+    # twice -- negligible next to the model load either path takes.
+    cap_tokenizer = AutoTokenizer.from_pretrained(config.POLICY_MODEL if args.tiny else model_name)
+    rows, prompt_truncated_count = cap_pool_rows(rows, cap_tokenizer, config.MAX_PROMPT_TOKENS)
+    print(
+        f"prompt cap: {prompt_truncated_count}/{len(rows)} row(s) truncated to "
+        f"<= {config.MAX_PROMPT_TOKENS} tokens (config.MAX_PROMPT_TOKENS)"
+    )
+
     rows_by_key = {r.key: r for r in rows}
     dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
 
@@ -435,6 +456,9 @@ def main() -> None:
         "prompts_per_update": prompts_per_update,
         "subset_path": subset_path or None,
         "subset_sha256": subset_sha256,
+        # TASK G: how many of this run's rows had their prompt left-truncated
+        # to config.MAX_PROMPT_TOKENS at load time (cap_pool_rows above).
+        "prompt_truncated_rows": prompt_truncated_count,
         "pass1": pass1_info,
         "token_budget": meter.budget,
         "tokens_generated": meter.total,

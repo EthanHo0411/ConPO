@@ -310,6 +310,17 @@ PENDING_QUEUE_MAX = 2000  # DEV_SET
 # RUN_JUDGE_MODE default: "batched" (VLLMBatchedJudge/HFBatchedJudge, no
 # resident judge server) or "http" (HttpJudge against local/judge_server.sh).
 JUDGE_MODE_DEFAULT = "batched"
+# TASK G (design choice, builder, 2026-09-11): the old 4096 (VLLMBatchedJudge's
+# default, local/judge_server.sh's --max-model-len) assumed a veto prompt was
+# "well under the policy's own 3584-token budget" -- wrong, since
+# conpo/judge.py's build_veto_prompt embeds the task prompt PLUS both full
+# responses, not instead of them. Measured worst case (Qwen3-4B and Qwen3-14B
+# share one tokenizer, verified): MAX_PROMPT_TOKENS + 2*MAX_COMPLETION_TOKENS
+# + the fixed instruction + up to 5 constraint descriptions + chat-template
+# overhead renders to 4422 input tokens, +256 for the judge's own reply
+# (conpo/judge.py's SamplingParams(max_tokens=256)) = 4678. Margin above that
+# for description-length variability beyond the sample measured.
+JUDGE_MAX_MODEL_LEN = 5120
 
 # ---------------------------------------------------------------------------
 # H6 multi-constraint compositor (design 2026-09-03/2026-09-04): phi-

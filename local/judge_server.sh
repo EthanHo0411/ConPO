@@ -46,6 +46,7 @@ export VLLM_ENABLE_V1_MULTIPROCESSING=1
 # config.JUDGE_MODEL, read by name rather than retyped. Assumes conpo is
 # installed editable in the uv venv by `uv sync` (pyproject.toml).
 MODEL="$(python -c 'from conpo import config; print(config.JUDGE_MODEL)')"
+JS_MAX_MODEL_LEN="$(python -c 'from conpo import config; print(config.JUDGE_MAX_MODEL_LEN)')"
 PORT="${JS_PORT:-8000}"
 TTL="${JS_TTL:-14400}"
 SERVE_DIR="${CONPO_RUNS_DIR}/serve"
@@ -69,19 +70,24 @@ trap cleanup EXIT
 echo "model=${MODEL} host=$(hostname) port=${PORT} ttl=${TTL}s"
 echo "endpoint file=${ENDPOINT}"
 
-# bf16, max-model-len 4096: a veto prompt is one task prompt plus two
-# responses plus a fixed instruction (conpo/judge.py:build_veto_prompt), well
-# under the policy's own 3584-token budget, so 4096 leaves margin without
-# sizing the KV cache for Qwen3's declared 262k context. enforce-eager
-# matches the trainer's proven vLLM settings (ConPO-Build-Plan.md section 1);
-# drop it once M0 shows CUDA graphs help on the H100.
+# bf16, max-model-len 5120 (conpo/config.py's JUDGE_MAX_MODEL_LEN, TASK G
+# 2026-09-11): a veto prompt is one task prompt (<= MAX_PROMPT_TOKENS) PLUS
+# two full responses (<= MAX_COMPLETION_TOKENS each) plus a fixed instruction
+# (conpo/judge.py:build_veto_prompt) -- the old 4096 assumed it was "well
+# under the policy's own 3584-token budget", which only holds for the prompt
+# alone, not the prompt plus both responses; measured worst case is 4678
+# input+output tokens (JUDGE_MAX_MODEL_LEN's own comment has the arithmetic).
+# Still well short of sizing the KV cache for Qwen3's declared 262k context.
+# enforce-eager matches the trainer's proven vLLM settings
+# (ConPO-Build-Plan.md section 1); drop it once M0 shows CUDA graphs help on
+# the H100.
 python -m vllm.entrypoints.openai.api_server \
     --model "${MODEL}" \
     --host 0.0.0.0 \
     --port "${PORT}" \
     --dtype bfloat16 \
     --gpu-memory-utilization 0.85 \
-    --max-model-len 4096 \
+    --max-model-len "${JS_MAX_MODEL_LEN}" \
     --tensor-parallel-size 1 \
     --enforce-eager \
     --no-enable-log-requests &

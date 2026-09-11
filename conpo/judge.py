@@ -519,10 +519,17 @@ class VLLMBatchedJudge:
     def __init__(
         self,
         model: str,
-        max_model_len: int = 4096,
+        # TASK G: config.JUDGE_MAX_MODEL_LEN (that constant's docstring has
+        # the worst-case veto-prompt-length arithmetic), not the policy's
+        # config.MAX_MODEL_LEN -- a veto prompt embeds the task prompt PLUS
+        # both full responses, so it needs its own, larger budget.
+        max_model_len: int = config.JUDGE_MAX_MODEL_LEN,
         # 0.6 of an H100 80 GB: Qwen3-14B bf16 weights alone are 27.5 GiB, so 0.35
         # left vLLM no room for KV blocks (devbox burst, 2026-09-08); the sleeping
         # colocated trainer holds about 12 GiB of the card at burst time.
+        # UNTESTED at the raised max_model_len above (TASK G): a larger
+        # max_model_len grows vLLM's profile-run KV-cache sizing; re-check
+        # this headroom on a real burst if it OOMs.
         gpu_memory_utilization: float = 0.6,
         quantization: str | None = None,
         burst_timeout_s: float = 3600.0,
