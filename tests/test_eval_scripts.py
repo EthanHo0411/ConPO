@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from conpo import metrics, scoring
+from conpo import config, metrics, scoring
 from conpo.engine import FakeEngine
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
@@ -46,6 +46,41 @@ def test_generate_greedy_requests_one_greedy_completion_per_prompt(module: types
 @pytest.mark.parametrize("module", [eval_external, eval_internal])
 def test_generate_greedy_empty_prompts(module: types.ModuleType) -> None:
     assert module.generate_greedy(FakeEngine([]), [], max_tokens=16) == []
+
+
+# --- build_parser / left_truncate_prompt (both scripts' copies) ------------
+
+
+@pytest.mark.parametrize("module", [eval_external, eval_internal])
+def test_max_tokens_defaults_to_eval_max_new_tokens(module: types.ModuleType) -> None:
+    args = module.build_parser().parse_args(["--out", "unused.json"])
+    assert args.max_tokens == config.EVAL_MAX_NEW_TOKENS
+
+
+class _CharTokenizer:
+    """Character-level fake tokenizer (id == ord(char)): no network fetch, no
+    GPU, only the surface (__call__, decode) left_truncate_prompt needs to
+    exercise its truncation logic independent of any real tokenizer."""
+
+    def __call__(self, text: str, add_special_tokens: bool = False) -> dict[str, list[int]]:
+        return {"input_ids": [ord(c) for c in text]}
+
+    def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
+        return "".join(chr(i) for i in ids)
+
+
+@pytest.mark.parametrize("module", [eval_external, eval_internal])
+def test_left_truncate_prompt_over_cap_keeps_last_n_tokens(module: types.ModuleType) -> None:
+    truncated, was_truncated = module.left_truncate_prompt(_CharTokenizer(), "abcdefghij", max_tokens=4)
+    assert was_truncated is True
+    assert truncated == "ghij"  # left truncation: head dropped, tail kept
+
+
+@pytest.mark.parametrize("module", [eval_external, eval_internal])
+def test_left_truncate_prompt_under_cap_is_unchanged(module: types.ModuleType) -> None:
+    truncated, was_truncated = module.left_truncate_prompt(_CharTokenizer(), "short", max_tokens=100)
+    assert was_truncated is False
+    assert truncated == "short"
 
 
 # --- eval_external.py --score-only ------------------------------------------

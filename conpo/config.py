@@ -49,6 +49,10 @@ NUM_GENERATIONS = 8
 TEMPERATURE = 0.8
 TOP_P = 0.95
 MAX_COMPLETION_TOKENS = 1024
+# Locked eval decoding protocol (IFBench: temperature 0, one response per
+# prompt, no system prompt, thinking off, 2048 max new tokens, identical for
+# every arm; user decision 2026-09-02, tasks/todo.md "Eval decoding" row).
+EVAL_MAX_NEW_TOKENS = 2048
 MAX_PROMPT_TOKENS = 2048
 # Explicit because Qwen3 declares a huge context and vLLM sizes the KV cache
 # for all of it; MAX_PROMPT_TOKENS + MAX_COMPLETION_TOKENS fits with margin.

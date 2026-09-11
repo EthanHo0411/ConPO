@@ -217,7 +217,11 @@ still wins over the default, as always.
    ```bash
    GPU=0 bash local/eval.sh runs/full_s42/adapter
    ```
-   Omit the adapter argument to evaluate the base model.
+   Omit the adapter argument to evaluate the base model. Decoding follows the
+   locked protocol (temperature 0, one response per prompt, no system
+   prompt, thinking off, up to `config.EVAL_MAX_NEW_TOKENS` = 2048 new
+   tokens) and left-truncates prompts to `config.MAX_PROMPT_TOKENS` like
+   training, with truncated-prompt counts recorded in each output JSON.
 
    **Evaluate every run in one sweep** (`local/eval_sweep.sh`, plain bash,
    sequential -- each launcher owns whichever GPU it is given until it

@@ -31,6 +31,39 @@ from conpo.verifiers import IFEVAL_FAMILIES
 _IFEVAL_SET = set(IFEVAL_FAMILIES)
 
 
+def left_truncate_prompt(tokenizer: Any, prompt: str, max_tokens: int) -> tuple[str, bool]:
+    """Left-truncate `prompt`'s tokenisation (policy tokenizer) to its last
+    `max_tokens` tokens, mirroring TRL GRPOConfig.max_prompt_length's left
+    truncation that training applies via config.MAX_PROMPT_TOKENS.
+
+    vllm 0.26.0's offline `SamplingParams` has no `truncate_prompt_tokens`
+    field to do this at generation time (that field lives only on the
+    OpenAI-server request/render objects, vllm/renderers/params.py and
+    vllm/entrypoints/openai/*/protocol.py; verified against the installed
+    package: `SamplingParams(truncate_prompt_tokens=...)` raises
+    `TypeError: Unexpected keyword argument 'truncate_prompt_tokens'`), so
+    both backends truncate here, before generation, instead.
+
+    Returns the (possibly truncated) prompt text and whether it was truncated.
+    """
+    ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    if len(ids) <= max_tokens:
+        return prompt, False
+    return tokenizer.decode(ids[-max_tokens:], skip_special_tokens=True), True
+
+
+def truncate_prompts(tokenizer: Any, prompts: Sequence[str], max_tokens: int) -> tuple[list[str], int]:
+    """Apply `left_truncate_prompt` across `prompts`; returns the (possibly
+    truncated) prompts and how many of them were truncated."""
+    out: list[str] = []
+    truncated = 0
+    for prompt in prompts:
+        text, was_truncated = left_truncate_prompt(tokenizer, prompt, max_tokens)
+        out.append(text)
+        truncated += int(was_truncated)
+    return out, truncated
+
+
 def generate_greedy(engine: Any, prompts: Sequence[str], max_tokens: int) -> list[str]:
     """One greedy (temperature 0) completion per prompt, via `engine.generate`."""
     if not prompts:
@@ -234,7 +267,7 @@ def write_verdicts(out_path: str, verdicts: Sequence[dict[str, Any]]) -> str:
     return verdicts_path
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="External IFEval / IFBench eval for the ConPO policy.")
     parser.add_argument("--model", default=config.POLICY_MODEL)
     parser.add_argument("--adapter", default=None, help="LoRA adapter directory, or omit for the base model")
@@ -260,8 +293,12 @@ def main() -> None:
         ),
     )
     parser.add_argument("--limit", type=int, default=None, help="cap rows per dataset, for smoke runs")
-    parser.add_argument("--max-tokens", type=int, default=config.MAX_COMPLETION_TOKENS)
-    args = parser.parse_args()
+    parser.add_argument("--max-tokens", type=int, default=config.EVAL_MAX_NEW_TOKENS)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     ifeval_rows = _load_ifeval_rows()
     ifbench_rows = scoring.load_ifbench_test()
@@ -269,6 +306,7 @@ def main() -> None:
         ifeval_rows = ifeval_rows[: args.limit]
         ifbench_rows = ifbench_rows[: args.limit]
 
+    prompt_truncation: dict[str, Any] | None = None
     if args.score_only is not None:
         canned = _load_canned(args.score_only)
         if args.join_by_prompt:
@@ -279,17 +317,30 @@ def main() -> None:
     else:
         if args.backend == "hf":
             engine = _load_hf_engine(args.model, args.adapter)
-            ifeval_responses = generate_greedy(engine, [r["prompt"] for r in ifeval_rows], args.max_tokens)
-            ifbench_responses = generate_greedy(engine, [r["prompt"] for r in ifbench_rows], args.max_tokens)
+            tokenizer = engine.tokenizer
         else:
-            ifeval_responses = _generate_vllm(
-                args.model, args.adapter, [r["prompt"] for r in ifeval_rows], args.max_tokens
-            )
-            ifbench_responses = _generate_vllm(
-                args.model, args.adapter, [r["prompt"] for r in ifbench_rows], args.max_tokens
-            )
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(args.model)
+        ifeval_prompts, ifeval_truncated = truncate_prompts(
+            tokenizer, [r["prompt"] for r in ifeval_rows], config.MAX_PROMPT_TOKENS
+        )
+        ifbench_prompts, ifbench_truncated = truncate_prompts(
+            tokenizer, [r["prompt"] for r in ifbench_rows], config.MAX_PROMPT_TOKENS
+        )
+        if args.backend == "hf":
+            ifeval_responses = generate_greedy(engine, ifeval_prompts, args.max_tokens)
+            ifbench_responses = generate_greedy(engine, ifbench_prompts, args.max_tokens)
+        else:
+            ifeval_responses = _generate_vllm(args.model, args.adapter, ifeval_prompts, args.max_tokens)
+            ifbench_responses = _generate_vllm(args.model, args.adapter, ifbench_prompts, args.max_tokens)
         ifeval_records = [_merge(row, response) for row, response in zip(ifeval_rows, ifeval_responses)]
         ifbench_records = [_merge(row, response) for row, response in zip(ifbench_rows, ifbench_responses)]
+        prompt_truncation = {
+            "max_prompt_tokens": config.MAX_PROMPT_TOKENS,
+            "side": "left",
+            "truncated_counts": {"ifeval": ifeval_truncated, "ifbench": ifbench_truncated},
+        }
 
     ifeval_score = dataclasses.asdict(scoring.score_ifeval(ifeval_records)) if ifeval_records else None
     ifbench_score = dataclasses.asdict(scoring.score_ifbench(ifbench_records)) if ifbench_records else None
@@ -300,6 +351,7 @@ def main() -> None:
         "decoding": {"temperature": 0, "max_tokens": args.max_tokens},
         "model": args.model,
         "adapter": args.adapter,
+        "prompt_truncation": prompt_truncation,
     }
     Path(args.out).write_text(json.dumps(out, indent=2), encoding="utf-8")
     print(f"wrote {args.out}")

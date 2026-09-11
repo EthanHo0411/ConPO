@@ -27,6 +27,35 @@ from conpo.verifiers import Constraint, verifier_vector
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
+def left_truncate_prompt(tokenizer: Any, prompt: str, max_tokens: int) -> tuple[str, bool]:
+    """Left-truncate `prompt`'s tokenisation (policy tokenizer) to its last
+    `max_tokens` tokens, mirroring TRL GRPOConfig.max_prompt_length's left
+    truncation that training applies via config.MAX_PROMPT_TOKENS.
+
+    Duplicated from scripts/eval_external.py (see that copy's docstring for
+    why vllm 0.26.0's offline SamplingParams cannot do this at generation
+    time instead): both scripts run standalone (no shared package).
+
+    Returns the (possibly truncated) prompt text and whether it was truncated.
+    """
+    ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    if len(ids) <= max_tokens:
+        return prompt, False
+    return tokenizer.decode(ids[-max_tokens:], skip_special_tokens=True), True
+
+
+def truncate_prompts(tokenizer: Any, prompts: Sequence[str], max_tokens: int) -> tuple[list[str], int]:
+    """Apply `left_truncate_prompt` across `prompts`; returns the (possibly
+    truncated) prompts and how many of them were truncated."""
+    out: list[str] = []
+    truncated = 0
+    for prompt in prompts:
+        text, was_truncated = left_truncate_prompt(tokenizer, prompt, max_tokens)
+        out.append(text)
+        truncated += int(was_truncated)
+    return out, truncated
+
+
 def generate_greedy(engine: Any, prompts: Sequence[str], max_tokens: int) -> list[str]:
     """One greedy (temperature 0) completion per prompt, via `engine.generate`.
 
@@ -158,7 +187,7 @@ def write_verdicts(out_path: str, verdicts: Sequence[dict[str, Any]]) -> str:
     return verdicts_path
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Internal ConPO eval: metrics.summarise over data/ splits.")
     parser.add_argument("--splits", default="dev,eval_i,eval_ii,eval_iii")
     parser.add_argument("--model", default=config.POLICY_MODEL)
@@ -167,8 +196,12 @@ def main() -> None:
     parser.add_argument("--out", required=True, help="output JSON path")
     parser.add_argument("--score-only", default=None, help="jsonl of {key, response}; skips generation")
     parser.add_argument("--limit", type=int, default=None, help="cap rows per split, for smoke runs")
-    parser.add_argument("--max-tokens", type=int, default=config.MAX_COMPLETION_TOKENS)
-    args = parser.parse_args()
+    parser.add_argument("--max-tokens", type=int, default=config.EVAL_MAX_NEW_TOKENS)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     split_names = [s.strip() for s in args.splits.split(",") if s.strip()]
     splits = {name: load_split(name, args.limit) for name in split_names}
@@ -178,8 +211,18 @@ def main() -> None:
         engine = _load_hf_engine(args.model, args.adapter)
     canned = _load_canned_responses(args.score_only) if args.score_only is not None else None
 
+    tokenizer = None
+    if args.score_only is None:
+        if engine is not None:
+            tokenizer = engine.tokenizer
+        else:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(args.model)
+
     results: dict[str, Any] = {}
     verdicts: list[dict[str, Any]] = []
+    truncated_counts: dict[str, int] = {}
     for name, rows in splits.items():
         prompts = [row.prompt for row in rows]
         if canned is not None:
@@ -187,11 +230,28 @@ def main() -> None:
             if missing:
                 raise KeyError(f"no canned response for keys {missing} in {args.score_only}")
             responses = [canned[str(row.key)] for row in rows]
-        elif engine is not None:
-            responses = generate_greedy(engine, prompts, args.max_tokens)
         else:
-            responses = _generate_vllm(args.model, args.adapter, prompts, args.max_tokens)
-        results[name] = metrics.summarise(rows, responses, name)
+            prompts, truncated_counts[name] = truncate_prompts(tokenizer, prompts, config.MAX_PROMPT_TOKENS)
+            try:
+                if engine is not None:
+                    responses = generate_greedy(engine, prompts, args.max_tokens)
+                else:
+                    responses = _generate_vllm(args.model, args.adapter, prompts, args.max_tokens)
+            except Exception:
+                print(f"generation failed on split={name!r}, keys={[row.key for row in rows]}")
+                raise
+        summary = metrics.summarise(rows, responses, name)
+        if name in truncated_counts:
+            # Nested per split, not a top-level "prompt_truncation" sibling:
+            # scripts/analyze.py's internal_table() iterates every top-level
+            # key of this JSON as a split name and reads summary["pacc"]
+            # (design choice, builder, 2026-09-11).
+            summary["prompt_truncation"] = {
+                "max_prompt_tokens": config.MAX_PROMPT_TOKENS,
+                "side": "left",
+                "truncated_count": truncated_counts[name],
+            }
+        results[name] = summary
         verdicts.extend(record_verdicts(rows, responses, name))
 
     Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
