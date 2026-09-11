@@ -25,6 +25,8 @@ set -euo pipefail
 
 PROJECT="$(dirname "$(dirname "$(readlink -f "$0")")")"
 cd "${PROJECT}"
+# shellcheck disable=SC1091
+source "${PROJECT}/local/env.sh"
 
 RETENTION="${RETENTION:-0}"
 RETENTION_RUNS="${RETENTION_RUNS:-full_s42 full_s43 full_s44 ifrlvr_s42 ifrlvr_s43 ifrlvr_s44}"
@@ -38,11 +40,11 @@ submit() {
     fi
 }
 
-# eval.sh: base model once, then every runs/*/adapter directory (the
-# glob stays a literal, unmatched string when no runs/ exist yet -- the
+# eval.sh: base model once, then every ${CONPO_RUNS_DIR}/*/adapter directory
+# (the glob stays a literal, unmatched string when none exist yet -- the
 # -d check below skips that case silently).
 submit local/eval.sh
-for adapter in runs/*/adapter; do
+for adapter in "${CONPO_RUNS_DIR}"/*/adapter; do
     [ -d "${adapter}" ] || continue
     submit local/eval.sh "${adapter}"
 done
@@ -50,6 +52,6 @@ done
 if [ "${RETENTION}" = "1" ]; then
     submit local/retention.sh
     for run_id in ${RETENTION_RUNS}; do
-        submit local/retention.sh "runs/${run_id}/adapter"
+        submit local/retention.sh "${CONPO_RUNS_DIR}/${run_id}/adapter"
     done
 fi

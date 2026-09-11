@@ -31,14 +31,14 @@
 #   RUN_SEED    default 42
 #   RUN_STEPS   optimiser-step budget, default 500 (design choice, builder,
 #               2026-09-04, matching local/train.sh's default)
-#   RUN_OUT_DIR default runs/${RUN_ARM}_s${RUN_SEED}
+#   RUN_OUT_DIR default ${CONPO_RUNS_DIR}/${RUN_ARM}_s${RUN_SEED}
 #   RUN_PAIRS   default ${RUN_OUT_DIR}/pairs.jsonl; step 1 skips building
 #               when a non-empty file already exists there
 #   RUN_SUBSET  vf_dpo only, key list build_pairs.py --subset filters
 #               --rows to, default subsets/train_15000_seed42.keys
 #   RUN_EDGES   edge_dpo only, an existing edges.jsonl from a finished full
-#               run, default runs/full_s${RUN_SEED}/edges.jsonl -- step 1
-#               fails loud when this does not exist
+#               run, default ${CONPO_RUNS_DIR}/full_s${RUN_SEED}/edges.jsonl
+#               -- step 1 fails loud when this does not exist
 
 set -euo pipefail
 source "$(dirname "$(readlink -f "$0")")/env.sh"
@@ -64,7 +64,7 @@ case "${RUN_ARM}" in
 esac
 export RUN_SEED="${RUN_SEED:-42}"
 export RUN_STEPS="${RUN_STEPS:-500}"
-export RUN_OUT_DIR="${RUN_OUT_DIR:-${PROJECT}/runs/${RUN_ARM}_s${RUN_SEED}}"
+export RUN_OUT_DIR="${RUN_OUT_DIR:-${CONPO_RUNS_DIR}/${RUN_ARM}_s${RUN_SEED}}"
 export RUN_PAIRS="${RUN_PAIRS:-${RUN_OUT_DIR}/pairs.jsonl}"
 export RUN_SUBSET="${RUN_SUBSET:-${PROJECT}/subsets/train_15000_seed42.keys}"
 mkdir -p "${RUN_OUT_DIR}"
@@ -76,7 +76,7 @@ echo "arm=${RUN_ARM} seed=${RUN_SEED} steps=${RUN_STEPS} pairs=${RUN_PAIRS} out=
 if [ -s "${RUN_PAIRS}" ]; then
     echo "pairs already exist at ${RUN_PAIRS}, skipping build_pairs.py"
 elif [ "${RUN_ARM}" = "edge_dpo" ]; then
-    RUN_EDGES="${RUN_EDGES:-${PROJECT}/runs/full_s${RUN_SEED}/edges.jsonl}"
+    RUN_EDGES="${RUN_EDGES:-${CONPO_RUNS_DIR}/full_s${RUN_SEED}/edges.jsonl}"
     if [ ! -s "${RUN_EDGES}" ]; then
         echo "RUN_EDGES=${RUN_EDGES} does not exist (edge_dpo needs a finished full run's edges.jsonl)"
         exit 1

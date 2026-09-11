@@ -20,7 +20,7 @@
 # Env:
 #   GPU           GPU index for CUDA_VISIBLE_DEVICES (default 0)
 #   EVAL_BACKEND  "vllm" (default here) or "hf"
-#   EVAL_OUT_DIR  results directory (default runs/eval_<adapter-or-base>_<jobid>)
+#   EVAL_OUT_DIR  results directory (default ${CONPO_RUNS_DIR}/eval_<adapter-or-base>_<jobid>)
 #   EVAL_LIMIT    cap rows per dataset/split, for a smoke run (unset = full)
 
 set -euo pipefail
@@ -37,7 +37,7 @@ export TRANSFORMERS_OFFLINE=1
 ADAPTER_DIR="${1:-}"
 BACKEND="${EVAL_BACKEND:-vllm}"
 ADAPTER_NAME="$(basename "${ADAPTER_DIR:-base}")"
-OUT_DIR="${EVAL_OUT_DIR:-${PROJECT}/runs/eval_${ADAPTER_NAME}_${JOB_ID}}"
+OUT_DIR="${EVAL_OUT_DIR:-${CONPO_RUNS_DIR}/eval_${ADAPTER_NAME}_${JOB_ID}}"
 mkdir -p "${OUT_DIR}"
 
 echo "adapter=${ADAPTER_DIR:-<base model>} backend=${BACKEND} out=${OUT_DIR}"

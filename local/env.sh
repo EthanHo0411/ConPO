@@ -55,6 +55,11 @@ export HF_HUB_CACHE="${CONPO_HF_HUB:-/node-local-cache/huggingface-home/hub}"
 export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
 export TRANSFORMERS_CACHE="${HF_HUB_CACHE}"
 
+# Run outputs and logs (Ethan's decision 2026-09-11): the node-local disk is
+# wiped about every 48 hours, so launcher outputs and logs default there;
+# local/harvest.sh moves a finished run into ${PROJECT}/runs on request.
+export CONPO_RUNS_DIR="${CONPO_RUNS_DIR:-/node-local-cache/cache/conpo-runs}"
+
 export TOKENIZERS_PARALLELISM=false
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

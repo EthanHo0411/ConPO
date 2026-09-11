@@ -104,6 +104,16 @@ Runs on this devbox (2x H100 80 GB, no job scheduler) via the uv venv
 for the full-FT point-check), so two single-GPU runs can share the box with
 `GPU=0` and `GPU=1`.
 
+Every launcher's output directory and log now default under `$CONPO_RUNS_DIR`
+(`local/env.sh`, default `/node-local-cache/cache/conpo-runs`) instead of
+`${PROJECT}/runs` and `${PROJECT}/logs`: the node-local disk is wiped about
+every 48 hours, so a fresh run lives there until it is worth keeping.
+`bash local/harvest.sh <run>` copies one named run (every run under
+`$CONPO_RUNS_DIR`, with no argument) into `runs/` with `rsync -a`, skipping
+`checkpoint-*/` unless `KEEP_CHECKPOINTS=1`; `DRY_RUN=1` previews the
+`rsync` commands without copying. An explicit `RUN_OUT_DIR` / `EVAL_OUT_DIR`
+still wins over the default, as always.
+
 0. **Sync the uv environment** (once, from the repo root):
    ```bash
    source local/env.sh && uv sync --frozen --extra cu130 --extra cluster --extra dev
@@ -126,9 +136,11 @@ for the full-FT point-check), so two single-GPU runs can share the box with
    ```
    Caches `config.POOL_DATASET`, `config.IFEVAL_DATASET`, nltk
    punkt/punkt_tab, and now also `snapshot_download`s the
-   `config.POLICY_MODEL` and `config.JUDGE_MODEL` weights into
-   `local/env.sh`'s shared hub (`/node-local-cache/huggingface-home/hub`).
-   Every launcher below runs with `HF_HUB_OFFLINE=1` against this cache.
+   `config.POLICY_MODEL`, `config.JUDGE_MODEL`, and every model in
+   `config.LATER_ABLATION_MODELS` (the model-axis replications, staged now
+   rather than at replication time) into `local/env.sh`'s shared hub
+   (`/node-local-cache/huggingface-home/hub`). Every launcher below runs
+   with `HF_HUB_OFFLINE=1` against this cache.
 
 2. **Build the training corpus** (CPU only):
    ```bash
@@ -149,8 +161,9 @@ for the full-FT point-check), so two single-GPU runs can share the box with
    `scripts/train.py`'s `build_judge` loads/unloads a `VLLMBatchedJudge`/
    `HFBatchedJudge` on the same card, in bursts, every `RUN_VETO_PERIOD`
    optimiser steps (`ConPOTrainer.flush_pending_veto`); writes to
-   `runs/full_s42/`. Add ablation overrides the same way, e.g.
-   `RUN_ARM=full RUN_NO_VETO=1 GPU=0 bash local/train.sh`.
+   `$CONPO_RUNS_DIR/full_s42/`. Add ablation overrides the same way, e.g.
+   `RUN_ARM=full RUN_NO_VETO=1 GPU=0 bash local/train.sh`. Once the run is
+   worth keeping past the node-local wipe: `bash local/harvest.sh full_s42`.
 
    **`RUN_JUDGE_MODE=http` fallback** (a resident judge server on the second
    H100, serialising every training run against it -- for comparison or
@@ -173,7 +186,8 @@ for the full-FT point-check), so two single-GPU runs can share the box with
      GPU=0 bash local/train_dpo.sh
    ```
    `edge_dpo` needs a finished `full` run's `edges.jsonl` (default
-   `runs/full_s${RUN_SEED}/edges.jsonl`) and fails loud when it is missing.
+   `$CONPO_RUNS_DIR/full_s${RUN_SEED}/edges.jsonl`) and fails loud when it
+   is missing.
 
 5. **Full fine-tune point-check** (two H100s, `local/train_fullft.sh`):
    `RUN_FULL_FT=1` (`scripts/train.py`, `peft_config=None`) under an
@@ -181,8 +195,8 @@ for the full-FT point-check), so two single-GPU runs can share the box with
    --num_processes 2` FSDP launch, sharding the full optimizer state across
    both cards (torch-native, not DeepSpeed ZeRO-2: `deepspeed` is not in
    `uv.lock`). `RUN_OUT_DIR` is explicit (a plain
-   `runs/${RUN_ARM}_s${RUN_SEED}` default would collide with the LoRA
-   `full_s42` run):
+   `$CONPO_RUNS_DIR/${RUN_ARM}_s${RUN_SEED}` default would collide with the
+   LoRA `full_s42` run):
    ```bash
    RUN_ARM=full RUN_SEED=42 RUN_FULL_FT=1 RUN_OUT_DIR=runs/full_fullft_s42 \
      bash local/train_fullft.sh
@@ -209,7 +223,7 @@ for the full-FT point-check), so two single-GPU runs can share the box with
    sequential -- each launcher owns whichever GPU it is given until it
    exits, since this devbox has no queue to serialise them):
    ```bash
-   bash local/eval_sweep.sh                      # eval.sh: base + every runs/*/adapter
+   bash local/eval_sweep.sh                      # eval.sh: base + every $CONPO_RUNS_DIR/*/adapter
    RETENTION=1 bash local/eval_sweep.sh           # + retention.sh (GSM8K/MMLU/BBH, USER DECISIONS)
    DRY_RUN=1 bash local/eval_sweep.sh             # print the launch lines instead of running
    ```

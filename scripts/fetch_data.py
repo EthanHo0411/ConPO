@@ -101,7 +101,7 @@ def main() -> None:
         # download lock even when nothing needs downloading. This stages once
         # and never syncs: a cached model is not refreshed from the Hub; delete
         # its hub entry to re-download.
-        for name in (config.POLICY_MODEL, config.JUDGE_MODEL):
+        for name in (config.POLICY_MODEL, config.JUDGE_MODEL, *config.LATER_ABLATION_MODELS.values()):
             print(f"model weights: {name}")
             try:
                 path = snapshot_download(name, local_files_only=True)

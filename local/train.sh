@@ -51,7 +51,7 @@
 #   TRAIN_SKIP_JUDGE  "1" to skip waiting on the judge endpoint (default "0",
 #                     only relevant with RUN_JUDGE_MODE=http)
 #   TRAIN_JUDGE_WAIT  seconds to wait for the endpoint file (default 3600)
-#   TRAIN_JUDGE_ENDPOINT  endpoint file (default runs/serve/judge.endpoint)
+#   TRAIN_JUDGE_ENDPOINT  endpoint file (default ${CONPO_RUNS_DIR}/serve/judge.endpoint)
 #   RUN_SUBSET        key list every arm trains on (default
 #                     subsets/train_15000_seed42.keys, the fixed 15k subset)
 #   RUN_JUDGE_MODE    "batched" (default) or "http" (needs the judge server)
@@ -78,7 +78,7 @@ export RUN_STEPS="${RUN_STEPS:-500}"
 export RUN_TOKEN_BUDGET="${RUN_TOKEN_BUDGET:-0}"
 export RUN_USE_VLLM="${RUN_USE_VLLM:-1}"
 export RUN_SUBSET="${RUN_SUBSET:-${PROJECT}/subsets/train_15000_seed42.keys}"
-export RUN_OUT_DIR="${RUN_OUT_DIR:-${PROJECT}/runs/${RUN_ARM}_s${RUN_SEED}}"
+export RUN_OUT_DIR="${RUN_OUT_DIR:-${CONPO_RUNS_DIR}/${RUN_ARM}_s${RUN_SEED}}"
 mkdir -p "${RUN_OUT_DIR}"
 
 echo "arm=${RUN_ARM} seed=${RUN_SEED} steps=${RUN_STEPS} token_budget=${RUN_TOKEN_BUDGET} subset=${RUN_SUBSET} out=${RUN_OUT_DIR}"
@@ -91,7 +91,7 @@ echo "arm=${RUN_ARM} seed=${RUN_SEED} steps=${RUN_STEPS} token_budget=${RUN_TOKE
 if [ "${RUN_NO_VETO:-0}" = "1" ] || [ "${TRAIN_SKIP_JUDGE:-0}" = "1" ] || [ "${RUN_JUDGE_MODE:-batched}" != "http" ]; then
     echo "not waiting on the judge server (RUN_NO_VETO=${RUN_NO_VETO:-0}, TRAIN_SKIP_JUDGE=${TRAIN_SKIP_JUDGE:-0}, RUN_JUDGE_MODE=${RUN_JUDGE_MODE:-batched})"
 else
-    ENDPOINT_FILE="${TRAIN_JUDGE_ENDPOINT:-${PROJECT}/runs/serve/judge.endpoint}"
+    ENDPOINT_FILE="${TRAIN_JUDGE_ENDPOINT:-${CONPO_RUNS_DIR}/serve/judge.endpoint}"
     WAIT="${TRAIN_JUDGE_WAIT:-3600}"
     echo "waiting up to ${WAIT}s for ${ENDPOINT_FILE}"
     END=$(( $(date +%s) + WAIT ))

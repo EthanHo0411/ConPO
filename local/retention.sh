@@ -16,7 +16,7 @@
 # Env:
 #   GPU           GPU index for CUDA_VISIBLE_DEVICES (default 0)
 #   EVAL_BACKEND  "vllm" (default here) or "hf"
-#   EVAL_OUT_DIR  results directory (default runs/retention_<adapter-or-base>_<jobid>)
+#   EVAL_OUT_DIR  results directory (default ${CONPO_RUNS_DIR}/retention_<adapter-or-base>_<jobid>)
 #   EVAL_LIMIT    cap rows per benchmark, for a smoke run (unset = full)
 #   EVAL_MODEL    replication model, overrides config.POLICY_MODEL
 
@@ -34,7 +34,7 @@ export TRANSFORMERS_OFFLINE=1
 ADAPTER_DIR="${1:-}"
 BACKEND="${EVAL_BACKEND:-vllm}"
 ADAPTER_NAME="$(basename "${ADAPTER_DIR:-base}")"
-OUT_DIR="${EVAL_OUT_DIR:-${PROJECT}/runs/retention_${ADAPTER_NAME}_${JOB_ID}}"
+OUT_DIR="${EVAL_OUT_DIR:-${CONPO_RUNS_DIR}/retention_${ADAPTER_NAME}_${JOB_ID}}"
 mkdir -p "${OUT_DIR}"
 
 echo "adapter=${ADAPTER_DIR:-<base model>} backend=${BACKEND} out=${OUT_DIR}"

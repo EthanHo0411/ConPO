@@ -30,7 +30,7 @@
 #   JS_PORT       port              (default 8000)
 #   JS_TTL        seconds to serve  (default 14400)
 #   JS_POLLS      health polls at 10s each before giving up (default 360)
-#   JS_ENDPOINT   endpoint file     (default runs/serve/judge.endpoint)
+#   JS_ENDPOINT   endpoint file     (default ${CONPO_RUNS_DIR}/serve/judge.endpoint)
 
 set -euo pipefail
 source "$(dirname "$(readlink -f "$0")")/env.sh"
@@ -48,7 +48,7 @@ export VLLM_ENABLE_V1_MULTIPROCESSING=1
 MODEL="$(python -c 'from conpo import config; print(config.JUDGE_MODEL)')"
 PORT="${JS_PORT:-8000}"
 TTL="${JS_TTL:-14400}"
-SERVE_DIR="${PROJECT}/runs/serve"
+SERVE_DIR="${CONPO_RUNS_DIR}/serve"
 ENDPOINT="${JS_ENDPOINT:-${SERVE_DIR}/judge.endpoint}"
 mkdir -p "${SERVE_DIR}"
 
