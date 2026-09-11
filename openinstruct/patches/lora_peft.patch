@@ -1,0 +1,59 @@
+--- a/open_instruct/grpo_fast.py
++++ b/open_instruct/grpo_fast.py
+@@ -357,6 +357,22 @@
+             attn_implementation=model_utils.olmo_core_attn_to_hf(model_config.attn_implementation),
+             **({"device_map": {"": self.local_rank}} if args.deepspeed_stage != 3 else {}),
+         )
++        if model_config.use_peft:
++            # ponytail: use_peft/lora_* parse but nothing ever called get_peft_model here
++            # (dpo_tune_cache.py and finetune.py do this same thing for their own models).
++            # Wrapping before deepspeed.initialize makes save_model's existing
++            # `isinstance(model_to_save, PeftModel)` branch fire instead of staying dead code.
++            from peft import LoraConfig, get_peft_model  # noqa: PLC0415
++
++            peft_config = LoraConfig(
++                task_type=model_config.lora_task_type,
++                r=model_config.lora_r,
++                lora_alpha=model_config.lora_alpha,
++                lora_dropout=model_config.lora_dropout,
++                target_modules=model_config.lora_target_modules,
++                modules_to_save=model_config.lora_modules_to_save,
++            )
++            self.policy = get_peft_model(self.policy, peft_config)
+         self.mpu = UlyssesSPAttentionHF.register_with_transformers(
+             model_name_or_path=self.policy,
+             core_attn_implementation=model_utils.olmo_core_attn_to_hf(model_config.attn_implementation),
+@@ -872,9 +888,15 @@
+             state_dict_keys = set(state_dict.keys())
+             output_state_dict_keys = set(output_state_dict.keys())
+ 
+-            # corner case for tie_word_embeddings, such as Qwen2-0.5B
+-            if getattr(model_to_save.config, "tie_word_embeddings", False) and "lm_head.weight" in state_dict_keys:
+-                state_dict_keys.remove("lm_head.weight")
++            # corner case for tie_word_embeddings, such as Qwen2-0.5B; ponytail: matched by
++            # suffix, not the exact "lm_head.weight" string, so this also covers a PEFT-wrapped
++            # policy (use_peft above), whose keys are all prefixed "base_model.model." (confirmed
++            # empirically: LoRA save_model failed here with `AssertionError: mismatch keys
++            # {'base_model.model.lm_head.weight'}`).
++            if getattr(model_to_save.config, "tie_word_embeddings", False):
++                tied_lm_head_keys = [k for k in state_dict_keys if k.endswith("lm_head.weight")]
++                if tied_lm_head_keys:
++                    state_dict_keys.discard(tied_lm_head_keys[0])
+ 
+             assert state_dict_keys.issubset(output_state_dict_keys), (
+                 f"mismatch keys {output_state_dict_keys.symmetric_difference(state_dict_keys)}"
+@@ -883,7 +905,13 @@
+             # only save peft weights https://github.com/microsoft/DeepSpeed/issues/4295
+             if isinstance(model_to_save, PeftModel):
+                 model_to_save.save_pretrained(output_dir)
+-                if self.stage == 3:
++                # ponytail: `self.stage` is never set anywhere on this class (grep confirms this
++                # is its only use) -- dead code before the LoRA patch above ever produced a
++                # PeftModel to reach it. Confirmed empirically: `AttributeError:
++                # 'PolicyTrainerRayProcess' object has no attribute 'stage'`. `self.args` is set
++                # in `from_pretrained`; `deepspeed_stage` is the field name used everywhere else
++                # in this class for the same DeepSpeed ZeRO stage.
++                if self.args.deepspeed_stage == 3:
+                     torch.save(
+                         get_peft_model_state_dict(model_to_save, output_state_dict), output_path / "adapter_model.bin"
+                     )

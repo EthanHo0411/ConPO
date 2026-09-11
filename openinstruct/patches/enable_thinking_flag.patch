@@ -1,0 +1,48 @@
+--- a/open_instruct/data_loader.py
++++ b/open_instruct/data_loader.py
+@@ -438,6 +438,10 @@
+     # Generation
+     temperature: float = 1.0
+     stop_strings: list[str] | None = None
++    enable_thinking: bool | None = None
++    """Forwarded to `tokenizer.apply_chat_template` for the rollout prompt (rlvr_tokenize_v1).
++    None leaves the tokenizer's own chat-template default untouched; set to False to force
++    non-thinking mode on templates that gate on this kwarg (e.g. Qwen3)."""
+     inflight_updates: bool = True
+     eval_response_length: int | None = None
+     """Local eval max tokens in GRPO `grpo_fast`. Defaults to `response_length` (see `__post_init__`)."""
+--- a/open_instruct/grpo_fast.py
++++ b/open_instruct/grpo_fast.py
+@@ -1126,6 +1126,7 @@
+             "system_prompt_override": system_prompt_override,
+             "tool_definitions": tool_definitions,
+             "pass_tools_to_chat_template": pass_tools_to_chat_template,
++            "enable_thinking": streaming_config.enable_thinking,
+         },
+         {"max_prompt_token_length": streaming_config.max_prompt_token_length},
+     ]
+--- a/open_instruct/dataset_transformation.py
++++ b/open_instruct/dataset_transformation.py
+@@ -1808,6 +1808,7 @@
+     system_prompt_override: str | None = None,
+     tool_definitions: list[dict[str, Any]] | None = None,
+     pass_tools_to_chat_template: bool = True,
++    enable_thinking: bool | None = None,
+ ):
+     prompt = row.pop(sft_messages_key)
+     assert len(prompt) > 0, "Empty prompt in dataset"
+@@ -1822,11 +1823,14 @@
+ 
+     tools_for_template = _resolve_tools_for_sample(row, tool_definitions, pass_tools_to_chat_template)
+ 
++    # `enable_thinking=None` (the default) leaves whatever the tokenizer's own chat template
++    # does unchanged; a template that never references the variable ignores it either way.
+     row[INPUT_IDS_PROMPT_KEY] = tokenizer.apply_chat_template(
+         prompt,
+         add_generation_prompt=True,
+         return_dict=False,
+         tools=tools_for_template,  # type: ignore[arg-type]
++        enable_thinking=enable_thinking,
+     )
+     if tokenizer.pad_token_id in row[INPUT_IDS_PROMPT_KEY]:
+         row[INPUT_IDS_PROMPT_KEY] = [x for x in row[INPUT_IDS_PROMPT_KEY] if x != tokenizer.pad_token_id]

@@ -1,0 +1,21 @@
+--- a/open_instruct/grpo_fast.py
++++ b/open_instruct/grpo_fast.py
+@@ -2064,7 +2064,17 @@
+     for i in range(0, len(dataset_mixer_list), 2):
+         dataset_name = dataset_mixer_list[i]
+         split = splits[i // 2]
+-        ds = datasets.load_dataset(dataset_name, split=split)
++        # ponytail: mirror dataset_transformation.py's own local-file branch (its
++        # RLVRDatasetConfig.__post_init__) -- datasets.load_dataset(dataset_name, ...) has no
++        # such branch here, so a local .jsonl/.parquet dataset_mixer_list path (any local path,
++        # tools or not) crashed this auto-discovery scan with FileNotFoundError before the run
++        # got anywhere near a GPU.
++        if os.path.exists(dataset_name) and dataset_name.endswith(".jsonl"):
++            ds = datasets.load_dataset("json", data_files=dataset_name, split=split)
++        elif os.path.exists(dataset_name) and dataset_name.endswith(".parquet"):
++            ds = datasets.load_dataset("parquet", data_files=dataset_name, split=split)
++        else:
++            ds = datasets.load_dataset(dataset_name, split=split)
+         if TOOLS_COLUMN_KEY in ds.column_names:
+             for tools in ds[TOOLS_COLUMN_KEY]:
+                 if tools:

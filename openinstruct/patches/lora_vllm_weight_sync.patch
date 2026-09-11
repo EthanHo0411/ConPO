@@ -1,0 +1,81 @@
+--- a/open_instruct/grpo_fast.py
++++ b/open_instruct/grpo_fast.py
+@@ -172,6 +172,20 @@
+     return None
+ 
+ 
++class _NamedParamsView:
++    """Minimal named_parameters()/parameters() view over a fixed (name, Parameter) list, for
++    broadcast_weights_to_vllm's PEFT branch (see PolicyTrainerRayProcess.broadcast_to_vllm)."""
++
++    def __init__(self, named_params: list[tuple[str, torch.nn.Parameter]]):
++        self._named_params = named_params
++
++    def named_parameters(self):
++        return iter(self._named_params)
++
++    def parameters(self):
++        return (p for _, p in self._named_params)
++
++
+ def _startup_debug_context(
+     args: grpo_utils.GRPOExperimentConfig,
+     requirements: dict[str, Any],
+@@ -556,14 +570,49 @@
+         # Ensure CUDA device is set before broadcast operations.
+         # DeepSpeed 0.17.3+ sets device_id in init_process_group which affects NCCL device binding.
+         torch.cuda.set_device(self.local_rank)
+-        return vllm_utils.broadcast_weights_to_vllm(
+-            model=self.model.module,
+-            vllm_engines=self.vllm_engines,
+-            model_update_group=self.model_update_group,
+-            model_step=model_step,
+-            gather_whole_model=self.args.gather_whole_model,
+-            name_mapper=_build_vlm_name_mapper(self._model_name_or_path),
+-        )
++        base_module = self.model.module
++        is_peft = isinstance(base_module, PeftModel)
++        sync_module = base_module
++        if is_peft:
++            # ponytail: broadcast_weights_to_vllm/_broadcast_weights_ipc call .named_parameters()
++            # directly on whatever `model=` they get; none of a PeftModel's own names exist on
++            # vLLM's plain Qwen3ForCausalLM. Three PEFT naming artifacts to undo (the first two
++            # each confirmed by an actual traceback, the third necessary for the same reason):
++            # the "base_model.model." prefix on every name
++            # ("no module or parameter named 'base_model'"), the interleaved lora_A/lora_B
++            # submodule params, and PEFT's lora.Linear wrapper renaming the wrapped layer's own
++            # weight from "<layer>.weight" to "<layer>.base_layer.weight" (vLLM's own qkv-fusion
++            # loader raised `KeyError: 'layers.0.self_attn.qkv_proj.base_layer.weight'` -- it
++            # recognizes "qkv_proj.weight", not the PEFT-nested name). merge_adapter() folds the
++            # LoRA delta into the base weight tensors in place first (the same PEFT pattern TRL
++            # uses for LoRA + colocated vLLM), so this view sends the fine-tuned values under
++            # vLLM's own plain parameter names; unmerge_adapter() in `finally` restores the
++            # trainable split for the next step. Safe with the IPC backend (single_gpu_mode):
++            # _broadcast_weights_ipc reads `p.data` synchronously before returning, nothing is
++            # cloned or sent after this call unwinds.
++            base_module.merge_adapter()
++            prefix = "base_model.model."
++            filtered = []
++            for name, param in base_module.named_parameters():
++                if ".lora_A." in name or ".lora_B." in name:
++                    continue
++                if name.startswith(prefix):
++                    name = name[len(prefix) :]
++                name = name.replace(".base_layer.", ".")
++                filtered.append((name, param))
++            sync_module = _NamedParamsView(filtered)
++        try:
++            return vllm_utils.broadcast_weights_to_vllm(
++                model=sync_module,
++                vllm_engines=self.vllm_engines,
++                model_update_group=self.model_update_group,
++                model_step=model_step,
++                gather_whole_model=self.args.gather_whole_model,
++                name_mapper=_build_vlm_name_mapper(self._model_name_or_path),
++            )
++        finally:
++            if is_peft:
++                base_module.unmerge_adapter()
+ 
+     def update_ref_policy(self):
+         if not self.args.load_ref_policy:
