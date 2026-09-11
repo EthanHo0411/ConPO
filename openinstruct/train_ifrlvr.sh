@@ -75,6 +75,16 @@ export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
 export TRANSFORMERS_CACHE="${HF_HUB_CACHE}"
 export NLTK_DATA="${CONPO_ROOT}/nltk_data"
 export TOKENIZERS_PARALLELISM=false
+# Overrides ConPO's own local/env.sh (expandable_segments:True, needed there for its own
+# multi-tensor TRL run) for this process tree only. With single_gpu_mode, weight sync always
+# goes over vLLM's IPC backend (open_instruct/vllm_utils.py:1275 hardcodes
+# backend="ipc" if use_hybrid_engine else "nccl", never reads --vllm_sync_backend -- see
+# README.md "Weight sync backend"); expandable_segments makes torch back some CUDA storages
+# with a cuMem virtual-memory segment, whose cross-process share goes through pidfd_getfd
+# (torch/multiprocessing/reductions.py's _share_cuda_/rebuild_cuda_tensor), a syscall this
+# container's ptrace policy denies. False keeps every storage on classic cudaMalloc segments,
+# so the same IPC path uses cudaIpcMemHandle instead (no fd, no pidfd_getfd, no ptrace needed).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
 # See setup_venv.sh: DeepSpeed's op_builder reads this directly and otherwise falls back to
 # $HOME/.triton/autotune, outside the boundary.
 export TRITON_CACHE_DIR="/node-local-cache/cache/triton"

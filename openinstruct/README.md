@@ -191,6 +191,58 @@ training step. Safe under the IPC backend (`single_gpu_mode`): `_broadcast_weigh
 `p.data` and sends it synchronously before returning -- nothing is cloned or sent after
 `unmerge_adapter()` runs.
 
+## Weight sync backend: `--vllm_sync_backend` is dead here; the real fix is the allocator
+
+The full 937-step run's first weight sync crashed the trainer's `broadcast_to_vllm` and vLLM's
+`EngineCore` alike with `RuntimeError: pidfd_getfd: Operation not permitted`
+(`open_instruct/vllm_utils.py:1378` -> vendored vLLM's
+`vllm/distributed/weight_transfer/ipc_engine.py:279` `trainer_send_weights` /
+`ipc_engine.py:191` `receive_weights`), even though `train_ifrlvr.sh` already passed
+`--vllm_sync_backend gloo` (copied from open-instruct's own debug scripts, e.g.
+`scripts/train/debug/grpo_fast.sh`) and the earlier 3-step/64-row smoke test had passed with
+weight_sync around 0.17s/step under the exact same flag.
+
+**`--vllm_sync_backend` never reaches the weight-transfer engine in this pinned open-instruct.**
+It parses into `VLLMConfig.vllm_sync_backend` (`open_instruct/data_loader.py:399`, default
+`"nccl"`) but `create_vllm_engines()`'s call site (`open_instruct/grpo_fast.py:1428-1456`) never
+passes it through -- confirmed by reading that call's full argument list. The backend actually
+used is hardcoded from `single_gpu_mode` alone: `open_instruct/vllm_utils.py:1275` sets
+`WeightTransferConfig(backend="ipc" if use_hybrid_engine else "nccl")`, where
+`use_hybrid_engine = pg is not None` and `pg` is only threaded through when `--single_gpu_mode`
+is set (`grpo_fast.py:1439-1440`). Both the smoke and full logs confirm this: both print
+`Creating weight transfer engine: IPCWeightTransferEngine` (`vllm/distributed/weight_transfer/
+factory.py:100`) despite `vllm_sync_backend='gloo'` in the printed args -- the flag is inert.
+There is also no NCCL/Gloo escape available here: switching backends means dropping
+`--single_gpu_mode`, and NCCL needs a real second GPU-rank in the process group, which this
+task's one-GPU-only constraint (GPU 0 is a live, untouchable run) rules out. `--vllm_sync_backend
+gloo` is left in the launch command below (harmless, matches upstream's own debug scripts) but
+should not be read as doing anything in this vendored version.
+
+**Actual root cause: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.** ConPO's own
+`local/env.sh:65` exports this for its own (multi-GPU, non-colocated) TRL runs, and it stays in
+the ambient shell that both the smoke and full `train_ifrlvr.sh` launches inherit (`.ethan-env`
+does not touch this variable). Under `expandable_segments:True`, torch's CUDA caching allocator
+backs some storages with a `cuMemCreate`-based virtual-memory segment; sharing a tensor on such
+a segment across processes needs a real POSIX file descriptor passed between processes, which
+torch does via `pidfd_getfd` (`torch/multiprocessing/reductions.py:154,353`
+`rebuild_cuda_tensor`/`_share_cuda_`; the `pidfd_getfd` symbol itself is compiled into
+`torch/lib/libc10_cuda.so`, confirmed via `strings`). `pidfd_getfd` needs ptrace-equivalent
+permission (`CAP_SYS_PTRACE`, or a strict parent/child relation) that this K8s pod's Ray
+worker processes -- siblings under the same raylet, not parent/child of each other -- do not
+have, so the call raises `EPERM` whenever the tensor being sent actually lives on one of these
+segments. Whether a given weight tensor does depends on the caching allocator's accumulated
+state at the moment of the very first `broadcast_to_vllm` call, which differs between the tiny
+64-row smoke run and the 15,000-row full run's dataset/tool-pool setup -- explaining why the
+smoke test's identical code path did not hit it while the full run's did, on its first sync.
+Plain `cudaMalloc` segments use the classic driver-level `cudaIpcMemHandle_t` reduction instead,
+which needs no file descriptor and no `pidfd_getfd` call at all.
+
+**Fix:** `train_ifrlvr.sh` now exports `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` for
+this process tree only (after the other env exports, overriding whatever `local/env.sh` set in
+the calling shell), keeping every CUDA storage on classic segments so weight sync's IPC
+reduction never needs `pidfd_getfd`. No ConPO training knob (LR, LoRA config, batch size, seed,
+...) changes.
+
 ## Data: dataset schema and family mapping
 
 `IFEvalVerifier.__call__` (`open_instruct/ground_truth_utils.py:310-354`) reads three row
