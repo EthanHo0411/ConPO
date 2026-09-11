@@ -9,7 +9,19 @@ from pathlib import Path
 
 import pytest
 
-from conpo.retention import RetentionRow, rows_from_bbh, rows_from_gsm8k, rows_from_mmlu, score_bbh, score_gsm8k, score_mmlu
+from conpo.retention import (
+    RetentionRow,
+    extract_bbh_prediction,
+    extract_gsm8k_prediction,
+    extract_mmlu_prediction,
+    extract_prediction,
+    rows_from_bbh,
+    rows_from_gsm8k,
+    rows_from_mmlu,
+    score_bbh,
+    score_gsm8k,
+    score_mmlu,
+)
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
@@ -87,6 +99,44 @@ def test_score_bbh_trailing_full_stop_stripped() -> None:
 
 def test_score_bbh_wrong_answer() -> None:
     assert score_bbh("Reasoning.\nFalse.", "True") is False
+
+
+# --- extract_*_prediction ------------------------------------------------------
+
+
+def test_extract_gsm8k_prediction_uses_marker() -> None:
+    assert extract_gsm8k_prediction("Step 1... Step 2...\n#### 18") == "18"
+
+
+def test_extract_gsm8k_prediction_none_when_no_number() -> None:
+    assert extract_gsm8k_prediction("I don't know.") is None
+
+
+def test_extract_mmlu_prediction_none_when_no_letter() -> None:
+    assert extract_mmlu_prediction("I am not sure about this one.") is None
+
+
+def test_extract_bbh_prediction_last_line() -> None:
+    assert extract_bbh_prediction("Reasoning...\nThe answer is (a).") == "the answer is (a)"
+
+
+def test_extract_bbh_prediction_none_when_empty() -> None:
+    assert extract_bbh_prediction("") is None
+
+
+def test_extract_prediction_dispatches_by_benchmark() -> None:
+    gsm8k_row = RetentionRow(key="k", benchmark="gsm8k", prompt="p", target="18", group="")
+    mmlu_row = RetentionRow(key="k", benchmark="mmlu", prompt="p", target="B", group="")
+    bbh_row = RetentionRow(key="k", benchmark="bbh", prompt="p", target="True", group="")
+    assert extract_prediction(gsm8k_row, "#### 18") == "18"
+    assert extract_prediction(mmlu_row, "B") == "B"
+    assert extract_prediction(bbh_row, "True") == "true"
+
+
+def test_extract_prediction_unknown_benchmark_raises() -> None:
+    row = RetentionRow(key="k", benchmark="nope", prompt="p", target="x", group="")
+    with pytest.raises(ValueError):
+        extract_prediction(row, "anything")
 
 
 # --- rows_from_* ---------------------------------------------------------------
@@ -220,6 +270,17 @@ def test_eval_retention_score_only_all_benchmarks(tmp_path: Path, monkeypatch: p
     assert by_key["gsm8k:2"]["correct"] is False
     assert by_key["mmlu:2"]["group"] == "sub2"
     assert by_key["bbh:task_b:0"]["correct"] is True
+
+    # response/prediction/gold: inspectable without re-running generation.
+    assert by_key["gsm8k:2"]["response"] == "#### 99"
+    assert by_key["gsm8k:2"]["prediction"] == "99"
+    assert by_key["gsm8k:2"]["gold"] == "3"
+    assert by_key["mmlu:2"]["response"] == "D"
+    assert by_key["mmlu:2"]["prediction"] == "D"
+    assert by_key["mmlu:2"]["gold"] == "C"
+    assert by_key["bbh:task_a:1"]["response"] == "banana"
+    assert by_key["bbh:task_a:1"]["prediction"] == "banana"
+    assert by_key["bbh:task_a:1"]["gold"] == "False"
 
 
 def test_eval_retention_score_only_missing_key_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

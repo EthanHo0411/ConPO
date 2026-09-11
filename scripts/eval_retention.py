@@ -8,7 +8,8 @@ a requested row raises KeyError, mirroring scripts/eval_internal.py).
 Alongside `--out`'s JSON ({benchmark: accuracy, "n", "correct", "by_group",
 "model", "adapter", "max_tokens", "limit"} -- a benchmark not requested is
 absent throughout, never written as 0), `<out>.verdicts.jsonl` carries one
-line per scored prompt: {key, benchmark, group, correct}.
+line per scored prompt: {key, benchmark, group, correct, response,
+prediction, gold}.
 """
 
 import argparse
@@ -26,7 +27,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 import eval_external  # noqa: E402 -- generate_greedy / _load_hf_engine / _generate_vllm live here
 
 from conpo import config
-from conpo.retention import RetentionRow, score
+from conpo.retention import RetentionRow, extract_prediction, score
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 BENCHMARKS = ("gsm8k", "mmlu", "bbh")
@@ -61,11 +62,22 @@ def _load_canned_responses(path: str) -> dict[str, str]:
 
 
 def record_verdicts(rows: Sequence[RetentionRow], responses: Sequence[str]) -> list[dict[str, Any]]:
-    """One verdict dict per row: key, benchmark, group, correct."""
+    """One verdict dict per row: key, benchmark, group, correct, response
+    (full model output), prediction (the scorer's extracted answer, None if
+    extraction found nothing) and gold (row.target) -- so a failed group can
+    be diagnosed from the verdicts file alone."""
     out = []
     for row, response in zip(rows, responses):
         out.append(
-            {"key": row.key, "benchmark": row.benchmark, "group": row.group, "correct": bool(score(row, response))}
+            {
+                "key": row.key,
+                "benchmark": row.benchmark,
+                "group": row.group,
+                "correct": bool(score(row, response)),
+                "response": response,
+                "prediction": extract_prediction(row, response),
+                "gold": row.target,
+            }
         )
     return out
 
