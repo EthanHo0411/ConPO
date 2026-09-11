@@ -103,7 +103,7 @@ from conpo.stats import mean_std, paired_bootstrap_diff, verdict_from_ci, wilson
 # conpo -> reserch2) -- the base a card's repo-relative "eval_dir" field
 # resolves against (same convention as scripts/run_card.py's eval_dir_str).
 _RESERCH2_ROOT = Path(__file__).resolve().parent.parent.parent
-_CONPO_REPO_ROOT = _RESERCH2_ROOT / "conpo"
+_CONPO_REPO_ROOT = Path(__file__).resolve().parent.parent  # this repo itself (the umbrella may call the checkout conpo, ConPO, or a symlink)
 
 # Default 15k subset manifest (USER DECISION 2026-09-03: the dashboard
 # carries run configuration on its own, section 0 below) -- overridable via
