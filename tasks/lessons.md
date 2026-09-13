@@ -43,3 +43,8 @@
 - **What went wrong**: a diagnostic eval of full_s42's checkpoint-50 pointed at the node-local run directory and crashed: `save_total_limit=2` (scripts/train.py) had already deleted checkpoints 25 and 50 when 75 and 90 were written.
 - **Rule**: evaluate or resume older checkpoints from the NFS harvest (`runs/<run>/checkpoint-N`, kept by `KEEP_CHECKPOINTS=1 bash local/harvest.sh <run>` every tick); node-local holds only the newest two.
 - **Category**: implementation
+
+### 2026-09-13 | Pod restart removed the policy model from the shared hub
+- **What went wrong**: after the restart wiped node-local, both resumed runs died at model load ("couldn't find them in the cached files"): the shared hub had lost `models--Qwen--Qwen3-4B` while keeping Qwen3-14B. The venv fallback to `ConPO/.venv` on NFS worked, so the wipe surfaced one layer later than expected.
+- **Rule**: after any node-local wipe, verify the three layers in order before launching: venv (`ls $CONPO_VENV/bin/python`), hub models (`ls $HF_HUB_CACHE/models--Qwen--Qwen3-4B/snapshots/*/model.safetensors.index.json` and the judge), run directory (newest checkpoint with conpo_state.json). Re-download from a script with the offline variables unset; never launch chains that cascade into the next run before the first step of the resumed run is confirmed.
+- **Category**: implementation
