@@ -19,7 +19,7 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig
 from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM, TrainerCallback
-from trl import GRPOConfig
+from trl import GRPOConfig, GRPOTrainer
 
 import conpo.operators  # noqa: F401  registers all 53 corruption operators
 from conpo import config
@@ -1130,6 +1130,119 @@ def test_flush_deferred_vllm_sleep_runs_before_periodic_veto_flush(
     assert call_order.count("flush_deferred_sleep") == 1
     assert len(call_order) >= 2
     assert all(item == "flush_pending_veto" for item in call_order[1:])
+
+
+# ---------------------------------------------------------------------------
+# K4 RUN_KL_CLAMP (devbox 2026-09-13): ConPOTrainer._compute_loss is a full
+# copy of TRL 1.9.2's own GRPOTrainer._compute_loss (no overridable KL hook
+# exists there -- see conpo/trainer.py's comment above the method) with one
+# added clamp on the KL diff. Both tests call _compute_loss directly on a
+# hand-built GRPO-shaped inputs dict, bypassing generation/edges/judge
+# entirely (none of which the KL diff touches).
+# ---------------------------------------------------------------------------
+
+_KL_TEST_VOCAB_SIZE = 151936  # matches _tiny_model_and_tokenizer's Qwen3Config
+
+
+def _kl_clamp_trainer(tmp_path: Path) -> ConPOTrainer:
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=1,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    arm, overrides = resolve_arm("solve_only")
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=EdgeBuffer(),
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=overrides,
+        peft_config=_lora_config(),
+    )
+    # _compute_loss reads current_gradient_accumulation_steps, normally set
+    # per-batch by transformers.Trainer._inner_training_loop; these tests
+    # call _compute_loss directly (no trainer.train()), so set it by hand.
+    trainer.current_gradient_accumulation_steps = grpo_config.gradient_accumulation_steps
+    return trainer
+
+
+def _kl_clamp_inputs() -> dict[str, torch.Tensor]:
+    """Minimal GRPO-shaped micro-batch _compute_loss needs: 2 prompts x
+    3-token completions, no padding. ref_per_token_logps is set far from
+    any plausible policy log-prob so the unclamped KL diff is clearly
+    nonzero (needed by the unset-path equivalence test to actually
+    exercise the KL branch; the clamp=0.0 test doesn't depend on this
+    value at all, since the clamp forces the diff to 0 regardless)."""
+    torch.manual_seed(0)
+    return {
+        "prompt_ids": torch.randint(0, _KL_TEST_VOCAB_SIZE, (2, 4)),
+        "prompt_mask": torch.ones(2, 4, dtype=torch.long),
+        "completion_ids": torch.randint(0, _KL_TEST_VOCAB_SIZE, (2, 3)),
+        "completion_mask": torch.ones(2, 3, dtype=torch.long),
+        "advantages": torch.tensor([1.0, -0.5]),
+        "ref_per_token_logps": torch.full((2, 3), -50.0),
+    }
+
+
+def test_compute_loss_kl_clamp_unset_matches_trl(tmp_path: Path) -> None:
+    """RUN_KL_CLAMP unset -> self._kl_clamp is None -> the clamp branch in
+    ConPOTrainer._compute_loss is a no-op, so its result must be exactly
+    what TRL's own (un-subclassed) _compute_loss returns on the identical
+    trainer instance, model and inputs."""
+    trainer = _kl_clamp_trainer(tmp_path)
+    assert trainer._kl_clamp is None
+    inputs = _kl_clamp_inputs()
+
+    loss_ours = trainer._compute_loss(trainer.model, inputs)
+    loss_trl = GRPOTrainer._compute_loss(trainer, trainer.model, inputs)
+
+    assert torch.equal(loss_ours, loss_trl)
+
+
+def test_compute_loss_kl_clamp_zero_collapses_kl_to_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_KL_CLAMP=0.0 clamps every token's diff to [0, 0], so per_token_kl
+    (exp(0) - 0 - 1) is exactly 0 for every masked token no matter how far
+    ref_per_token_logps sits from the policy's own -- checked via the "kl"
+    metric _compute_loss records (global_masked_mean(per_token_kl) over the
+    fully-unmasked batch), which is exactly 0.0 only if every token is."""
+    monkeypatch.setenv("RUN_KL_CLAMP", "0.0")
+    trainer = _kl_clamp_trainer(tmp_path)
+    assert trainer._kl_clamp == 0.0
+    inputs = _kl_clamp_inputs()
+
+    trainer._compute_loss(trainer.model, inputs)
+
+    assert trainer._metrics["train"]["kl"][-1] == 0.0
 
 
 # ---------------------------------------------------------------------------
