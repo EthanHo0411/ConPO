@@ -299,6 +299,11 @@ def test_full_arm_two_optimizer_steps(tmp_path: Path, monkeypatch: pytest.Monkey
     }
     for record in records:
         assert expected_keys <= record.keys()
+        # K5 RUN_RESAMPLE_ZERO_STD unset (this test's default): the
+        # resample_* keys must be absent, not zero, proving the flag-off
+        # path never runs _resample_degenerate_groups.
+        assert "resample_groups_replaced" not in record
+        assert "resample_rounds" not in record
     # Both raw anchors are lifetime cumulative counters (gap 3): never
     # decrease from one step's record to the next.
     assert records[0]["tokens_cumulative"] <= records[1]["tokens_cumulative"]
@@ -1439,6 +1444,121 @@ def test_score_edge_pairs_token_clamp_reports_frac_in_unit_interval(
 
     frac = trainer.last_loss_stats["resp_token_clamp_frac"]
     assert 0.0 <= frac <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# K5 RUN_RESAMPLE_ZERO_STD (devbox 2026-09-13): a degenerate (zero-reward-std)
+# prompt group is replaced with a freshly drawn, freshly generated substitute
+# from rows_by_key, up to RUN_RESAMPLE_MAX_ROUNDS extra rounds. Both tests
+# rig reward_conjunctive at the class level (must happen before construction:
+# ConPOTrainer.__init__ binds self.reward_conjunctive into GRPOConfig's
+# reward_funcs once, so a post-construction instance patch would not be
+# seen) and run a real trainer.train() over the tiny model, forward/reverse/
+# prompt_loss/resp_loss all off to isolate _resample_degenerate_groups from
+# every other mechanism.
+# ---------------------------------------------------------------------------
+
+
+def _resample_trainer(tmp_path: Path, rows_by_key: dict[str, PoolRow]) -> ConPOTrainer:
+    model, tokenizer = _tiny_model_and_tokenizer()
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": ROW_A.prompt}], "key": ROW_A.key}])
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=1,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    arm = ArmSpec(reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=False)
+    return ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=EdgeBuffer(),
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=Overrides(),
+        peft_config=_lora_config(),
+        probe_enabled=False,
+    )
+
+
+def _mechanism_records(mechanism_log_path: Path) -> list[dict[str, object]]:
+    lines = mechanism_log_path.read_text(encoding="utf-8").splitlines()
+    return [r for r in (json.loads(line) for line in lines if line.strip()) if "event" not in r]
+
+
+def test_resample_zero_std_replaces_degenerate_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dataset holds only ROW_A, whose rigged reward is constant (zero
+    std, degenerate); rows_by_key also carries ROW_B, whose rigged reward
+    alternates within any group (nonzero std). RUN_RESAMPLE_ZERO_STD must
+    draw ROW_B as ROW_A's only candidate substitute, splice its freshly
+    generated group into `output`, and report the swap -- with the
+    degenerate_group_rate the existing per-group loop computes afterward
+    improving to 0.0."""
+
+    def rigged_reward(self: ConPOTrainer, completions: object, key: list[str], **_: object) -> list[float]:
+        return [1.0 if k == ROW_A.key else float(i % 2) for i, k in enumerate(key)]
+
+    monkeypatch.setattr(ConPOTrainer, "reward_conjunctive", rigged_reward)
+    monkeypatch.setenv("RUN_RESAMPLE_ZERO_STD", "1")
+
+    trainer = _resample_trainer(tmp_path, {ROW_A.key: ROW_A, ROW_B.key: ROW_B})
+    assert trainer._resample_zero_std is True
+
+    trainer.train()
+
+    records = _mechanism_records(trainer.mechanism_log_path)
+    assert len(records) == 1
+    assert records[0]["resample_groups_replaced"] >= 1
+    assert records[0]["degenerate_group_rate"] == 0.0
+
+
+def test_resample_zero_std_stops_at_round_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every candidate row (including the original) scores a constant
+    reward under this rig, so no substitute is ever informative:
+    _resample_degenerate_groups must run exactly RUN_RESAMPLE_MAX_ROUNDS
+    rounds, then let training proceed with the still-degenerate batch
+    rather than hang or raise."""
+
+    def always_degenerate_reward(self: ConPOTrainer, completions: object, key: list[str], **_: object) -> list[float]:
+        return [1.0 for _ in completions]
+
+    monkeypatch.setattr(ConPOTrainer, "reward_conjunctive", always_degenerate_reward)
+    monkeypatch.setenv("RUN_RESAMPLE_ZERO_STD", "1")
+    monkeypatch.setenv("RUN_RESAMPLE_MAX_ROUNDS", "2")
+
+    rows_by_key = {r.key: r for r in (ROW_A, ROW_B, ROW_C, ROW_D)}
+    trainer = _resample_trainer(tmp_path, rows_by_key)
+    assert trainer._resample_max_rounds == 2
+
+    trainer.train()  # must return, not hang or raise, once the round cap is hit
+
+    assert trainer.state.global_step == 1
+    records = _mechanism_records(trainer.mechanism_log_path)
+    assert len(records) == 1
+    assert records[0]["resample_rounds"] == 2
+    assert records[0]["degenerate_group_rate"] == 1.0
 
 
 # ---------------------------------------------------------------------------

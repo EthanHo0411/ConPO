@@ -139,6 +139,21 @@ def _completion_text(completion: object) -> str:
     return str(completion)
 
 
+def _pad_last_dim(tensor: torch.Tensor, width: int, side: str, value: float) -> torch.Tensor:
+    """Right- or left-pad a 2D tensor's last (sequence) dimension to
+    `width` with `value`; a no-op if it is already that wide. `side` is
+    "left" or "right", matching TRL's own `pad()` padding-side convention
+    (grpo_trainer.py: left for prompt tensors, right for completion-aligned
+    ones) -- used by ConPOTrainer._splice_group_output (RUN_RESAMPLE_ZERO_STD)
+    to reconcile two independently-padded _generate_and_score_completions
+    outputs before splicing rows from one into the other."""
+    extra = width - tensor.shape[-1]
+    if extra <= 0:
+        return tensor
+    pad_spec = (extra, 0) if side == "left" else (0, extra)
+    return torch.nn.functional.pad(tensor, pad_spec, value=value)
+
+
 def _tokenize_prompt_response(
     tokenizer: object, prompt_text: str, response: str
 ) -> tuple[torch.LongTensor, torch.LongTensor, torch.LongTensor]:
@@ -340,6 +355,19 @@ class ConPOTrainer(GRPOTrainer):
         self._token_logratio_clamp: float | None = (
             float(raw_token_logratio_clamp) if raw_token_logratio_clamp else None
         )
+        # RUN_RESAMPLE_ZERO_STD (K5, default unset): in
+        # _generate_and_score_completions, a prompt group whose rewards all
+        # have zero std (torch.allclose to zeros) carries no gradient signal
+        # (GRPO advantages are all zero); when set, such a group is
+        # replaced with a freshly drawn, freshly generated substitute prompt
+        # (_resample_degenerate_groups) instead of being trained on as-is.
+        # RUN_RESAMPLE_MAX_ROUNDS caps the number of extra generation rounds
+        # spent trying (default 3, open-instruct has no direct equivalent);
+        # once exhausted, the batch proceeds with whatever it still holds.
+        # Read once here, same convention as _kl_clamp/_token_logratio_clamp
+        # above.
+        self._resample_zero_std = config.env("RUN_RESAMPLE_ZERO_STD", "0") == "1"
+        self._resample_max_rounds = int(config.env("RUN_RESAMPLE_MAX_ROUNDS", "3"))
 
         # Wall-clock accumulation across RUN_RESUME processes (scripts/train.py):
         # the node-local disk is wiped roughly every 48 hours, so one logical
@@ -519,6 +547,16 @@ class ConPOTrainer(GRPOTrainer):
             self._vllm_sleep_pending = False
         t0 = time.perf_counter()
         output = super()._generate_and_score_completions(inputs)
+        # n moved up here (was computed further down, just above the
+        # per-group loop): RUN_RESAMPLE_ZERO_STD needs the group size before
+        # that loop runs, to find and replace degenerate groups in `inputs`/
+        # `output` while there is still time for the rest of this method to
+        # see the replacement instead of the original.
+        n = self.num_generations if self.model.training else self.num_generations_eval
+        resample_groups_replaced = 0
+        resample_rounds = 0
+        if self._resample_zero_std:
+            resample_groups_replaced, resample_rounds = self._resample_degenerate_groups(inputs, output, n)
         # Reset here, not in on_step_begin: TRL's own generation-batch cache
         # means this method (and therefore this step's forward/reverse work)
         # runs only on the first micro-batch of an accumulation
@@ -539,7 +577,6 @@ class ConPOTrainer(GRPOTrainer):
         self.meter.add(self.engine.count_tokens(completions_text))
 
         current_update = self.state.global_step
-        n = self.num_generations if self.model.training else self.num_generations_eval
         advantages = output["advantages"]
 
         forward_reasons: Counter[str] = Counter()
@@ -566,7 +603,7 @@ class ConPOTrainer(GRPOTrainer):
             group_completions = completions_text[start:end]
             group_advantages = advantages[start:end]
             total_groups += 1
-            if torch.allclose(group_advantages, torch.zeros_like(group_advantages)):
+            if self._group_is_degenerate(group_advantages):
                 degenerate_groups += 1
 
             observations: dict[str, list[bool]] = {c.iid: [] for c in row.constraints}
@@ -769,6 +806,12 @@ class ConPOTrainer(GRPOTrainer):
         # wrapped llm.wake_up after this dict is built.
         if self._engine_seconds is not None:
             record["engine_seconds"] = self._engine_seconds
+        # RUN_RESAMPLE_ZERO_STD (K5): only present when the flag is on, same
+        # convention as engine_seconds/pair_stats_top_pairs above -- absent,
+        # not zero, is how a flag-off run reports "not attempted" here.
+        if self._resample_zero_std:
+            record["resample_groups_replaced"] = resample_groups_replaced
+            record["resample_rounds"] = resample_rounds
         if self.pair_stats is not None and current_update % config.PROBE_PERIOD_S == 0:
             record["pair_stats_top_pairs"] = [list(row) for row in self.pair_stats.top_pairs(5)]
         # Stashed, not written here -- see the __init__ comment on
@@ -802,6 +845,87 @@ class ConPOTrainer(GRPOTrainer):
             self.control.should_training_stop = True
 
         return output
+
+    @staticmethod
+    def _group_is_degenerate(group_advantages: torch.Tensor) -> bool:
+        """True iff every advantage in this prompt group is (numerically)
+        zero -- the group's reward std was zero, so GRPO's own advantage
+        normalisation leaves nothing for the policy gradient to learn from
+        it. Shared by the per-group loop above and
+        _resample_degenerate_groups below (RUN_RESAMPLE_ZERO_STD)."""
+        return bool(torch.allclose(group_advantages, torch.zeros_like(group_advantages)))
+
+    def _splice_group_output(
+        self, output: dict[str, object], sub_output: dict[str, object], start: int, end: int
+    ) -> None:
+        """Overwrite output[key][start:end] with sub_output[key] for every
+        per-row key a _generate_and_score_completions call may return,
+        padding both to a common sequence width first: two separate calls
+        each pad prompt/completion to their own max length (TRL's
+        grpo_trainer.py), so a shorter side must be grown before an
+        in-place slice assignment can work. Padding side mirrors TRL's own
+        `pad()` calls -- left for prompt_ids/prompt_mask, right for
+        everything aligned to the completion axis. `advantages` has no
+        sequence dimension (one scalar per row) so it is spliced directly.
+        `num_items_in_batch` (a single batch-wide scalar, not per-row) is
+        deliberately not in this map and so is left untouched."""
+        pad_token_id = self.processing_class.pad_token_id
+        per_key_pad: dict[str, tuple[str, int | float]] = {
+            "prompt_ids": ("left", pad_token_id),
+            "prompt_mask": ("left", 0),
+            "completion_ids": ("right", pad_token_id),
+            "completion_mask": ("right", 0),
+            "old_per_token_logps": ("right", 0.0),
+            "ref_per_token_logps": ("right", 0.0),
+            "sampling_per_token_logps": ("right", 0.0),
+            "importance_sampling_ratio": ("right", 0.0),
+        }
+        for key, (side, pad_value) in per_key_pad.items():
+            if key not in output or key not in sub_output:
+                continue
+            width = max(output[key].shape[-1], sub_output[key].shape[-1])
+            output[key] = _pad_last_dim(output[key], width, side, pad_value)
+            sub_output[key] = _pad_last_dim(sub_output[key], width, side, pad_value)
+            output[key][start:end] = sub_output[key]
+        output["advantages"][start:end] = sub_output["advantages"]
+
+    def _resample_degenerate_groups(
+        self, inputs: list[dict[str, object]], output: dict[str, object], n: int
+    ) -> tuple[int, int]:
+        """RUN_RESAMPLE_ZERO_STD (K5): replace every degenerate prompt group
+        in this batch with a freshly drawn, freshly generated substitute
+        prompt, for up to self._resample_max_rounds extra generation
+        rounds; after that cap the batch proceeds with whatever it still
+        holds. `inputs` and `output` are mutated in place so the rest of
+        _generate_and_score_completions (decode, advantages, the per-group
+        loop's own degenerate_group_rate) sees the replacement rather than
+        the original. Returns (groups_replaced, rounds_run) for the
+        mechanism-log record.
+        """
+        groups_replaced = 0
+        rounds_run = 0
+        for _ in range(self._resample_max_rounds):
+            degenerate_starts = [
+                start
+                for start in range(0, len(inputs), n)
+                if self._group_is_degenerate(output["advantages"][start : start + n])
+            ]
+            if not degenerate_starts:
+                break
+            rounds_run += 1
+            for start in degenerate_starts:
+                end = start + n
+                current_keys = {str(row["key"]) for row in inputs}
+                candidates = [key for key in self.rows_by_key if key not in current_keys]
+                if not candidates:
+                    continue
+                new_row = self.rows_by_key[self.rng.choice(candidates)]
+                sub_inputs = [{"prompt": [{"role": "user", "content": new_row.prompt}], "key": new_row.key}] * n
+                sub_output = super()._generate_and_score_completions(sub_inputs)
+                self._splice_group_output(output, sub_output, start, end)
+                inputs[start:end] = sub_inputs
+                groups_replaced += 1
+        return groups_replaced, rounds_run
 
     def _consume_forward_result(
         self,
