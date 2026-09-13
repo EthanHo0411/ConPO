@@ -284,6 +284,26 @@ class SaveCadenceCallback(TrainerCallback):
         state.logging_steps = args.logging_steps  # type: ignore[attr-defined]
 
 
+class StopAtStepCallback(TrainerCallback):
+    """Halts training once state.global_step reaches stop_at_step, saving a
+    checkpoint at that step first (RUN_STOP_AT_STEP). transformers' inner
+    loop runs on_step_end, then _maybe_log_save_evaluate (which honours
+    control.should_save and writes checkpoint-<global_step> via the standard
+    path), then checks control.should_training_stop -- so setting both here
+    saves-then-stops at the same step. max_steps is left untouched by the
+    caller, so a checkpoint saved this way keeps the full run's cosine
+    schedule for a later resume.
+    """
+
+    def __init__(self, stop_at_step: int) -> None:
+        self.stop_at_step = stop_at_step
+
+    def on_step_end(self, args: object, state: object, control: object, **kwargs: object) -> None:
+        if state.global_step >= self.stop_at_step:  # type: ignore[attr-defined]
+            control.should_save = True  # type: ignore[attr-defined]
+            control.should_training_stop = True  # type: ignore[attr-defined]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tiny", action="store_true", help="tiny random model + 4 rows, for smoke tests")
@@ -315,6 +335,12 @@ def main() -> None:
     # config.VETO_PERIOD_K -- config.py's locked value is untouched, this
     # only lets a CPU test force a checkpoint every step instead of every 25.
     save_steps = int(config.env("RUN_SAVE_STEPS", str(config.SAVE_STEPS)))
+    # RUN_STOP_AT_STEP (devbox 2026-09-13): when set, StopAtStepCallback
+    # (below) halts training and saves a checkpoint once state.global_step
+    # reaches this value, without changing max_steps (`steps` below) -- so a
+    # checkpoint resumed later still follows the full run's cosine schedule.
+    stop_at_step_raw = config.env("RUN_STOP_AT_STEP", "")
+    stop_at_step = int(stop_at_step_raw) if stop_at_step_raw else None
     # RUN_TAU / RUN_TAU_P: same override pattern as RUN_VETO_PERIOD /
     # RUN_SAVE_STEPS above, but for config.TAU / config.TAU_P directly --
     # conpo/trainer.py's compute_loss and conpo/losses.py's resp_loss /
@@ -519,6 +545,9 @@ def main() -> None:
     meter = TokenMeter()
     mechanism_log_path = out_dir / "mechanism.jsonl"
     pass1_callback = Pass1CheckpointCallback(dataset_size=len(rows), prompts_per_update=prompts_per_update)
+    callbacks: list[TrainerCallback] = [pass1_callback, SaveCadenceCallback()]
+    if stop_at_step is not None:
+        callbacks.append(StopAtStepCallback(stop_at_step))
 
     trainer = ConPOTrainer(
         model=model,
@@ -539,7 +568,7 @@ def main() -> None:
         veto_period_k=veto_period_k,
         out_dir=out_dir,
         peft_config=lora_config,
-        callbacks=[pass1_callback, SaveCadenceCallback()],
+        callbacks=callbacks,
         resume_from=resume_checkpoint_dir,
     )
     pass1_callback.trainer = trainer
@@ -602,6 +631,9 @@ def main() -> None:
         # RUN_RESUME (devbox 2026-09-11): the checkpoint step this run
         # resumed from, or None for a fresh run.
         "resumed_from_step": resumed_from_step,
+        # RUN_STOP_AT_STEP (devbox 2026-09-13): step this run was told to
+        # halt at, or None when unset (max_steps stays the full run's).
+        "stop_at_step": stop_at_step,
         # Smoke-shape knobs (design 2026-09-04): what shape this run trained
         # with, whether or not RUN_NUM_GENERATIONS/
         # RUN_MAX_COMPLETION_TOKENS/RUN_EFFECTIVE_BATCH overrode the default.

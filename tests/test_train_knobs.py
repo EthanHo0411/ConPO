@@ -750,3 +750,75 @@ def test_save_cadence_callback_reasserts_args_on_train_begin() -> None:
     train_script.SaveCadenceCallback().on_train_begin(args, state, None)
     assert state.save_steps == 15
     assert state.logging_steps == 1
+
+
+# ---------------------------------------------------------------------------
+# scripts/train.py: StopAtStepCallback (RUN_STOP_AT_STEP)
+# ---------------------------------------------------------------------------
+
+
+def test_stop_at_step_callback_saves_and_stops_once_target_step_is_reached() -> None:
+    from types import SimpleNamespace
+
+    from transformers import TrainerControl, TrainerState
+
+    callback = train_script.StopAtStepCallback(stop_at_step=2)
+
+    below_target = TrainerState(global_step=1)
+    control = TrainerControl()
+    callback.on_step_end(SimpleNamespace(), below_target, control)
+    assert control.should_save is False
+    assert control.should_training_stop is False
+
+    at_target = TrainerState(global_step=2)
+    control = TrainerControl()
+    callback.on_step_end(SimpleNamespace(), at_target, control)
+    assert control.should_save is True
+    assert control.should_training_stop is True
+
+
+def test_main_tiny_run_stop_at_step_halts_training_and_records_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_STOP_AT_STEP must halt the run (not just save an extra checkpoint)
+    at the given step while leaving max_steps -- and so the cosine
+    schedule -- at the full RUN_STEPS value; unset, it must not touch the
+    run at all."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "4")
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    # Default: RUN_STOP_AT_STEP unset must not halt the run early. RUN_SAVE_STEPS=1
+    # so a checkpoint at every step would reveal an early halt if the callback
+    # fired anyway.
+    out_dir_default = tmp_path / "out_default"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_default))
+    monkeypatch.setenv("RUN_SAVE_STEPS", "1")
+    monkeypatch.delenv("RUN_STOP_AT_STEP", raising=False)
+    train_script.main()
+    assert (out_dir_default / "checkpoint-4").is_dir()
+    metadata_default = json.loads((out_dir_default / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata_default["stop_at_step"] is None
+
+    # Override: RUN_STOP_AT_STEP=2 must save at step 2 and stop there, never
+    # reaching step 4 -- config.SAVE_STEPS' own cadence (25) would not save
+    # at step 2 on its own, so checkpoint-2 existing proves the callback's
+    # should_save, and checkpoint-4 absent proves should_training_stop.
+    out_dir_stop = tmp_path / "out_stop"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_stop))
+    monkeypatch.delenv("RUN_SAVE_STEPS", raising=False)
+    monkeypatch.setenv("RUN_STOP_AT_STEP", "2")
+    train_script.main()
+    checkpoint_2 = out_dir_stop / "checkpoint-2"
+    assert checkpoint_2.is_dir()
+    trainer_state = json.loads((checkpoint_2 / "trainer_state.json").read_text(encoding="utf-8"))
+    assert trainer_state["global_step"] == 2
+    assert not (out_dir_stop / "checkpoint-4").exists()
+    metadata_stop = json.loads((out_dir_stop / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata_stop["stop_at_step"] == 2
