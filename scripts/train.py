@@ -303,6 +303,11 @@ def main() -> None:
     # conpo/trainer.py's ConPOTrainer.__init__ reads the same env var
     # itself, directly.
     repair_batch_generation = config.env("RUN_REPAIR_BATCH_GENERATION", "1") == "1"
+    # RUN_CACHE_REF_LOGPROBS (L3, devbox perf pass): same pattern -- read
+    # here only to record the effective value in run_metadata below;
+    # conpo/trainer.py's ConPOTrainer.__init__ reads the same env var
+    # itself, directly.
+    cache_ref_logprobs = config.env("RUN_CACHE_REF_LOGPROBS", "1") == "1"
     model_name = config.env("RUN_MODEL", config.POLICY_MODEL)
     veto_period_k = int(config.env("RUN_VETO_PERIOD", str(config.VETO_PERIOD_K)))
     # RUN_SAVE_STEPS (design choice, builder, 2026-09-11): overrides
@@ -605,6 +610,11 @@ def main() -> None:
         # calls into one call per repair round for the whole step (default)
         # instead of one repair_failed_group call per group.
         "repair_batch_generation": repair_batch_generation,
+        # RUN_CACHE_REF_LOGPROBS (L3, devbox perf pass): whether this run
+        # cached an edge's x^-A reference log-probs on first draw (default)
+        # instead of recomputing them from the reference model on every
+        # replay (conpo/trainer.py's _prompt_margins).
+        "cache_ref_logprobs": cache_ref_logprobs,
     }
     (out_dir / "run_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
 

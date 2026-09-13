@@ -1,5 +1,6 @@
 """Tests for conpo.edges."""
 
+import dataclasses
 import random
 from collections import Counter
 
@@ -45,9 +46,28 @@ def test_edge_json_round_trip() -> None:
         len_minus=10,
         created_update=5,
         meta={"note": "test"},
+        logp_ref_plus_xminus=-2.1,
+        logp_ref_minus_xminus=-6.7,
     )
     restored = Edge.from_json(edge.to_json())
     assert restored == edge
+    assert restored.logp_ref_plus_xminus == -2.1
+    assert restored.logp_ref_minus_xminus == -6.7
+
+
+def test_edge_from_json_defaults_missing_xminus_cache_to_none() -> None:
+    """A pre-L3 edges.jsonl line has neither key (RUN_CACHE_REF_LOGPROBS,
+    L3): from_json must default them to None rather than raise, so an old
+    saved buffer still loads and recomputes lazily on next draw."""
+    edge = _make_edge(direction="forward", created_update=0)
+    pre_l3_json = edge.to_json()
+    del pre_l3_json["logp_ref_plus_xminus"]
+    del pre_l3_json["logp_ref_minus_xminus"]
+
+    restored = Edge.from_json(pre_l3_json)
+
+    assert restored.logp_ref_plus_xminus is None
+    assert restored.logp_ref_minus_xminus is None
 
 
 def test_edge_rejects_bad_direction() -> None:
@@ -133,6 +153,29 @@ def test_save_load_round_trip(tmp_path) -> None:
     original_ids = {e.prompt_id for e in buf.sample(10, current_update=1, rng=random.Random(0), balanced=False)}
     loaded_ids = {e.prompt_id for e in loaded.sample(10, current_update=1, rng=random.Random(0), balanced=False)}
     assert original_ids == loaded_ids
+
+
+def test_save_load_round_trip_preserves_xminus_cache(tmp_path) -> None:
+    """RUN_CACHE_REF_LOGPROBS (L3): a filled x^-A cache survives save/load
+    (RUN_RESUME), so a resumed run does not needlessly recompute it."""
+    buf = EdgeBuffer(capacity=1000, age_cap=1000)
+    cached = dataclasses.replace(
+        _make_edge(direction="forward", created_update=0, prompt_id="f0"),
+        logp_ref_plus_xminus=-1.23,
+        logp_ref_minus_xminus=-4.56,
+    )
+    buf.push(cached)
+    buf.push(_make_edge(direction="reverse", created_update=1, prompt_id="r0"))
+    path = tmp_path / "edges.jsonl"
+    buf.save(path)
+
+    loaded = EdgeBuffer(capacity=1000, age_cap=1000)
+    loaded.load(path)
+
+    by_id = {e.prompt_id: e for e in loaded.sample(10, current_update=1, rng=random.Random(0), balanced=False)}
+    assert by_id["f0"].logp_ref_plus_xminus == -1.23
+    assert by_id["f0"].logp_ref_minus_xminus == -4.56
+    assert by_id["r0"].logp_ref_plus_xminus is None
 
 
 def test_discard_removes_given_edges_and_reports_count() -> None:

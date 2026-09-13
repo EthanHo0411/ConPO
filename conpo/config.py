@@ -288,6 +288,12 @@ def env(name: str, default: str) -> str:
 #   instead of running each group's own repair_failed_group call to
 #   completion before the next group starts; "0" reproduces the old
 #   one-repair_failed_group-call-per-group behaviour.
+# RUN_CACHE_REF_LOGPROBS: "1" (default) caches an edge's x^-A reference
+#   log-probs (conpo/trainer.py's _prompt_margins) on the Edge the first
+#   time it is drawn for L_prompt, so later replays from edge_buffer read
+#   the cache instead of re-running the reference model; "0" reproduces the
+#   old always-recompute behaviour (also the numerical cross-check that
+#   both paths agree, since the reference policy is frozen).
 
 # ---------------------------------------------------------------------------
 # Trainer step sizes (section 2.4-2.6: sampled once per optimiser step from

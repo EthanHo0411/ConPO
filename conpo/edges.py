@@ -38,6 +38,13 @@ class Edge:
     admitted; age(e) (section 2.4) is current_update - created_update.
     meta holds anything else a producer wants to keep (e.g. the operator
     or repair-step reason) without widening this schema.
+    logp_ref_plus_xminus/minus_xminus (RUN_CACHE_REF_LOGPROBS, L3) cache
+    log pi_ref(y_plus | x^-A) and log pi_ref(y_minus | x^-A) -- the two
+    reference log-probs conpo/trainer.py's _prompt_margins needs for its
+    x^-A term -- the first time this edge is drawn for L_prompt, so later
+    replays skip that reference forward. None means "not yet computed"
+    (lazy: not every edge is ever drawn for L_prompt, and an edge loaded
+    from a pre-L3 edges.jsonl has no cached value yet).
     """
 
     prompt_id: str
@@ -53,6 +60,8 @@ class Edge:
     len_minus: int
     created_update: int
     meta: Mapping[str, object] = field(default_factory=dict)
+    logp_ref_plus_xminus: float | None = None
+    logp_ref_minus_xminus: float | None = None
 
     def __post_init__(self) -> None:
         if self.direction not in _DIRECTIONS:
@@ -76,6 +85,8 @@ class Edge:
             "len_minus": self.len_minus,
             "created_update": self.created_update,
             "meta": dict(self.meta),
+            "logp_ref_plus_xminus": self.logp_ref_plus_xminus,
+            "logp_ref_minus_xminus": self.logp_ref_minus_xminus,
         }
 
     @classmethod
@@ -94,6 +105,10 @@ class Edge:
             len_minus=data["len_minus"],
             created_update=data["created_update"],
             meta=data.get("meta", {}),
+            # .get(..., None): a pre-L3 edges.jsonl has neither key, and the
+            # cache is meant to be absent then (recomputed lazily on next draw).
+            logp_ref_plus_xminus=data.get("logp_ref_plus_xminus", None),
+            logp_ref_minus_xminus=data.get("logp_ref_minus_xminus", None),
         )
 
 

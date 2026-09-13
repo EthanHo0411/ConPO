@@ -32,6 +32,7 @@ from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
 from trl import GRPOConfig
 
 import conpo.operators  # noqa: F401  registers every corruption operator
+import conpo.trainer as trainer_module
 from conpo import config
 from conpo.arms import HYPOTHESES, Overrides, resolve_arm
 from conpo.compositor import PairStats
@@ -320,6 +321,125 @@ def test_prompt_margins_multi_family_edge_zero_at_theta_equals_theta_ref(tmp_pat
     assert m_minus.shape == (1,)
     assert abs(m_plus.item()) < 1e-4
     assert abs(m_minus.item()) < 1e-4
+
+
+def _trainer_and_unscored_edge_for_prompt_margins(tmp_path: Path, prompt_id: str) -> tuple[ConPOTrainer, Edge]:
+    """Same setup as test_prompt_margins_multi_family_edge_zero_at_theta_equals_theta_ref
+    above, factored out for the RUN_CACHE_REF_LOGPROBS (L3) tests below,
+    which call _prompt_margins on the same edge twice."""
+    row = _make_multi_row(prompt_id, "Write a short summary.")
+    corrupted = registry.corrupt_set(row.constraints, (0, 1), MULTI_TEXT, random.Random(0))
+    assert corrupted is not None
+
+    model, tokenizer = _tiny_model_and_tokenizer()
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": row.prompt}], "key": row.key}])
+    arm, overrides = resolve_arm("solve_only")  # no construction; _prompt_margins is called directly
+    trainer = ConPOTrainer(
+        model=model,
+        args=_grpo_config(tmp_path, max_steps=1),
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key={row.key: row},
+        edge_buffer=EdgeBuffer(),
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=overrides,
+        peft_config=_lora_config(),
+    )
+
+    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+    with torch.no_grad(), unwrapped.disable_adapter():
+        logp_plus, len_plus = score_response(unwrapped, tokenizer, row.prompt, MULTI_TEXT)
+        logp_minus, len_minus = score_response(unwrapped, tokenizer, row.prompt, corrupted)
+    edge = Edge(
+        prompt_id=row.key,
+        prompt=row.prompt,
+        y_plus=MULTI_TEXT,
+        y_minus=corrupted,
+        families=frozenset({NO_COMMA.iid, WORD_ONCE.iid}),
+        direction="reverse",
+        step=0,
+        logp_ref_plus=logp_plus.item(),
+        logp_ref_minus=logp_minus.item(),
+        len_plus=len_plus,
+        len_minus=len_minus,
+        created_update=0,
+        meta={},
+    )
+    return trainer, edge
+
+
+def _count_score_response_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Wrap conpo.trainer.score_response (the bare-name global _prompt_margins
+    calls) to count invocations without changing its behaviour."""
+    calls = {"n": 0}
+    real_score_response = trainer_module.score_response
+
+    def counting_score_response(*args: object, **kwargs: object) -> tuple[torch.Tensor, int]:
+        calls["n"] += 1
+        return real_score_response(*args, **kwargs)
+
+    monkeypatch.setattr(trainer_module, "score_response", counting_score_response)
+    return calls
+
+
+def test_prompt_margins_caches_xminus_reference_logprobs_across_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_CACHE_REF_LOGPROBS (L3, default on): the first _prompt_margins
+    draw of an edge runs the two x^-A ref_model score_response calls and
+    caches them on the edge; a later replay of the same edge (drawn again
+    from edge_buffer) reads the cache and skips those two forwards, while
+    m_minus stays numerically the same (frozen reference model)."""
+    trainer, edge = _trainer_and_unscored_edge_for_prompt_margins(tmp_path, "row-cache-hit")
+    assert trainer._cache_ref_logprobs is True  # RUN_CACHE_REF_LOGPROBS default
+    assert edge.logp_ref_plus_xminus is None
+    assert edge.logp_ref_minus_xminus is None
+
+    calls = _count_score_response_calls(monkeypatch)
+    _, m_minus_first = trainer._prompt_margins(trainer.model, [edge])
+    first_call_forwards = calls["n"]
+
+    assert edge.logp_ref_plus_xminus is not None
+    assert edge.logp_ref_minus_xminus is not None
+
+    calls["n"] = 0
+    _, m_minus_second = trainer._prompt_margins(trainer.model, [edge])
+    second_call_forwards = calls["n"]
+
+    assert first_call_forwards == 6  # 4 policy (x+/x-) + 2 ref (x-), cache miss
+    assert second_call_forwards == 4  # ref (x-) skipped, cache hit
+    assert torch.allclose(m_minus_first, m_minus_second, atol=1e-5)
+
+
+def test_prompt_margins_recomputes_xminus_reference_logprobs_when_cache_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_CACHE_REF_LOGPROBS=0 reproduces the pre-L3 behaviour exactly:
+    every _prompt_margins draw of an edge re-runs both x^-A ref_model
+    score_response calls and never populates the cache fields."""
+    monkeypatch.setenv("RUN_CACHE_REF_LOGPROBS", "0")
+    trainer, edge = _trainer_and_unscored_edge_for_prompt_margins(tmp_path, "row-cache-off")
+    assert trainer._cache_ref_logprobs is False
+
+    calls = _count_score_response_calls(monkeypatch)
+    trainer._prompt_margins(trainer.model, [edge])
+    first_call_forwards = calls["n"]
+
+    calls["n"] = 0
+    trainer._prompt_margins(trainer.model, [edge])
+    second_call_forwards = calls["n"]
+
+    assert first_call_forwards == 6
+    assert second_call_forwards == 6
+    assert edge.logp_ref_plus_xminus is None
+    assert edge.logp_ref_minus_xminus is None
 
 
 def _build_scored_multi_family_edge(tmp_path: Path) -> tuple[PoolRow, "ConPOTrainer", Edge]:

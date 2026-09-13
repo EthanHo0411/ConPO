@@ -299,6 +299,11 @@ class ConPOTrainer(GRPOTrainer):
         # below). Read once here, not per step: nothing in a run changes it
         # after this trainer is built.
         self._repair_batch_generation = config.env("RUN_REPAIR_BATCH_GENERATION", "1") == "1"
+        # RUN_CACHE_REF_LOGPROBS (L3, default on): _prompt_margins reads an
+        # edge's x^-A reference log-probs from its cache once present
+        # instead of re-running the reference model on every replay. Read
+        # once here, same convention as _repair_batch_generation above.
+        self._cache_ref_logprobs = config.env("RUN_CACHE_REF_LOGPROBS", "1") == "1"
 
         # Wall-clock accumulation across RUN_RESUME processes (scripts/train.py):
         # the node-local disk is wiped roughly every 48 hours, so one logical
@@ -1460,8 +1465,11 @@ class ConPOTrainer(GRPOTrainer):
         being excluded from it by compute_loss's own sampling predicate).
         x^+A is `edge.prompt` itself (unchanged), so its reference log-probs
         are already cached on the edge; x^-A's reference log-probs are
-        computed fresh here, under `disable_adapter()`, since no edge caches
-        them.
+        replay-invariant too (x^-A depends only on the static `row` and
+        `edge.families`, both fixed for the edge's whole lifetime), so
+        RUN_CACHE_REF_LOGPROBS (L3, default on) computes them once under
+        `disable_adapter()` and caches them onto the edge for every later
+        draw; "0" recomputes them fresh on every call, as before.
         """
         m_plus_terms: list[torch.Tensor] = []
         m_minus_terms: list[torch.Tensor] = []
@@ -1489,9 +1497,20 @@ class ConPOTrainer(GRPOTrainer):
 
             lp_plus_xminus, len_p_xminus = score_response(model, self.processing_class, x_minus, edge.y_plus)
             lp_minus_xminus, len_m_xminus = score_response(model, self.processing_class, x_minus, edge.y_minus)
-            with self._reference_model(model) as ref_model:
-                ref_plus_xminus, _ = score_response(ref_model, self.processing_class, x_minus, edge.y_plus)
-                ref_minus_xminus, _ = score_response(ref_model, self.processing_class, x_minus, edge.y_minus)
+            if self._cache_ref_logprobs and edge.logp_ref_plus_xminus is not None:
+                ref_plus_xminus = torch.tensor(
+                    edge.logp_ref_plus_xminus, dtype=lp_plus_xminus.dtype, device=lp_plus_xminus.device
+                )
+                ref_minus_xminus = torch.tensor(
+                    edge.logp_ref_minus_xminus, dtype=lp_minus_xminus.dtype, device=lp_minus_xminus.device
+                )
+            else:
+                with self._reference_model(model) as ref_model:
+                    ref_plus_xminus, _ = score_response(ref_model, self.processing_class, x_minus, edge.y_plus)
+                    ref_minus_xminus, _ = score_response(ref_model, self.processing_class, x_minus, edge.y_minus)
+                if self._cache_ref_logprobs:
+                    object.__setattr__(edge, "logp_ref_plus_xminus", ref_plus_xminus.item())
+                    object.__setattr__(edge, "logp_ref_minus_xminus", ref_minus_xminus.item())
             q_plus_xminus = losses.q_theta(
                 lp_plus_xminus, ref_plus_xminus.detach(), torch.tensor(len_p_xminus, device=lp_plus_xminus.device)
             )
@@ -1697,13 +1716,22 @@ class ConPOTrainer(GRPOTrainer):
                 # lambda_p > 0 -- that is what "ablates L_prompt's
                 # contribution" (arms.py's Overrides docstring) means.
                 _t_score = time.perf_counter()
+                # RUN_CACHE_REF_LOGPROBS (L3): a cache hit skips the two
+                # ref_model forwards below, so count misses (cache absent,
+                # or the flag off) before the call mutates the cache.
+                ref_xminus_misses = (
+                    sum(1 for edge in prompt_edges if edge.logp_ref_plus_xminus is None)
+                    if self._cache_ref_logprobs
+                    else len(prompt_edges)
+                )
                 m_plus, m_minus = self._prompt_margins(model, prompt_edges)
                 pair_scoring_seconds += time.perf_counter() - _t_score
                 # Per edge: score_response(x+,y+), score_response(x+,y-),
-                # score_response(x-,y+), score_response(x-,y-), and the two
-                # ref_model score_response calls for (x-,y+)/(x-,y-) --
-                # _prompt_margins' x+ side reuses the edge's cached logp_ref_*.
-                pair_scoring_forwards += 6 * len(prompt_edges)
+                # score_response(x-,y+), score_response(x-,y-) always, plus
+                # the two ref_model score_response calls for (x-,y+)/(x-,y-)
+                # only on a cache miss -- _prompt_margins' x+ side reuses the
+                # edge's cached logp_ref_*.
+                pair_scoring_forwards += 4 * len(prompt_edges) + 2 * ref_xminus_misses
                 loss_prompt, prompt_stats = losses.prompt_loss(
                     m_plus,
                     m_minus,

@@ -357,6 +357,38 @@ def test_main_tiny_run_repair_batch_generation_default_and_override_reach_metada
     assert metadata_off["repair_batch_generation"] is False
 
 
+def test_main_tiny_run_cache_ref_logprobs_default_and_override_reach_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_CACHE_REF_LOGPROBS (L3, devbox perf pass 2026-09-13): same
+    override-and-record pattern as RUN_VLLM_PUSH_ONCE_PER_STEP above --
+    conpo/trainer.py's own behaviour under each setting is covered in
+    tests/test_h6_multi.py and tests/test_edges.py, this only pins the
+    recorded flag."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    out_dir_default = tmp_path / "out_default"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_default))
+    train_script.main()
+    metadata_default = json.loads((out_dir_default / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata_default["cache_ref_logprobs"] is True
+
+    out_dir_off = tmp_path / "out_off"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_off))
+    monkeypatch.setenv("RUN_CACHE_REF_LOGPROBS", "0")
+    train_script.main()
+    metadata_off = json.loads((out_dir_off / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata_off["cache_ref_logprobs"] is False
+
+
 # ---------------------------------------------------------------------------
 # conpo/trainer.py: ConPOTrainer.__init__'s construction-time guard (review
 # finding, B7 2026-09-04) -- a non-PEFT model with beta == 0.0 leaves TRL's
