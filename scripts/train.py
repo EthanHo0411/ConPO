@@ -633,6 +633,21 @@ def main() -> None:
         "kappa": kappa,
         "loss_type": loss_type,
         "pair_loss_weight": pair_loss_weight,
+        # RUN_VLLM_IS_MODE / RUN_KL_CLAMP / RUN_RESAMPLE_ZERO_STD /
+        # RUN_RESAMPLE_MAX_ROUNDS / RUN_TOKEN_LOGRATIO_CLAMP (K2/K4/K5/K6,
+        # fixer review 2026-09-13): these four knobs reached the trainer but
+        # not run_metadata.json, so a finished run's artefacts alone could
+        # not say which of them were active for it (same reasoning as the
+        # judge_mode/judge_model/veto_period_k comment above). kl_clamp,
+        # resample_zero_std, resample_max_rounds and token_logratio_clamp
+        # are read back off the constructed trainer instance rather than
+        # re-parsed here, since main() never binds their raw env values to a
+        # local variable the way it does for loss_type/pair_loss_weight.
+        "vllm_is_mode": vllm_is_mode or None,
+        "kl_clamp": trainer._kl_clamp,
+        "resample_zero_std": trainer._resample_zero_std,
+        "resample_max_rounds": trainer._resample_max_rounds,
+        "token_logratio_clamp": trainer._token_logratio_clamp,
         "row_limit": row_limit or None,
         # RUN_RESUME (devbox 2026-09-11): the checkpoint step this run
         # resumed from, or None for a fresh run.

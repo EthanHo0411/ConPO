@@ -1561,6 +1561,33 @@ def test_resample_zero_std_stops_at_round_cap(tmp_path: Path, monkeypatch: pytes
     assert records[0]["degenerate_group_rate"] == 1.0
 
 
+def test_splice_group_output_adjusts_num_items_in_batch_by_token_delta(tmp_path: Path) -> None:
+    """_splice_group_output's docstring: `num_items_in_batch` is TRL's own
+    pre-resampling batch-wide valid-token count (grpo_trainer.py's
+    `_generate_and_score_completions`, ~line 2427), which
+    ConPOTrainer._compute_loss uses as the loss normalizer whenever
+    loss_type is in {dapo, cispo, vespo}. A spliced-in replacement group of
+    a different completion length must move that scalar by the resulting
+    change in valid completion tokens, or RUN_LOSS_TYPE=dapo combined with
+    RUN_RESAMPLE_ZERO_STD=1 trains every resampled step with a stale
+    normalizer (fixer review 2026-09-13)."""
+    trainer = _resample_trainer(tmp_path, {ROW_A.key: ROW_A})
+    output = {
+        "completion_mask": torch.tensor([[1, 1, 0], [1, 1, 1]]),  # 2 + 3 = 5 valid tokens
+        "advantages": torch.tensor([0.5, -0.5]),
+        "num_items_in_batch": torch.tensor(10.0),
+    }
+    sub_output = {
+        "completion_mask": torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]]),  # 4 + 2 = 6 valid tokens
+        "advantages": torch.tensor([1.0, -1.0]),
+        "num_items_in_batch": torch.tensor(999.0),  # must be ignored: only output's own copy is updated
+    }
+
+    trainer._splice_group_output(output, sub_output, start=0, end=2)
+
+    assert output["num_items_in_batch"].item() == pytest.approx(11.0)  # 10 + (6 - 5)
+
+
 # ---------------------------------------------------------------------------
 # arms.py sanity (folded in here per the file-scope assigned to this task)
 # ---------------------------------------------------------------------------

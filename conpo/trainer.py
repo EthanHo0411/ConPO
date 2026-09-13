@@ -867,8 +867,18 @@ class ConPOTrainer(GRPOTrainer):
         `pad()` calls -- left for prompt_ids/prompt_mask, right for
         everything aligned to the completion axis. `advantages` has no
         sequence dimension (one scalar per row) so it is spliced directly.
-        `num_items_in_batch` (a single batch-wide scalar, not per-row) is
-        deliberately not in this map and so is left untouched."""
+        `num_items_in_batch` (a single batch-wide scalar, not per-row) has no
+        per-row slice to overwrite, so it is instead adjusted by the change
+        in valid completion tokens this splice makes: TRL computes it once,
+        over the whole pre-resampling batch (grpo_trainer.py's
+        `_generate_and_score_completions`, ~line 2427), before this method
+        ever runs, and ConPOTrainer._compute_loss uses it as the loss
+        normalizer for loss_type in {dapo, cispo, vespo} -- left untouched
+        here, a replaced group's different completion length would silently
+        miscalibrate that normalizer for every such step (fixer review
+        2026-09-13)."""
+        discarded_valid = output["completion_mask"][start:end].sum()
+        replacement_valid = sub_output["completion_mask"].sum()
         pad_token_id = self.processing_class.pad_token_id
         per_key_pad: dict[str, tuple[str, int | float]] = {
             "prompt_ids": ("left", pad_token_id),
@@ -888,6 +898,7 @@ class ConPOTrainer(GRPOTrainer):
             sub_output[key] = _pad_last_dim(sub_output[key], width, side, pad_value)
             output[key][start:end] = sub_output[key]
         output["advantages"][start:end] = sub_output["advantages"]
+        output["num_items_in_batch"] = output["num_items_in_batch"] + (replacement_valid - discarded_valid)
 
     def _resample_degenerate_groups(
         self, inputs: list[dict[str, object]], output: dict[str, object], n: int

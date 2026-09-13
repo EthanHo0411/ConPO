@@ -342,6 +342,61 @@ def test_main_tiny_run_vllm_is_mode_default_and_override_reach_grpo_config(
     assert _CapturingTrainer.captured_mode == "token_mask"
 
 
+def test_main_tiny_run_vllm_is_mode_kl_clamp_resample_and_token_logratio_clamp_reach_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K2/K4/K5/K6 (fixer review 2026-09-13): RUN_VLLM_IS_MODE,
+    RUN_KL_CLAMP, RUN_RESAMPLE_ZERO_STD/RUN_RESAMPLE_MAX_ROUNDS and
+    RUN_TOKEN_LOGRATIO_CLAMP all reach the trainer (this file's own
+    vllm_is_mode test above, and tests/test_trainer_tiny.py's
+    _kl_clamp/_token_logratio_clamp/_resample_zero_std tests) but, before
+    this fix, none of the four reached run_metadata.json -- unlike
+    RUN_LOSS_TYPE/RUN_PAIR_LOSS_WEIGHT above, so a finished run's own
+    artefacts could not say which of these knobs were active for it."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    out_dir_default = tmp_path / "out_default"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_default))
+    for env_var in (
+        "RUN_VLLM_IS_MODE",
+        "RUN_KL_CLAMP",
+        "RUN_RESAMPLE_ZERO_STD",
+        "RUN_RESAMPLE_MAX_ROUNDS",
+        "RUN_TOKEN_LOGRATIO_CLAMP",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+    train_script.main()
+    metadata_default = json.loads((out_dir_default / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata_default["vllm_is_mode"] is None
+    assert metadata_default["kl_clamp"] is None
+    assert metadata_default["resample_zero_std"] is False
+    assert metadata_default["resample_max_rounds"] == 3
+    assert metadata_default["token_logratio_clamp"] is None
+
+    out_dir_override = tmp_path / "out_override"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_override))
+    monkeypatch.setenv("RUN_VLLM_IS_MODE", "token_mask")
+    monkeypatch.setenv("RUN_KL_CLAMP", "40")
+    monkeypatch.setenv("RUN_RESAMPLE_ZERO_STD", "1")
+    monkeypatch.setenv("RUN_RESAMPLE_MAX_ROUNDS", "2")
+    monkeypatch.setenv("RUN_TOKEN_LOGRATIO_CLAMP", "0.5")
+    train_script.main()
+    metadata_override = json.loads((out_dir_override / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata_override["vllm_is_mode"] == "token_mask"
+    assert metadata_override["kl_clamp"] == pytest.approx(40.0)
+    assert metadata_override["resample_zero_std"] is True
+    assert metadata_override["resample_max_rounds"] == 2
+    assert metadata_override["token_logratio_clamp"] == pytest.approx(0.5)
+
+
 def test_main_tiny_raises_when_run_limit_below_prompts_per_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
