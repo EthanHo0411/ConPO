@@ -261,6 +261,49 @@ def test_main_tiny_run_loss_type_reaches_config_and_metadata(
     assert metadata["loss_type"] == "dapo"
 
 
+def test_main_tiny_run_vllm_is_mode_default_and_override_reach_grpo_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_VLLM_IS_MODE is a pure passthrough to TRL's own GRPOConfig field
+    `vllm_importance_sampling_mode` (no ConPO-internal config.py counterpart,
+    unlike RUN_LOSS_TYPE) -- scripts/train.py sets it on grpo_config only
+    when the env var is set. --tiny never runs with use_vllm=True, so this
+    pins the wiring, not vLLM behaviour, by capturing the GRPOConfig that
+    reaches ConPOTrainer.__init__ via a thin subclass.
+    """
+
+    class _CapturingTrainer(train_script.ConPOTrainer):
+        captured_mode: str | None = None
+
+        def __init__(self, *a: object, **kw: object) -> None:
+            _CapturingTrainer.captured_mode = kw["args"].vllm_importance_sampling_mode  # type: ignore[attr-defined]
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(train_script, "ConPOTrainer", _CapturingTrainer)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    out_dir_default = tmp_path / "out_default"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_default))
+    monkeypatch.delenv("RUN_VLLM_IS_MODE", raising=False)
+    train_script.main()
+    assert _CapturingTrainer.captured_mode == GRPOConfig().vllm_importance_sampling_mode
+
+    out_dir_override = tmp_path / "out_override"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_override))
+    monkeypatch.setenv("RUN_VLLM_IS_MODE", "token_mask")
+    train_script.main()
+    assert _CapturingTrainer.captured_mode == "token_mask"
+
+
 def test_main_tiny_raises_when_run_limit_below_prompts_per_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

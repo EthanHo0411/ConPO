@@ -334,6 +334,12 @@ def main() -> None:
     # read fresh by the GRPOConfig(...) call below (loss_type=config.LOSS_TYPE).
     loss_type = config.env("RUN_LOSS_TYPE", config.LOSS_TYPE)
     config.LOSS_TYPE = loss_type
+    # RUN_VLLM_IS_MODE (devbox 2026-09-13): pure passthrough to TRL's own
+    # GRPOConfig.vllm_importance_sampling_mode (default "sequence_mask") --
+    # unlike RUN_LOSS_TYPE this has no ConPO-internal config.py counterpart,
+    # so it is applied directly to grpo_config below only when set, after
+    # the GRPOConfig(...) call closes.
+    vllm_is_mode = config.env("RUN_VLLM_IS_MODE", "")
     out_dir = Path(config.env("RUN_OUT_DIR", "runs/tmp"))
     run_resume = config.env("RUN_RESUME", "0") == "1"
     resume_checkpoint_dir, resumed_from_step = _resolve_resume(out_dir, run_resume)
@@ -485,6 +491,8 @@ def main() -> None:
         bf16=torch.cuda.is_available(),
         fp16=False,
     )
+    if vllm_is_mode:
+        grpo_config.vllm_importance_sampling_mode = vllm_is_mode
 
     # before_load/after_unload are left unset: build_judge runs before the
     # trainer exists, so there is no engine handle to hand it yet.
