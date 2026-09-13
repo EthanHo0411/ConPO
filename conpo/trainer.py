@@ -1691,7 +1691,7 @@ class ConPOTrainer(GRPOTrainer):
                 loss_resp, resp_stats = losses.resp_loss(
                     delta, ages, tau=config.TAU, gamma=config.GAMMA, kappa=config.KAPPA
                 )
-                total = total + loss_resp
+                total = total + config.PAIR_LOSS_WEIGHT * loss_resp
                 stats["resp_loss"] = loss_resp.item()
                 stats["resp_mean_age"] = ages.float().mean().item()
                 stats.update({f"resp_{k}": v for k, v in resp_stats.items()})
@@ -1748,7 +1748,7 @@ class ConPOTrainer(GRPOTrainer):
                     clamp=config.MARGIN_CLAMP_MULT * config.KAPPA * config.TAU_P,
                 )
                 if self.overrides.lambda_p > 0:
-                    total = total + self.overrides.lambda_p * loss_prompt
+                    total = total + config.PAIR_LOSS_WEIGHT * self.overrides.lambda_p * loss_prompt
                 stats["prompt_loss"] = loss_prompt.item()
                 stats.update({f"prompt_{k}": v for k, v in prompt_stats.items()})
 

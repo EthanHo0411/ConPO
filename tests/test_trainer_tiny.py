@@ -1246,6 +1246,106 @@ def test_compute_loss_kl_clamp_zero_collapses_kl_to_zero(
 
 
 # ---------------------------------------------------------------------------
+# K7 RUN_PAIR_LOSS_WEIGHT (devbox 2026-09-13): config.PAIR_LOSS_WEIGHT
+# multiplies loss_resp and lambda_p * loss_prompt individually before they
+# join `total` in compute_loss, so it must scale the pair contribution
+# (loss_resp + lambda_p * loss_prompt) without touching L_clean (the GRPO
+# term, stats["clean_loss"]). _score_edge_pairs/_prompt_margins are stubbed
+# to fixed-shape tensors (same idiom as
+# test_compute_loss_evicts_saturated_edge_and_records_resp_evicted above),
+# so compute_loss's own edge sampling from edge_buffer -- which consumes
+# self.rng and would otherwise draw edges in a different order on the
+# second call -- cannot change the numeric result: both directions'
+# 2 edges each are always sampled in full (edge_n=48 > 4 edges available)
+# and both fixture edges are single-family (qualifies for the prompt draw
+# whether or not RUN_MULTI is set).
+# ---------------------------------------------------------------------------
+
+
+def _pair_loss_weight_trainer(tmp_path: Path) -> ConPOTrainer:
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A, ROW_B]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=1,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    arm, _ = resolve_arm("full")  # resp_loss=True, prompt_loss=True
+    edge_buffer = EdgeBuffer()
+    for edge in _hand_built_edges():
+        edge_buffer.push(edge)
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=edge_buffer,
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=Overrides(),  # lambda_p = config.LAMBDA_P (1.0)
+        peft_config=_lora_config(),
+        probe_enabled=False,
+    )
+    trainer._score_edge_pairs = lambda model, edges: (  # type: ignore[method-assign]
+        torch.zeros(len(edges)),
+        torch.zeros(len(edges), dtype=torch.long),
+    )
+    trainer._prompt_margins = lambda model, edges: (  # type: ignore[method-assign]
+        torch.full((len(edges),), 0.5),
+        torch.full((len(edges),), 0.1),
+    )
+    trainer.current_gradient_accumulation_steps = grpo_config.gradient_accumulation_steps
+    return trainer
+
+
+def test_compute_loss_pair_loss_weight_scales_pair_contribution_not_clean_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = _pair_loss_weight_trainer(tmp_path)
+    inputs = _kl_clamp_inputs()
+
+    monkeypatch.setattr(config, "PAIR_LOSS_WEIGHT", 1.0)
+    total_1x = trainer.compute_loss(trainer.model, inputs)
+    stats_1x = dict(trainer.last_loss_stats)
+
+    monkeypatch.setattr(config, "PAIR_LOSS_WEIGHT", 2.0)
+    total_2x = trainer.compute_loss(trainer.model, inputs)
+    stats_2x = dict(trainer.last_loss_stats)
+
+    # L_clean (the GRPO term) is untouched by PAIR_LOSS_WEIGHT.
+    assert stats_1x["clean_loss"] == pytest.approx(stats_2x["clean_loss"])
+
+    pair_1x = total_1x.item() - stats_1x["clean_loss"] * config.LAMBDA_G
+    pair_2x = total_2x.item() - stats_2x["clean_loss"] * config.LAMBDA_G
+    assert pair_1x != pytest.approx(0.0)
+    assert pair_2x == pytest.approx(2 * pair_1x)
+
+
+# ---------------------------------------------------------------------------
 # arms.py sanity (folded in here per the file-scope assigned to this task)
 # ---------------------------------------------------------------------------
 

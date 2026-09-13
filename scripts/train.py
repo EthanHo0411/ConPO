@@ -360,6 +360,11 @@ def main() -> None:
     # read fresh by the GRPOConfig(...) call below (loss_type=config.LOSS_TYPE).
     loss_type = config.env("RUN_LOSS_TYPE", config.LOSS_TYPE)
     config.LOSS_TYPE = loss_type
+    # RUN_PAIR_LOSS_WEIGHT (devbox 2026-09-13): same pattern for
+    # config.PAIR_LOSS_WEIGHT, the multiplier on the summed pair losses read
+    # fresh at call time by conpo/trainer.py's compute_loss.
+    pair_loss_weight = float(config.env("RUN_PAIR_LOSS_WEIGHT", str(config.PAIR_LOSS_WEIGHT)))
+    config.PAIR_LOSS_WEIGHT = pair_loss_weight
     # RUN_VLLM_IS_MODE (devbox 2026-09-13): pure passthrough to TRL's own
     # GRPOConfig.vllm_importance_sampling_mode (default "sequence_mask") --
     # unlike RUN_LOSS_TYPE this has no ConPO-internal config.py counterpart,
@@ -627,6 +632,7 @@ def main() -> None:
         "tau_p": tau_p,
         "kappa": kappa,
         "loss_type": loss_type,
+        "pair_loss_weight": pair_loss_weight,
         "row_limit": row_limit or None,
         # RUN_RESUME (devbox 2026-09-11): the checkpoint step this run
         # resumed from, or None for a fresh run.

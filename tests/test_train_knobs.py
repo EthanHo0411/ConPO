@@ -261,6 +261,44 @@ def test_main_tiny_run_loss_type_reaches_config_and_metadata(
     assert metadata["loss_type"] == "dapo"
 
 
+def test_main_tiny_run_pair_loss_weight_reaches_config_and_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_PAIR_LOSS_WEIGHT overrides config.PAIR_LOSS_WEIGHT before the
+    trainer is built (scripts/train.py); conpo/trainer.py's compute_loss
+    reads config.PAIR_LOSS_WEIGHT fresh at call time, so the override
+    reaching config is what reaches training, and run_metadata.json must
+    record the effective value.
+
+    monkeypatch.setattr registers the pre-test value for restoration at
+    teardown regardless of what main()'s own plain
+    `config.PAIR_LOSS_WEIGHT = pair_loss_weight` assignment does in between,
+    so config.PAIR_LOSS_WEIGHT is back to its pre-test value for every later
+    test.
+    """
+    monkeypatch.setattr(config, "PAIR_LOSS_WEIGHT", config.PAIR_LOSS_WEIGHT)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setenv("RUN_PAIR_LOSS_WEIGHT", "2.5")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    assert config.PAIR_LOSS_WEIGHT == pytest.approx(2.5)
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["pair_loss_weight"] == pytest.approx(2.5)
+
+
 def test_main_tiny_run_vllm_is_mode_default_and_override_reach_grpo_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

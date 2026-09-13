@@ -149,6 +149,12 @@ LAMBDA_0 = 0.1  # DEV_SET
 LAMBDA_P = 1.0  # DEV_SET
 LAMBDA_G = 1.0  # DEV_SET
 
+# RUN_PAIR_LOSS_WEIGHT (devbox 2026-09-13): multiplier on the summed pair
+# losses (L_resp + lambda_P * L_prompt) before they join L_ConPO, read fresh
+# at call time by conpo/trainer.py's compute_loss. Not paper-derived; default
+# 1.0 leaves L_ConPO unchanged.
+PAIR_LOSS_WEIGHT = 1.0
+
 # lambda_T, lambda_U, lambda_C (section 2.6): acquisition-score weights in
 # a_c = lambda_T T_c + lambda_U U_c + lambda_C C_c, "calibrated on the
 # development set jointly ... so that the three terms have comparable
