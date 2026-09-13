@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
 from datasets import Dataset
 from peft import LoraConfig
 from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
@@ -194,7 +195,9 @@ def test_trainer_without_vllm_generation_installs_nothing(tmp_path: Path) -> Non
     assert trainer._engine_seconds is None
 
 
-def test_engine_seconds_accumulates_across_generate_calls(tmp_path: Path) -> None:
+def test_engine_seconds_accumulates_across_generate_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """`_install_vllm_reload_guard`'s wake_up/sleep/generate wrapping
     (Ethan devbox perf pass, 2026-09-11): two `generate()` calls, each
     going through the real trl colocate sequence via `_FakeVLLMGeneration`
@@ -202,7 +205,17 @@ def test_engine_seconds_accumulates_across_generate_calls(tmp_path: Path) -> Non
     accumulate wake_reload_resync/generate_only/sleep seconds and bump
     generate_calls/reload_calls -- the same wrapped callables
     conpo/engine.py's `VLLMColocateEngine.generate` and TRL's own rollout
-    both call through in a real run."""
+    both call through in a real run.
+
+    RUN_VLLM_PUSH_ONCE_PER_STEP=0 (L1 devbox perf pass, 2026-09-13): this
+    test's two direct `generate()` calls, with no `_generate_and_score_completions`
+    step boundary in between, are exactly the "same step" shape push-once
+    would collapse -- pinned off here so this test keeps guarding today's
+    unconditional per-call reload+resync+sleep path unchanged. See
+    test_push_once_per_step_skips_repeat_sync_and_defers_sleep below for the
+    default (flag on) behaviour.
+    """
+    monkeypatch.setenv("RUN_VLLM_PUSH_ONCE_PER_STEP", "0")
     trainer = _build_trainer(tmp_path)
     llm = _FakeLLM()
     trainer.vllm_generation = _FakeVLLMGeneration(llm)
@@ -215,6 +228,7 @@ def test_engine_seconds_accumulates_across_generate_calls(tmp_path: Path) -> Non
     assert seconds is not None
     assert seconds["generate_calls"] == 2
     assert seconds["reload_calls"] == 2
+    assert seconds["reload_calls_skipped"] == 0
     # Two ~5ms "sampling" sleeps, each between the kv_cache wake and
     # llm.sleep -- time.sleep(x) never returns before x seconds elapse.
     assert seconds["generate_only"] >= 0.008
@@ -223,3 +237,53 @@ def test_engine_seconds_accumulates_across_generate_calls(tmp_path: Path) -> Non
     # The reload guard's own effect (test_reload_weights_triggers_resync's
     # assertion) still holds with the extra wrapping installed.
     assert llm.calls.count("sync") == 2
+    assert llm.calls.count("sleep") == 2
+
+
+def test_push_once_per_step_skips_repeat_sync_and_defers_sleep(tmp_path: Path) -> None:
+    """RUN_VLLM_PUSH_ONCE_PER_STEP defaults to "1" (L1 devbox perf pass,
+    2026-09-13): a second `generate()` call within the same step (no
+    `_generate_and_score_completions` boundary in between, same shape as
+    the two direct calls above) must not re-run TRL's reload_weights RPC or
+    ConPOTrainer's own resync -- weights are still resident from the first
+    call -- and must not really sleep the engine either, so the next call's
+    wake_up is a genuine no-op instead of restoring garbage weights. The
+    deferred sleep only runs for real once `_flush_deferred_vllm_sleep`
+    (called from `_generate_and_score_completions`, right before every
+    flush_pending_veto trigger) says so. A step boundary
+    (`_vllm_synced_this_step` reset, what `_generate_and_score_completions`
+    does at its own top) forces a real resync and sleep again."""
+    trainer = _build_trainer(tmp_path)
+    llm = _FakeLLM()
+    trainer.vllm_generation = _FakeVLLMGeneration(llm)
+    trainer._install_vllm_reload_guard()
+
+    trainer.vllm_generation.generate()
+    trainer.vllm_generation.generate()
+
+    seconds = trainer._engine_seconds
+    assert seconds is not None
+    assert seconds["generate_calls"] == 2
+    assert seconds["reload_calls"] == 1
+    assert seconds["reload_calls_skipped"] == 1
+    assert llm.calls.count("sync") == 1
+    assert llm.calls.count("sleep") == 0  # deferred, not dropped
+    assert trainer._vllm_sleep_pending is True
+
+    trainer._flush_deferred_vllm_sleep()
+    assert llm.calls.count("sleep") == 1
+    assert trainer._vllm_sleep_pending is False
+    assert seconds["sleep"] >= 0.0
+
+    # New step: reset the same two trackers _generate_and_score_completions
+    # resets at its own top, then confirm a real resync+sleep happens again.
+    trainer._vllm_synced_this_step = False
+    trainer._vllm_sleep_pending = False
+
+    trainer.vllm_generation.generate()
+
+    assert seconds["reload_calls"] == 2
+    assert seconds["reload_calls_skipped"] == 1  # unchanged: this call resynced for real
+    assert llm.calls.count("sync") == 2
+    trainer._flush_deferred_vllm_sleep()
+    assert llm.calls.count("sleep") == 2

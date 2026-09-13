@@ -276,6 +276,12 @@ def env(name: str, default: str) -> str:
 # RUN_LIMIT: caps training rows after RUN_SUBSET is applied, "0" (default) = no cap.
 # RUN_OUT_DIR: directory to write run artefacts (checkpoints, logs, metrics).
 # RUN_MULTI: "1" to turn on multi-constraint reverse edges (Overrides.multi, H6 part B).
+# RUN_VLLM_PUSH_ONCE_PER_STEP: "1" (default) pushes the policy into vLLM once
+#   per optimiser step and defers the colocated engine's sleep() across the
+#   rest of that step's generate() calls, skipping TRL's per-call base
+#   reload plus ConPOTrainer's own re-push for every call after the first;
+#   "0" reproduces the old per-call reload+resync+sleep
+#   (conpo/trainer.py's _install_vllm_reload_guard).
 
 # ---------------------------------------------------------------------------
 # Trainer step sizes (section 2.4-2.6: sampled once per optimiser step from

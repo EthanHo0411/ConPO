@@ -293,6 +293,38 @@ def test_main_tiny_run_full_ft_writes_flag_and_no_adapter_config(
     assert len(mechanism_lines) == 1
 
 
+def test_main_tiny_run_vllm_push_once_per_step_default_and_override_reach_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_VLLM_PUSH_ONCE_PER_STEP (L1, devbox perf pass 2026-09-13):
+    scripts/train.py records the effective value in run_metadata.json, same
+    RUN_TAU/RUN_KAPPA override-and-record pattern -- --tiny runs with
+    use_vllm=False, so this only pins the recorded flag, not vLLM behaviour
+    itself (tests/test_vllm_reload_guard.py covers that)."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    out_dir_default = tmp_path / "out_default"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_default))
+    train_script.main()
+    metadata_default = json.loads((out_dir_default / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata_default["vllm_push_once_per_step"] is True
+
+    out_dir_off = tmp_path / "out_off"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_off))
+    monkeypatch.setenv("RUN_VLLM_PUSH_ONCE_PER_STEP", "0")
+    train_script.main()
+    metadata_off = json.loads((out_dir_off / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata_off["vllm_push_once_per_step"] is False
+
+
 # ---------------------------------------------------------------------------
 # conpo/trainer.py: ConPOTrainer.__init__'s construction-time guard (review
 # finding, B7 2026-09-04) -- a non-PEFT model with beta == 0.0 leaves TRL's

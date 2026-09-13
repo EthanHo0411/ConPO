@@ -1016,6 +1016,91 @@ def test_arm_direction_gating_produces_only_the_enabled_direction(
 
 
 # ---------------------------------------------------------------------------
+# RUN_VLLM_PUSH_ONCE_PER_STEP (L1, devbox perf pass 2026-09-13): the deferred
+# vLLM sleep must be flushed for real before flush_pending_veto's asleep-by-
+# the-time-a-burst-starts invariant (conpo/trainer.py's
+# _sleep_engine_if_enabled docstring) is asked to hold.
+# ---------------------------------------------------------------------------
+
+
+def test_flush_deferred_vllm_sleep_runs_before_periodic_veto_flush(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_generate_and_score_completions` must call `_flush_deferred_vllm_sleep`
+    before it can trigger `flush_pending_veto` -- the periodic check here,
+    plus `_save_checkpoint` and scripts/train.py's end-of-training call,
+    which both fire strictly after this method has already returned for the
+    step. With `max_steps=1`, HF's own end-of-training checkpoint save fires
+    `_save_checkpoint`'s own `flush_pending_veto()` call in addition to the
+    periodic one this test forces (`veto_period_k=1`), so two
+    "flush_pending_veto" markers are expected -- both must still come after
+    the single "flush_deferred_sleep" marker. `use_vllm=False` (no real
+    vLLM engine, so `_flush_deferred_vllm_sleep` itself is a no-op) is
+    enough: this test is only about call ORDER, both methods replaced with
+    spies that record it."""
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=8,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    arm, overrides = resolve_arm("solve_only")
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=EdgeBuffer(),
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=overrides,
+        peft_config=_lora_config(),
+    )
+    trainer.veto_period_k = 1  # force the periodic branch on this one step
+
+    call_order: list[str] = []
+
+    def _fake_flush_deferred_sleep() -> None:
+        call_order.append("flush_deferred_sleep")
+
+    def _fake_flush_pending_veto() -> float:
+        call_order.append("flush_pending_veto")
+        return 0.0
+
+    monkeypatch.setattr(trainer, "_flush_deferred_vllm_sleep", _fake_flush_deferred_sleep)
+    monkeypatch.setattr(trainer, "flush_pending_veto", _fake_flush_pending_veto)
+
+    trainer.train()
+
+    assert call_order[0] == "flush_deferred_sleep"
+    assert call_order.count("flush_deferred_sleep") == 1
+    assert len(call_order) >= 2
+    assert all(item == "flush_pending_veto" for item in call_order[1:])
+
+
+# ---------------------------------------------------------------------------
 # arms.py sanity (folded in here per the file-scope assigned to this task)
 # ---------------------------------------------------------------------------
 

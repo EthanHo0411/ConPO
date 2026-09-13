@@ -356,6 +356,12 @@ class ConPOTrainer(GRPOTrainer):
         # HFEngine/FakeEngine runs, so the per-step record's "engine_seconds"
         # key is absent (not zeroed) for them. See _install_vllm_reload_guard.
         self._engine_seconds: dict[str, float] | None = None
+        # RUN_VLLM_PUSH_ONCE_PER_STEP (L1): always exists, unlike the
+        # push-once bookkeeping _install_vllm_reload_guard itself owns
+        # (_vllm_synced_this_step, _vllm_push_once, ...), because
+        # _flush_deferred_vllm_sleep reads it unconditionally every step
+        # (HFEngine/FakeEngine runs included, where it just stays False).
+        self._vllm_sleep_pending: bool = False
 
         reward_func = self.reward_conjunctive if arm.reward == "conjunctive" else self.reward_additive
         callbacks = list(kwargs.pop("callbacks", None) or [])
@@ -456,7 +462,13 @@ class ConPOTrainer(GRPOTrainer):
                 "sleep": 0.0,
                 "generate_calls": 0,
                 "reload_calls": 0,
+                "reload_calls_skipped": 0,
             }
+            # RUN_VLLM_PUSH_ONCE_PER_STEP (L1): a step boundary is exactly
+            # this method's own top, same reasoning as _engine_seconds above
+            # -- so both push-once trackers reset here too.
+            self._vllm_synced_this_step = False
+            self._vllm_sleep_pending = False
         t0 = time.perf_counter()
         output = super()._generate_and_score_completions(inputs)
         # Reset here, not in on_step_begin: TRL's own generation-batch cache
@@ -704,6 +716,16 @@ class ConPOTrainer(GRPOTrainer):
         # single record for this step.
         self._pending_mechanism_record = record
 
+        # RUN_VLLM_PUSH_ONCE_PER_STEP (L1): run this step's deferred
+        # llm.sleep() for real, if one is pending, before any of the three
+        # flush_pending_veto triggers below can run -- _sleep_engine_if_enabled
+        # trusts that the colocated engine is already asleep by the time a
+        # burst starts (periodic check right below, _save_checkpoint, and
+        # scripts/train.py's end-of-training call all fire after this method
+        # has already returned for the step, so this one call site covers
+        # all three).
+        self._flush_deferred_vllm_sleep()
+
         # The periodic flush condition (USER DECISIONS 2026-09-02); the
         # queue-size condition is enforced per-push by _push_pending above
         # (PendingQueue.push raises past max_size, so a check only here would
@@ -945,6 +967,10 @@ class ConPOTrainer(GRPOTrainer):
         the engine is already asleep. Calling `.sleep()` again here would be
         a second sleep with no intervening wake, which vllm's sleep/wake
         pair does not support (a state transition, not idempotent).
+        RUN_VLLM_PUSH_ONCE_PER_STEP (L1, default on) defers that per-call
+        sleep instead of dropping it: `_generate_and_score_completions`
+        calls `_flush_deferred_vllm_sleep()` before every trigger below, so
+        the engine is still genuinely asleep by the time this runs.
 
         UNTESTED: no GPU in this environment, verified only by reading
         trl/generation/vllm_generation.py's own wake_up(tags=...)/
@@ -1082,6 +1108,7 @@ class ConPOTrainer(GRPOTrainer):
             "sleep": 0.0,
             "generate_calls": 0,
             "reload_calls": 0,
+            "reload_calls_skipped": 0,
         }
         # Per-call markers the wake_up/sleep/generate wrappers below hand off
         # through: generate() calls never overlap (one training process, no
@@ -1089,12 +1116,30 @@ class ConPOTrainer(GRPOTrainer):
         self._engine_gen_t0: float | None = None
         self._engine_kv_wake_done_t: float | None = None
         self._engine_kv_wake_seen = False
+        # RUN_VLLM_PUSH_ONCE_PER_STEP (L1, default on): once this step's
+        # policy is pushed into vLLM, every later generate() call in the
+        # same step skips TRL's own reload_weights RPC and our resync
+        # (_reload_then_resync below), and defers llm.sleep() instead of
+        # running it (_timed_sleep below) so weights and the KV cache stay
+        # resident -- there is nothing to reload from. Read once here, not
+        # per call: nothing in a run changes it after this trainer is built.
+        self._vllm_push_once = config.env("RUN_VLLM_PUSH_ONCE_PER_STEP", "1") == "1"
+        self._vllm_synced_this_step = False
+        self._vllm_sleep_pending = False
+        # True only while _flush_deferred_vllm_sleep below is running the
+        # deferred sleep for real, so _timed_sleep's push-once branch
+        # doesn't defer that same call back onto itself.
+        self._vllm_flushing_deferred_sleep = False
 
         def _reload_then_resync(method: str, *args: Any, **kwargs: Any) -> Any:
+            if method == "reload_weights" and self._vllm_push_once and self._vllm_synced_this_step:
+                self._engine_seconds["reload_calls_skipped"] += 1  # type: ignore[index]
+                return None
             result = original_collective_rpc(method, *args, **kwargs)
             if method == "reload_weights":
                 vllm_generation.sync_weights()
                 self._engine_seconds["reload_calls"] += 1  # type: ignore[index]
+                self._vllm_synced_this_step = True
             return result
 
         llm.collective_rpc = _reload_then_resync
@@ -1128,6 +1173,14 @@ class ConPOTrainer(GRPOTrainer):
                 if self._engine_kv_wake_done_t is not None:
                     self._engine_seconds["generate_only"] += t0 - self._engine_kv_wake_done_t  # type: ignore[index]
                     self._engine_kv_wake_done_t = None
+                if self._vllm_push_once and not self._vllm_flushing_deferred_sleep:
+                    # Defer: weights and the KV cache stay resident so the
+                    # next generate() call in this step has nothing to
+                    # reload. _flush_deferred_vllm_sleep runs the real sleep
+                    # (through this same wrapper) before anything that needs
+                    # the engine actually asleep.
+                    self._vllm_sleep_pending = True
+                    return None
                 result = original_sleep(*args, **kwargs)
                 self._engine_seconds["sleep"] += time.perf_counter() - t0  # type: ignore[index]
                 return result
@@ -1153,6 +1206,28 @@ class ConPOTrainer(GRPOTrainer):
                     self._engine_gen_t0 = None
 
             vllm_generation.generate = _timed_generate
+
+    def _flush_deferred_vllm_sleep(self) -> None:
+        """RUN_VLLM_PUSH_ONCE_PER_STEP (L1): run this step's deferred
+        `llm.sleep(level=2)` for real, if `_timed_sleep` above deferred one.
+
+        Goes through the same wrapped `llm.sleep` (`_vllm_flushing_deferred_sleep`
+        set while it runs, so `_timed_sleep` executes the real call instead of
+        deferring again), so `sleep`/`generate_only` timing stays accounted
+        for exactly as it is without push-once. No-op with the flag off or
+        with no colocated vLLM engine (`vllm_generation` never set, or
+        nothing pending). Must run before anything that trusts the engine is
+        already asleep -- see the call site in `_generate_and_score_completions`
+        and `_sleep_engine_if_enabled`'s own docstring.
+        """
+        if not self._vllm_sleep_pending:
+            return
+        self._vllm_flushing_deferred_sleep = True
+        try:
+            self.vllm_generation.llm.sleep(level=2)  # type: ignore[attr-defined]
+        finally:
+            self._vllm_flushing_deferred_sleep = False
+        self._vllm_sleep_pending = False
 
     def _save_checkpoint(self, model: torch.nn.Module, trial: object) -> None:
         """Flush before every checkpoint save (USER DECISIONS 2026-09-02),

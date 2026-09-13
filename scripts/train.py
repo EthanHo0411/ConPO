@@ -293,6 +293,11 @@ def main() -> None:
     seed = int(config.env("RUN_SEED", "0"))
     steps = int(config.env("RUN_STEPS", "1"))
     use_vllm = config.env("RUN_USE_VLLM", "0") == "1"
+    # RUN_VLLM_PUSH_ONCE_PER_STEP (L1, devbox perf pass): read here only to
+    # record the effective value in run_metadata below -- conpo/trainer.py's
+    # _install_vllm_reload_guard reads the same env var itself, directly, at
+    # guard-install time.
+    vllm_push_once_per_step = config.env("RUN_VLLM_PUSH_ONCE_PER_STEP", "1") == "1"
     model_name = config.env("RUN_MODEL", config.POLICY_MODEL)
     veto_period_k = int(config.env("RUN_VETO_PERIOD", str(config.VETO_PERIOD_K)))
     # RUN_SAVE_STEPS (design choice, builder, 2026-09-11): overrides
@@ -586,6 +591,10 @@ def main() -> None:
         # run trained every weight (peft_config=None above) instead of a
         # LoRA adapter.
         "full_ft": full_ft,
+        # RUN_VLLM_PUSH_ONCE_PER_STEP (L1, devbox perf pass): whether this
+        # run pushed the policy into vLLM once per step (default) instead of
+        # before every generate() call.
+        "vllm_push_once_per_step": vllm_push_once_per_step,
     }
     (out_dir / "run_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
 
