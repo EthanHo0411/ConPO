@@ -566,9 +566,11 @@ def test_compute_loss_evicts_saturated_edge_and_records_resp_evicted(
     margin_high = config.KAPPA * config.TAU + 0.1
     margin_low = config.KAPPA * config.TAU - 0.1
 
-    def fake_score_edge_pairs(model: torch.nn.Module, edges: list) -> tuple[torch.Tensor, torch.Tensor]:
+    def fake_score_edge_pairs(
+        model: torch.nn.Module, edges: list
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         assert len(edges) == 2
-        return torch.tensor([margin_high, margin_low]), torch.zeros(len(edges), dtype=torch.long)
+        return torch.tensor([margin_high, margin_low]), torch.zeros(len(edges), dtype=torch.long), {}
 
     trainer._score_edge_pairs = fake_score_edge_pairs
 
@@ -1313,6 +1315,7 @@ def _pair_loss_weight_trainer(tmp_path: Path) -> ConPOTrainer:
     trainer._score_edge_pairs = lambda model, edges: (  # type: ignore[method-assign]
         torch.zeros(len(edges)),
         torch.zeros(len(edges), dtype=torch.long),
+        {},
     )
     trainer._prompt_margins = lambda model, edges: (  # type: ignore[method-assign]
         torch.full((len(edges),), 0.5),
@@ -1343,6 +1346,99 @@ def test_compute_loss_pair_loss_weight_scales_pair_contribution_not_clean_loss(
     pair_2x = total_2x.item() - stats_2x["clean_loss"] * config.LAMBDA_G
     assert pair_1x != pytest.approx(0.0)
     assert pair_2x == pytest.approx(2 * pair_1x)
+
+
+# ---------------------------------------------------------------------------
+# K6 RUN_TOKEN_LOGRATIO_CLAMP (devbox 2026-09-13): _score_edge_pairs's flag
+# branch (_score_edge_pairs_clamped/_token_clamped_q) scores both sides
+# fresh, per token, and clamps the policy-minus-reference log-ratio before
+# forming Delta_theta(e). Both tests run a real trainer.train() over real
+# _hand_built_edges (no stubbing of _score_edge_pairs), so the flag actually
+# exercises the new forward passes end to end.
+# ---------------------------------------------------------------------------
+
+
+def _token_logratio_clamp_trainer(tmp_path: Path) -> ConPOTrainer:
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A, ROW_B]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=1,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    # forward/reverse/prompt_loss off, resp_loss on: isolate _score_edge_pairs
+    # from generation/repair/corruption/L_prompt, same idiom as the
+    # saturated-edge eviction trainer above.
+    arm = ArmSpec(reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=True)
+    edge_buffer = EdgeBuffer()
+    for edge in _hand_built_edges():
+        edge_buffer.push(edge)
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=edge_buffer,
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=Overrides(),
+        peft_config=_lora_config(),
+        probe_enabled=False,
+    )
+    return trainer
+
+
+def test_score_edge_pairs_token_clamp_unset_key_absent(tmp_path: Path) -> None:
+    """RUN_TOKEN_LOGRATIO_CLAMP unset -> self._token_logratio_clamp is None ->
+    _score_edge_pairs takes its original cached-scalar path, and
+    resp_token_clamp_frac is ABSENT (not zero) from stats, proving
+    byte-for-byte unchanged behaviour when the flag is unset."""
+    trainer = _token_logratio_clamp_trainer(tmp_path)
+    assert trainer._token_logratio_clamp is None
+
+    trainer.train()
+
+    assert "resp_token_clamp_frac" not in trainer.last_loss_stats
+
+
+def test_score_edge_pairs_token_clamp_reports_frac_in_unit_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_TOKEN_LOGRATIO_CLAMP set -> _score_edge_pairs_clamped runs (fresh
+    per-token policy/reference forwards, clamped diff), and stats carries
+    resp_token_clamp_frac in [0, 1]."""
+    monkeypatch.setenv("RUN_TOKEN_LOGRATIO_CLAMP", "0.5")
+    trainer = _token_logratio_clamp_trainer(tmp_path)
+    assert trainer._token_logratio_clamp == 0.5
+
+    trainer.train()
+
+    frac = trainer.last_loss_stats["resp_token_clamp_frac"]
+    assert 0.0 <= frac <= 1.0
 
 
 # ---------------------------------------------------------------------------

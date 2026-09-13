@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from conpo import config
-from conpo.losses import completion_lengths, prompt_loss, q_theta, resp_loss, sequence_logprobs
+from conpo.losses import clamp_token_logratio, completion_lengths, prompt_loss, q_theta, resp_loss, sequence_logprobs
 
 
 def _tiny_model() -> Qwen3ForCausalLM:
@@ -178,3 +178,14 @@ def test_prompt_loss_clamp_matches_loss_at_clamped_values_and_reports_clamp_frac
     assert stats["gamma_theta"] == pytest.approx((clamped_plus - clamped_minus).mean().item())
     # 3 of the 6 pooled entries (m_plus[0], m_minus[0], m_minus[2]) exceed the clamp.
     assert stats["clamp_frac"] == pytest.approx(3 / 6)
+
+
+# --- (g) K6 per-token log-ratio clamp -------------------------------------
+
+
+def test_clamp_token_logratio_clamps_and_reports_hits() -> None:
+    diff = torch.tensor([0.5, -3.0])  # token 0 within [-1, 1], token 1 exceeds it
+    clamped_sum, hits = clamp_token_logratio(diff, clamp=1.0)
+
+    assert torch.allclose(clamped_sum, torch.tensor(0.5 - 1.0))
+    assert hits.tolist() == [False, True]  # 1 of 2 tokens clamped

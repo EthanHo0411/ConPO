@@ -139,6 +139,30 @@ def _completion_text(completion: object) -> str:
     return str(completion)
 
 
+def _tokenize_prompt_response(
+    tokenizer: object, prompt_text: str, response: str
+) -> tuple[torch.LongTensor, torch.LongTensor, torch.LongTensor]:
+    """input_ids, attention_mask, completion_mask (CPU) for one (prompt, response) pair.
+
+    Factored out of score_response so RUN_TOKEN_LOGRATIO_CLAMP's per-token
+    policy/reference scoring (_token_clamped_q below) can tokenize once and
+    score both sides on the exact same ids, guaranteeing the two per-token
+    log-prob tensors line up token for token.
+    """
+    rendered_prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt_text}],
+        add_generation_prompt=True,
+        tokenize=False,
+        **config.POLICY_CHAT_TEMPLATE_KWARGS,
+    )
+    prompt_ids = tokenizer(rendered_prompt, add_special_tokens=False, return_tensors="pt")["input_ids"]
+    response_ids = tokenizer(response, add_special_tokens=False, return_tensors="pt")["input_ids"]
+    input_ids = torch.cat([prompt_ids, response_ids], dim=1)
+    attention_mask = torch.ones_like(input_ids)
+    completion_mask = torch.cat([torch.zeros_like(prompt_ids), torch.ones_like(response_ids)], dim=1)
+    return input_ids, attention_mask, completion_mask
+
+
 def score_response(
     model: torch.nn.Module, tokenizer: object, prompt_text: str, response: str
 ) -> tuple[torch.Tensor, int]:
@@ -150,18 +174,13 @@ def score_response(
     reference score; call plainly for a policy score that needs a gradient).
     Used identically for y_plus and y_minus.
     """
-    rendered_prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt_text}],
-        add_generation_prompt=True,
-        tokenize=False,
-        **config.POLICY_CHAT_TEMPLATE_KWARGS,
-    )
+    input_ids, attention_mask, completion_mask = _tokenize_prompt_response(tokenizer, prompt_text, response)
     device = next(model.parameters()).device
-    prompt_ids = tokenizer(rendered_prompt, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
-    response_ids = tokenizer(response, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
-    input_ids = torch.cat([prompt_ids, response_ids], dim=1)
-    attention_mask = torch.ones_like(input_ids)
-    completion_mask = torch.cat([torch.zeros_like(prompt_ids), torch.ones_like(response_ids)], dim=1)
+    input_ids, attention_mask, completion_mask = (
+        input_ids.to(device),
+        attention_mask.to(device),
+        completion_mask.to(device),
+    )
     logp = losses.sequence_logprobs(model, input_ids, attention_mask, completion_mask)[0]
     length = int(losses.completion_lengths(completion_mask)[0].item())
     return logp, length
@@ -312,6 +331,15 @@ class ConPOTrainer(GRPOTrainer):
         # convention as _repair_batch_generation/_cache_ref_logprobs above.
         raw_kl_clamp = config.env("RUN_KL_CLAMP", "")
         self._kl_clamp: float | None = float(raw_kl_clamp) if raw_kl_clamp else None
+        # RUN_TOKEN_LOGRATIO_CLAMP (K6, default unset): clamps the per-token
+        # policy-minus-reference log-ratio in _score_edge_pairs to +/- this
+        # value before it is summed into Delta_theta(e)'s q_plus/q_minus, so
+        # no single token can carry more than this many nats of margin. Read
+        # once here, same convention as _kl_clamp above.
+        raw_token_logratio_clamp = config.env("RUN_TOKEN_LOGRATIO_CLAMP", "")
+        self._token_logratio_clamp: float | None = (
+            float(raw_token_logratio_clamp) if raw_token_logratio_clamp else None
+        )
 
         # Wall-clock accumulation across RUN_RESUME processes (scripts/train.py):
         # the node-local disk is wiped roughly every 48 hours, so one logical
@@ -1425,18 +1453,25 @@ class ConPOTrainer(GRPOTrainer):
     # Losses
     # -----------------------------------------------------------------
 
-    def _score_edge_pairs(self, model: torch.nn.Module, edges: Sequence[Edge]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _score_edge_pairs(
+        self, model: torch.nn.Module, edges: Sequence[Edge]
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         """Delta_theta(e) (ConPO.pdf section 2.4) and age(e) for a batch of edges.
 
         One policy forward pass per response (2 per edge, gradient-tracked);
         logp_ref_*/len_* come from each edge's cache, filled once at
-        admission by `_generate_and_score_completions`.
+        admission by `_generate_and_score_completions`. The third return
+        value is `{}` here; it exists so the RUN_TOKEN_LOGRATIO_CLAMP branch
+        below can report resp_token_clamp_frac through the same signature.
 
         ponytail: one edge at a time (2*len(edges) separate forward calls,
         batch size 1 each) instead of padding the batch into one call; add
         batched scoring if per-step throughput on the real GPU run measures
         as a bottleneck.
         """
+        if self._token_logratio_clamp is not None:
+            return self._score_edge_pairs_clamped(model, edges, self._token_logratio_clamp)
+
         logp_plus, logp_minus, ref_plus, ref_minus, len_plus, len_minus, ages = [], [], [], [], [], [], []
         for edge in edges:
             lp_plus, _ = score_response(model, self.processing_class, edge.prompt, edge.y_plus)
@@ -1460,7 +1495,65 @@ class ConPOTrainer(GRPOTrainer):
             torch.tensor(len_minus, dtype=torch.long, device=device),
         )
         ages_t = torch.tensor(ages, dtype=torch.long, device=device)
-        return q_plus - q_minus, ages_t
+        return q_plus - q_minus, ages_t, {}
+
+    def _score_edge_pairs_clamped(
+        self, model: torch.nn.Module, edges: Sequence[Edge], clamp: float
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+        """_score_edge_pairs under RUN_TOKEN_LOGRATIO_CLAMP (K6).
+
+        Per response: a gradient-tracked policy forward and a fresh no-grad
+        reference forward over the identical tokenized ids (_token_clamped_q
+        below), so the per-token policy-minus-reference log-ratio lines up
+        token for token before losses.clamp_token_logratio clamps it. No
+        cache reuse -- edge.logp_ref_plus/minus and len_plus/minus are
+        unused on this path, unlike the cached path above -- doubling the
+        per-edge reference-model forward cost; acceptable since it only
+        runs when the flag is set.
+        """
+        q_plus_list, q_minus_list, ages, clamp_hits = [], [], [], []
+        for edge in edges:
+            q_plus, hits_plus = self._token_clamped_q(model, edge.prompt, edge.y_plus, clamp)
+            q_minus, hits_minus = self._token_clamped_q(model, edge.prompt, edge.y_minus, clamp)
+            q_plus_list.append(q_plus)
+            q_minus_list.append(q_minus)
+            clamp_hits.append(hits_plus)
+            clamp_hits.append(hits_minus)
+            ages.append(self.edge_buffer.age(edge, self.state.global_step))
+        device = q_plus_list[0].device
+        ages_t = torch.tensor(ages, dtype=torch.long, device=device)
+        all_hits = torch.cat(clamp_hits)
+        resp_stats = {"token_clamp_frac": all_hits.float().mean().item() if all_hits.numel() else 0.0}
+        return torch.stack(q_plus_list) - torch.stack(q_minus_list), ages_t, resp_stats
+
+    def _token_clamped_q(
+        self, model: torch.nn.Module, prompt_text: str, response: str, clamp: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """q_theta(x, y) with its per-token policy-minus-reference log-ratio
+        clamped to +/-`clamp` (RUN_TOKEN_LOGRATIO_CLAMP, K6), plus which
+        completion tokens hit the clamp (pooled by the caller into
+        resp_token_clamp_frac). Policy and reference are scored on the same
+        tokenized ids (_tokenize_prompt_response), so their per-token
+        log-probs line up position for position.
+        """
+        input_ids, attention_mask, completion_mask = _tokenize_prompt_response(
+            self.processing_class, prompt_text, response
+        )
+        device = next(model.parameters()).device
+        input_ids, attention_mask, completion_mask = (
+            input_ids.to(device),
+            attention_mask.to(device),
+            completion_mask.to(device),
+        )
+        _, policy_tok = losses.sequence_logprobs_with_tokens(model, input_ids, attention_mask, completion_mask)
+        with self._reference_model(model) as ref_model:
+            _, ref_tok = losses.sequence_logprobs_with_tokens(ref_model, input_ids, attention_mask, completion_mask)
+        mask = completion_mask[:, 1:].bool()
+        diff = (policy_tok - ref_tok)[mask]
+        clamped_sum, hits = losses.clamp_token_logratio(diff, clamp)
+        length = losses.completion_lengths(completion_mask)
+        q = losses.q_theta_from_logratio(clamped_sum.unsqueeze(0), length)[0]
+        return q, hits
 
     def _prompt_margins(self, model: torch.nn.Module, edges: Sequence[Edge]) -> tuple[torch.Tensor, torch.Tensor]:
         """m_plus = m_theta(x^+A), m_minus = m_theta(x^-A) (ConPO.pdf section 2.5).
@@ -1615,7 +1708,7 @@ class ConPOTrainer(GRPOTrainer):
             return
 
         try:
-            delta, ages = self._score_edge_pairs(model, probe_edges)
+            delta, ages, _ = self._score_edge_pairs(model, probe_edges)
             probe_loss, _ = losses.resp_loss(delta, ages, tau=config.TAU, gamma=config.GAMMA, kappa=config.KAPPA)
             probe_grad = torch.autograd.grad(probe_loss, lora_params, retain_graph=False, allow_unused=True)
             probe_grad = [g if g is not None else torch.zeros_like(p) for g, p in zip(probe_grad, lora_params)]
@@ -1674,7 +1767,7 @@ class ConPOTrainer(GRPOTrainer):
             resp_edges = self.edge_buffer.sample(edge_n, current_update, self.rng, balanced=True)
             if resp_edges:
                 _t_score = time.perf_counter()
-                delta, ages = self._score_edge_pairs(model, resp_edges)
+                delta, ages, token_clamp_stats = self._score_edge_pairs(model, resp_edges)
                 # Saturated-edge eviction: an edge whose margin already clears
                 # kappa*tau carries weight 0 in resp_loss below (same test)
                 # forever after, since delta only grows as training proceeds,
@@ -1687,7 +1780,10 @@ class ConPOTrainer(GRPOTrainer):
                 ]
                 stats["resp_evicted"] = self.edge_buffer.discard(saturated_edges)
                 pair_scoring_seconds += time.perf_counter() - _t_score
-                pair_scoring_forwards += 2 * len(resp_edges)  # score_response(y_plus), score_response(y_minus)
+                # score_response(y_plus), score_response(y_minus); doubled by
+                # RUN_TOKEN_LOGRATIO_CLAMP's fresh per-edge reference forward
+                # (_score_edge_pairs_clamped), which the cached path above skips.
+                pair_scoring_forwards += (4 if self._token_logratio_clamp is not None else 2) * len(resp_edges)
                 loss_resp, resp_stats = losses.resp_loss(
                     delta, ages, tau=config.TAU, gamma=config.GAMMA, kappa=config.KAPPA
                 )
@@ -1695,6 +1791,7 @@ class ConPOTrainer(GRPOTrainer):
                 stats["resp_loss"] = loss_resp.item()
                 stats["resp_mean_age"] = ages.float().mean().item()
                 stats.update({f"resp_{k}": v for k, v in resp_stats.items()})
+                stats.update({f"resp_{k}": v for k, v in token_clamp_stats.items()})
 
                 margins_by_direction_family: dict[tuple[str, str], list[float]] = {}
                 for edge, margin in zip(resp_edges, delta.detach().tolist()):

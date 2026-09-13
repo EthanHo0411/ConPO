@@ -12,6 +12,42 @@ import torch.nn.functional as F
 from conpo import config
 
 
+def sequence_logprobs_with_tokens(
+    model: torch.nn.Module,
+    input_ids: torch.LongTensor,
+    attention_mask: torch.LongTensor,
+    completion_mask: torch.LongTensor,
+    chunk_size: int = 512,
+) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    """sequence_logprobs, plus the per-token values it sums and discards.
+
+    One forward pass; log-probabilities are then computed in chunks along
+    the sequence axis so no (B, L, vocab) fp32 tensor beyond one chunk is
+    ever materialised. Standard causal shift: logits at position t predict
+    the token at position t + 1, so completion_mask[:, 1:] gates which
+    predicted tokens count. The second return value is that per-token
+    log pi_theta(y_t | x, y_<t), masked to 0 outside the completion span
+    (shape (B, L - 1)) -- RUN_TOKEN_LOGRATIO_CLAMP (K6, conpo/trainer.py)
+    needs it to clamp a policy-minus-reference log-ratio token by token
+    before summing, which the scalar sum below cannot support.
+    """
+    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits  # (B, L, V)
+
+    shift_logits = logits[:, :-1, :]
+    shift_labels = input_ids[:, 1:]
+    shift_mask = completion_mask[:, 1:].to(shift_logits.dtype)
+
+    seq_len = shift_labels.shape[1]
+    chunks = []
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        chunk_logp = F.log_softmax(shift_logits[:, start:end, :], dim=-1)
+        token_logp = chunk_logp.gather(-1, shift_labels[:, start:end].unsqueeze(-1)).squeeze(-1)
+        chunks.append(token_logp * shift_mask[:, start:end])
+    token_logp = torch.cat(chunks, dim=1)
+    return token_logp.sum(dim=1), token_logp
+
+
 def sequence_logprobs(
     model: torch.nn.Module,
     input_ids: torch.LongTensor,
@@ -27,25 +63,29 @@ def sequence_logprobs(
     the token at position t + 1, so completion_mask[:, 1:] gates which
     predicted tokens count.
     """
-    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits  # (B, L, V)
-
-    shift_logits = logits[:, :-1, :]
-    shift_labels = input_ids[:, 1:]
-    shift_mask = completion_mask[:, 1:].to(shift_logits.dtype)
-
-    batch, seq_len = shift_labels.shape
-    total = torch.zeros(batch, dtype=shift_logits.dtype, device=shift_logits.device)
-    for start in range(0, seq_len, chunk_size):
-        end = min(start + chunk_size, seq_len)
-        chunk_logp = F.log_softmax(shift_logits[:, start:end, :], dim=-1)
-        token_logp = chunk_logp.gather(-1, shift_labels[:, start:end].unsqueeze(-1)).squeeze(-1)
-        total = total + (token_logp * shift_mask[:, start:end]).sum(dim=1)
-    return total
+    return sequence_logprobs_with_tokens(model, input_ids, attention_mask, completion_mask, chunk_size)[0]
 
 
 def completion_lengths(completion_mask: torch.LongTensor) -> torch.LongTensor:
     """Number of completion tokens per sequence."""
     return completion_mask.sum(dim=1).long()
+
+
+def q_theta_from_logratio(
+    raw_logratio: torch.Tensor,
+    lengths: torch.LongTensor,
+    alpha: int = config.ALPHA,
+) -> torch.Tensor:
+    """q_theta^(alpha) from an already-formed raw log-ratio (section 2.4).
+
+    q_theta normally forms `raw_logratio` as `logp_policy - logp_ref`, two
+    scalar sequence-level sums; RUN_TOKEN_LOGRATIO_CLAMP (K6,
+    conpo/trainer.py) instead forms it by clamping and summing a per-token
+    log-ratio, so the length normalisation below is factored out to be
+    shared by both.
+    """
+    length_norm = lengths.clamp(min=1).to(raw_logratio.dtype) ** alpha
+    return raw_logratio / length_norm
 
 
 def q_theta(
@@ -55,8 +95,26 @@ def q_theta(
     alpha: int = config.ALPHA,
 ) -> torch.Tensor:
     """q_theta^(alpha)(x, y) (section 2.4): length-normalised, reference-adjusted score."""
-    length_norm = lengths.clamp(min=1).to(logp_policy.dtype) ** alpha
-    return (logp_policy - logp_ref) / length_norm
+    return q_theta_from_logratio(logp_policy - logp_ref, lengths, alpha)
+
+
+def clamp_token_logratio(diff: torch.Tensor, clamp: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """RUN_TOKEN_LOGRATIO_CLAMP (K6): elementwise-clamp a per-token
+    policy-minus-reference log-ratio to +/-`clamp` before it is summed into
+    the raw log-ratio `q_theta_from_logratio` normalises -- so no single
+    token can carry more than `clamp` nats of margin.
+
+    `diff` holds one response's completion-token log-ratios only (the
+    caller, conpo/trainer.py's `_token_clamped_q`, selects those out of the
+    masked (B, L-1) tensors `sequence_logprobs_with_tokens` returns before
+    calling this). Returns (sum of the clamped values, a same-shape boolean
+    of which entries the raw value exceeded -- pooled across every scored
+    token by the caller into the `resp_token_clamp_frac` stat, mirroring
+    prompt_loss's own clamp_frac above).
+    """
+    hits = diff.detach().abs() > clamp
+    clamped = diff.clamp(min=-clamp, max=clamp)
+    return clamped.sum(), hits
 
 
 def resp_loss(
