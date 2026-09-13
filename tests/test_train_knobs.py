@@ -224,6 +224,43 @@ def test_main_tiny_run_tau_and_tau_p_reach_config_and_metadata(
     assert metadata["kappa"] == pytest.approx(2.5)
 
 
+def test_main_tiny_run_loss_type_reaches_config_and_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_LOSS_TYPE overrides config.LOSS_TYPE before the trainer is built
+    (scripts/train.py); the GRPOConfig(...) call reads config.LOSS_TYPE at
+    that point (loss_type=config.LOSS_TYPE), so the override reaching config
+    is what reaches TRL's GRPOTrainer, and run_metadata.json must record the
+    effective value.
+
+    monkeypatch.setattr registers the pre-test value for restoration at
+    teardown regardless of what main()'s own plain `config.LOSS_TYPE = loss_type`
+    assignment does in between, so config.LOSS_TYPE is back to its pre-test
+    value for every later test.
+    """
+    monkeypatch.setattr(config, "LOSS_TYPE", config.LOSS_TYPE)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setenv("RUN_LOSS_TYPE", "dapo")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    assert config.LOSS_TYPE == "dapo"
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["loss_type"] == "dapo"
+
+
 def test_main_tiny_raises_when_run_limit_below_prompts_per_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

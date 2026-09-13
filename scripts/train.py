@@ -330,6 +330,10 @@ def main() -> None:
     # (kappa * tau), read fresh at call time by conpo/trainer.py.
     kappa = float(config.env("RUN_KAPPA", str(config.KAPPA)))
     config.KAPPA = kappa
+    # RUN_LOSS_TYPE (devbox 2026-09-13): same pattern for config.LOSS_TYPE,
+    # read fresh by the GRPOConfig(...) call below (loss_type=config.LOSS_TYPE).
+    loss_type = config.env("RUN_LOSS_TYPE", config.LOSS_TYPE)
+    config.LOSS_TYPE = loss_type
     out_dir = Path(config.env("RUN_OUT_DIR", "runs/tmp"))
     run_resume = config.env("RUN_RESUME", "0") == "1"
     resume_checkpoint_dir, resumed_from_step = _resolve_resume(out_dir, run_resume)
@@ -585,6 +589,7 @@ def main() -> None:
         "tau": tau,
         "tau_p": tau_p,
         "kappa": kappa,
+        "loss_type": loss_type,
         "row_limit": row_limit or None,
         # RUN_RESUME (devbox 2026-09-11): the checkpoint step this run
         # resumed from, or None for a fresh run.
