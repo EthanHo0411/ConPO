@@ -195,6 +195,7 @@ def test_main_tiny_run_tau_and_tau_p_reach_config_and_metadata(
     """
     monkeypatch.setattr(config, "TAU", config.TAU)
     monkeypatch.setattr(config, "TAU_P", config.TAU_P)
+    monkeypatch.setattr(config, "KAPPA", config.KAPPA)
 
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -208,16 +209,19 @@ def test_main_tiny_run_tau_and_tau_p_reach_config_and_metadata(
     monkeypatch.setenv("RUN_NO_VETO", "1")
     monkeypatch.setenv("RUN_TAU", "0.25")
     monkeypatch.setenv("RUN_TAU_P", "0.4")
+    monkeypatch.setenv("RUN_KAPPA", "2.5")
     monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
 
     train_script.main()
 
     assert config.TAU == pytest.approx(0.25)
     assert config.TAU_P == pytest.approx(0.4)
+    assert config.KAPPA == pytest.approx(2.5)
 
     metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
     assert metadata["tau"] == pytest.approx(0.25)
     assert metadata["tau_p"] == pytest.approx(0.4)
+    assert metadata["kappa"] == pytest.approx(2.5)
 
 
 def test_main_tiny_raises_when_run_limit_below_prompts_per_update(

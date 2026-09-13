@@ -310,6 +310,11 @@ def main() -> None:
     tau_p = float(config.env("RUN_TAU_P", str(config.TAU_P)))
     config.TAU = tau
     config.TAU_P = tau_p
+    # RUN_KAPPA (devbox 2026-09-13): same pattern for config.KAPPA, the
+    # resp_loss retirement bar and the saturated-edge eviction threshold
+    # (kappa * tau), read fresh at call time by conpo/trainer.py.
+    kappa = float(config.env("RUN_KAPPA", str(config.KAPPA)))
+    config.KAPPA = kappa
     out_dir = Path(config.env("RUN_OUT_DIR", "runs/tmp"))
     run_resume = config.env("RUN_RESUME", "0") == "1"
     resume_checkpoint_dir, resumed_from_step = _resolve_resume(out_dir, run_resume)
@@ -564,6 +569,7 @@ def main() -> None:
         # overridden.
         "tau": tau,
         "tau_p": tau_p,
+        "kappa": kappa,
         "row_limit": row_limit or None,
         # RUN_RESUME (devbox 2026-09-11): the checkpoint step this run
         # resumed from, or None for a fresh run.
