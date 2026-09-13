@@ -135,6 +135,54 @@ def test_save_load_round_trip(tmp_path) -> None:
     assert original_ids == loaded_ids
 
 
+def test_discard_removes_given_edges_and_reports_count() -> None:
+    buf = EdgeBuffer(capacity=1000, age_cap=1000)
+    edges = [_make_edge(direction="forward", created_update=0, prompt_id=f"f{i}") for i in range(5)]
+    for e in edges:
+        buf.push(e)
+
+    removed = buf.discard([edges[1], edges[3]])
+
+    assert removed == 2
+    assert len(buf) == 3
+    remaining = {e.prompt_id for e in buf.sample(10, current_update=0, rng=random.Random(0), balanced=False)}
+    assert remaining == {"f0", "f2", "f4"}
+
+
+def test_discard_edge_not_in_buffer_counts_as_not_found() -> None:
+    buf = EdgeBuffer(capacity=1000, age_cap=1000)
+    buf.push(_make_edge(direction="forward", created_update=0, prompt_id="kept"))
+    stray = _make_edge(direction="forward", created_update=0, prompt_id="stray")  # never pushed
+
+    assert buf.discard([stray]) == 0
+    assert len(buf) == 1
+
+
+def test_discard_empty_list_is_a_no_op() -> None:
+    buf = EdgeBuffer(capacity=1000, age_cap=1000)
+    buf.push(_make_edge(direction="forward", created_update=0, prompt_id="a"))
+
+    assert buf.discard([]) == 0
+    assert len(buf) == 1
+
+
+def test_discarded_edge_does_not_return_after_save_load_round_trip(tmp_path) -> None:
+    buf = EdgeBuffer(capacity=1000, age_cap=1000)
+    edges = [_make_edge(direction="forward", created_update=0, prompt_id=f"f{i}") for i in range(3)]
+    for e in edges:
+        buf.push(e)
+    buf.discard([edges[1]])
+
+    path = tmp_path / "edges.jsonl"
+    buf.save(path)
+    loaded = EdgeBuffer(capacity=1000, age_cap=1000)
+    loaded.load(path)
+
+    assert len(loaded) == 2
+    loaded_ids = {e.prompt_id for e in loaded.sample(10, current_update=0, rng=random.Random(0), balanced=False)}
+    assert loaded_ids == {"f0", "f2"}
+
+
 def test_sample_where_filters_by_predicate_and_retires_stale() -> None:
     buf = EdgeBuffer(capacity=1000, age_cap=5)
     buf.push(_make_edge(direction="forward", created_update=0, prompt_id="stale", families=frozenset({"a"})))

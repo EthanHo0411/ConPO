@@ -156,3 +156,25 @@ def test_prompt_loss_gamma_diagnostic_matches_mean_difference() -> None:
     assert stats["gamma_theta"] == pytest.approx((m_plus - m_minus).mean().item())
     assert stats["mean_m_plus"] == pytest.approx(m_plus.mean().item())
     assert stats["mean_m_minus"] == pytest.approx(m_minus.mean().item())
+    assert stats["clamp_frac"] == 0.0  # default clamp is +-inf: nothing hit it
+
+
+# --- (f) prompt_loss margin clamp -----------------------------------------
+
+
+def test_prompt_loss_clamp_matches_loss_at_clamped_values_and_reports_clamp_frac() -> None:
+    clamp = 1.0
+    m_plus = torch.tensor([5.0, 0.3, -0.2])  # entry 0 exceeds +clamp
+    m_minus = torch.tensor([-5.0, 0.1, 2.0])  # entries 0 and 2 exceed the clamp
+    loss, stats = prompt_loss(m_plus, m_minus, clamp=clamp)
+
+    clamped_plus = torch.clamp(m_plus, -clamp, clamp)
+    clamped_minus = torch.clamp(m_minus, -clamp, clamp)
+    expected_loss = -F.logsigmoid(clamped_plus / config.TAU_P).mean() + config.LAMBDA_0 * (clamped_minus**2).mean()
+
+    assert torch.allclose(loss, expected_loss, atol=1e-6)
+    assert stats["mean_m_plus"] == pytest.approx(clamped_plus.mean().item())
+    assert stats["mean_m_minus"] == pytest.approx(clamped_minus.mean().item())
+    assert stats["gamma_theta"] == pytest.approx((clamped_plus - clamped_minus).mean().item())
+    # 3 of the 6 pooled entries (m_plus[0], m_minus[0], m_minus[2]) exceed the clamp.
+    assert stats["clamp_frac"] == pytest.approx(3 / 6)

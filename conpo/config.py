@@ -135,6 +135,11 @@ GAMMA = 0.99  # DEV_SET
 # Delta_theta(e) > kappa * tau (Lemma 7). DEV_SET.
 KAPPA = 5.0  # DEV_SET
 
+# Multiplier on kappa * tau_p for prompt_loss's margin clamp (conpo/losses.py):
+# bounds m_plus/m_minus to +/- MARGIN_CLAMP_MULT * kappa * tau_p, mirroring
+# L_resp's kappa*tau saturation point one octave out.
+MARGIN_CLAMP_MULT = 2.0
+
 # lambda_0 (section 2.5): coefficient on the indifference penalty
 # E[m_theta(x^-A)^2] in L_prompt. DEV_SET.
 LAMBDA_0 = 0.1  # DEV_SET

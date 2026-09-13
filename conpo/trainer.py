@@ -1508,6 +1508,17 @@ class ConPOTrainer(GRPOTrainer):
             if resp_edges:
                 _t_score = time.perf_counter()
                 delta, ages = self._score_edge_pairs(model, resp_edges)
+                # Saturated-edge eviction: an edge whose margin already clears
+                # kappa*tau carries weight 0 in resp_loss below (same test)
+                # forever after, since delta only grows as training proceeds,
+                # so it wastes a sample() draw and a score_edge_pairs forward
+                # every future step until age_cap retires it. Drop it now.
+                saturated_edges = [
+                    edge
+                    for edge, margin in zip(resp_edges, delta.detach().tolist())
+                    if margin > config.KAPPA * config.TAU
+                ]
+                stats["resp_evicted"] = self.edge_buffer.discard(saturated_edges)
                 pair_scoring_seconds += time.perf_counter() - _t_score
                 pair_scoring_forwards += 2 * len(resp_edges)  # score_response(y_plus), score_response(y_minus)
                 loss_resp, resp_stats = losses.resp_loss(
@@ -1554,7 +1565,11 @@ class ConPOTrainer(GRPOTrainer):
                 # _prompt_margins' x+ side reuses the edge's cached logp_ref_*.
                 pair_scoring_forwards += 6 * len(prompt_edges)
                 loss_prompt, prompt_stats = losses.prompt_loss(
-                    m_plus, m_minus, tau_p=config.TAU_P, lambda_0=config.LAMBDA_0
+                    m_plus,
+                    m_minus,
+                    tau_p=config.TAU_P,
+                    lambda_0=config.LAMBDA_0,
+                    clamp=config.MARGIN_CLAMP_MULT * config.KAPPA * config.TAU_P,
                 )
                 if self.overrides.lambda_p > 0:
                     total = total + self.overrides.lambda_p * loss_prompt
@@ -1567,6 +1582,8 @@ class ConPOTrainer(GRPOTrainer):
 
         if self._pending_mechanism_record is not None:
             self._pending_mechanism_record.update({k: v for k, v in stats.items() if k.startswith("prompt_")})
+            if "resp_evicted" in stats:
+                self._pending_mechanism_record["resp_evicted"] = stats["resp_evicted"]
             self._pending_mechanism_record["pair_scoring_seconds"] = pair_scoring_seconds
             self._pending_mechanism_record["pair_scoring_forwards"] = pair_scoring_forwards
             with open(self.mechanism_log_path, "a", encoding="utf-8") as f:

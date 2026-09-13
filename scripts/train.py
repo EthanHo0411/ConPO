@@ -300,6 +300,16 @@ def main() -> None:
     # config.VETO_PERIOD_K -- config.py's locked value is untouched, this
     # only lets a CPU test force a checkpoint every step instead of every 25.
     save_steps = int(config.env("RUN_SAVE_STEPS", str(config.SAVE_STEPS)))
+    # RUN_TAU / RUN_TAU_P: same override pattern as RUN_VETO_PERIOD /
+    # RUN_SAVE_STEPS above, but for config.TAU / config.TAU_P directly --
+    # conpo/trainer.py's compute_loss and conpo/losses.py's resp_loss /
+    # prompt_loss defaults both read these two module attributes fresh at
+    # call time (no importer binds them earlier), so assigning here before
+    # ConPOTrainer is constructed is enough to take effect for the whole run.
+    tau = float(config.env("RUN_TAU", str(config.TAU)))
+    tau_p = float(config.env("RUN_TAU_P", str(config.TAU_P)))
+    config.TAU = tau
+    config.TAU_P = tau_p
     out_dir = Path(config.env("RUN_OUT_DIR", "runs/tmp"))
     run_resume = config.env("RUN_RESUME", "0") == "1"
     resume_checkpoint_dir, resumed_from_step = _resolve_resume(out_dir, run_resume)
@@ -549,6 +559,11 @@ def main() -> None:
         "judge_mode": judge_mode,
         "judge_model": judge_model,
         "veto_period_k": veto_period_k,
+        # RUN_TAU / RUN_TAU_P (devbox 2026-09-12): effective config.TAU /
+        # config.TAU_P this run trained with, config.py's defaults unless
+        # overridden.
+        "tau": tau,
+        "tau_p": tau_p,
         "row_limit": row_limit or None,
         # RUN_RESUME (devbox 2026-09-11): the checkpoint step this run
         # resumed from, or None for a fresh run.

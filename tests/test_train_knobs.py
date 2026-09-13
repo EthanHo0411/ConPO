@@ -179,6 +179,47 @@ def test_main_tiny_writes_shape_knobs_to_run_metadata(
     assert metadata["effective_batch"] == config.EFFECTIVE_BATCH
 
 
+def test_main_tiny_run_tau_and_tau_p_reach_config_and_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_TAU / RUN_TAU_P override config.TAU / config.TAU_P before the
+    trainer is built (scripts/train.py); conpo/trainer.py's compute_loss
+    reads config.TAU / config.TAU_P fresh at call time, so the override
+    reaching config is what reaches training, and run_metadata.json
+    must record the effective values.
+
+    monkeypatch.setattr registers each pre-test value for restoration at
+    teardown regardless of what main()'s own plain `config.TAU = tau`
+    assignment does in between, so config.TAU/TAU_P are back to their
+    pre-test values for every later test.
+    """
+    monkeypatch.setattr(config, "TAU", config.TAU)
+    monkeypatch.setattr(config, "TAU_P", config.TAU_P)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setenv("RUN_TAU", "0.25")
+    monkeypatch.setenv("RUN_TAU_P", "0.4")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    assert config.TAU == pytest.approx(0.25)
+    assert config.TAU_P == pytest.approx(0.4)
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["tau"] == pytest.approx(0.25)
+    assert metadata["tau_p"] == pytest.approx(0.4)
+
+
 def test_main_tiny_raises_when_run_limit_below_prompts_per_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

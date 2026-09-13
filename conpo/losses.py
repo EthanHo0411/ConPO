@@ -96,6 +96,7 @@ def prompt_loss(
     m_minus: torch.Tensor,
     tau_p: float = config.TAU_P,
     lambda_0: float = config.LAMBDA_0,
+    clamp: float = float("inf"),
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """L_prompt (section 2.5): one-sided prompt-side contrastive objective.
 
@@ -103,11 +104,24 @@ def prompt_loss(
     is not part of the loss (section 2.5 explains why: a raw
     difference-in-differences loss would reward degrading the response
     when the constraint is absent).
+
+    `clamp` bounds m_plus and m_minus to [-clamp, clamp] before m_plus
+    enters logsigmoid and m_minus is squared: unlike Delta_theta, m_theta
+    has no retirement rule of its own, so one outlier margin would otherwise
+    dominate both terms' mean unchecked. Defaults to no clamping (+-inf) so
+    an unspecified call is unaffected. The returned stats (gamma_theta,
+    mean_m_plus, mean_m_minus) are computed on the clamped values;
+    clamp_frac is the fraction of entries, pooled across both tensors,
+    whose magnitude exceeded clamp.
     """
-    loss = -F.logsigmoid(m_plus / tau_p).mean() + lambda_0 * (m_minus**2).mean()
+    m_plus_c = torch.clamp(m_plus, -clamp, clamp)
+    m_minus_c = torch.clamp(m_minus, -clamp, clamp)
+    loss = -F.logsigmoid(m_plus_c / tau_p).mean() + lambda_0 * (m_minus_c**2).mean()
+    hit = torch.cat([m_plus.detach().abs() > clamp, m_minus.detach().abs() > clamp])
     stats = {
-        "gamma_theta": (m_plus - m_minus).mean().item(),
-        "mean_m_plus": m_plus.mean().item(),
-        "mean_m_minus": m_minus.mean().item(),
+        "gamma_theta": (m_plus_c - m_minus_c).mean().item(),
+        "mean_m_plus": m_plus_c.mean().item(),
+        "mean_m_minus": m_minus_c.mean().item(),
+        "clamp_frac": hit.float().mean().item(),
     }
     return loss, stats

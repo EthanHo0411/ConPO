@@ -494,6 +494,92 @@ def test_compute_loss_halves_edge_sample_and_runs_probe_once_per_step(
 
 
 # ---------------------------------------------------------------------------
+# compute_loss saturated-edge eviction (conpo/trainer.py): an edge whose
+# margin already clears kappa*tau carries weight 0 in resp_loss forever
+# after (delta only grows as training proceeds), so compute_loss discards it
+# from edge_buffer right after _score_edge_pairs instead of resampling it
+# every future step until age_cap retires it.
+# ---------------------------------------------------------------------------
+
+
+def test_compute_loss_evicts_saturated_edge_and_records_resp_evicted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "EDGE_PAIRS_PER_STEP", 2)
+
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A, ROW_B]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=1,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    # forward/reverse/prompt_loss off: isolate compute_loss's own eviction
+    # branch from the counterfactual-construction machinery and L_prompt.
+    arm = ArmSpec(reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=True)
+    edge_buffer = EdgeBuffer()
+    # Both edges "forward" (none "reverse"): sample()'s balanced=True falls
+    # back to the single present direction, so both are drawn deterministically.
+    for edge in _hand_built_edges()[2:]:
+        edge_buffer.push(edge)
+    assert len(edge_buffer) == 2
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=edge_buffer,
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=Overrides(),
+        peft_config=_lora_config(),
+    )
+    trainer._run_probe = lambda *args, **kwargs: None
+
+    # One margin above kappa*tau (must be evicted), one at/below it (kept);
+    # ages don't matter to eviction so both are 0.
+    margin_high = config.KAPPA * config.TAU + 0.1
+    margin_low = config.KAPPA * config.TAU - 0.1
+
+    def fake_score_edge_pairs(model: torch.nn.Module, edges: list) -> tuple[torch.Tensor, torch.Tensor]:
+        assert len(edges) == 2
+        return torch.tensor([margin_high, margin_low]), torch.zeros(len(edges), dtype=torch.long)
+
+    trainer._score_edge_pairs = fake_score_edge_pairs
+
+    trainer.train()
+
+    assert trainer.state.global_step == 1
+    assert len(edge_buffer) == 1  # the saturated edge was discarded
+    assert trainer.last_loss_stats["resp_evicted"] == 1
+
+
+# ---------------------------------------------------------------------------
 # _run_probe's memory bound (task H, Ethan devbox, 2026-09-11): the clean
 # side is now a fresh, small resample of the step's own batch instead of a
 # retain_graph=True differentiation of the full-batch `clean` tensor.

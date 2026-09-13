@@ -15,7 +15,7 @@ age_cap retired before every draw. FeasibleBuffer implements B_F (sections
 import json
 import random
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -190,6 +190,29 @@ class EdgeBuffer:
                 if j < n:
                     reservoir[j] = edge
         return reservoir
+
+    def discard(self, edges: Sequence[Edge]) -> int:
+        """Remove exactly the given edge objects from the buffer.
+
+        Edge is a frozen dataclass but not hashable (`meta` wraps a plain
+        dict), so edges are tracked by identity (id()), the same convention
+        conpo/trainer.py's own edge-identity bookkeeping already uses
+        (_pending_feasible_by_edge_id). Returns the number removed
+        (an edge already retired or sampled from a different buffer copy
+        counts as not found, not an error).
+        """
+        target_ids = {id(e) for e in edges}
+        if not target_ids:
+            return 0
+        kept: deque[Edge] = deque()
+        removed = 0
+        for edge in self._edges:
+            if id(edge) in target_ids:
+                removed += 1
+            else:
+                kept.append(edge)
+        self._edges = kept
+        return removed
 
     def counts_by_direction(self) -> dict[str, int]:
         counts: dict[str, int] = {}
