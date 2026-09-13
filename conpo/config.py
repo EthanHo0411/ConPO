@@ -282,6 +282,12 @@ def env(name: str, default: str) -> str:
 #   reload plus ConPOTrainer's own re-push for every call after the first;
 #   "0" reproduces the old per-call reload+resync+sleep
 #   (conpo/trainer.py's _install_vllm_reload_guard).
+# RUN_REPAIR_BATCH_GENERATION: "1" (default) merges every failing group's
+#   forward-repair trajectories into one shared engine.generate call per
+#   repair round for the whole step (conpo/forward.py's repair_all_groups),
+#   instead of running each group's own repair_failed_group call to
+#   completion before the next group starts; "0" reproduces the old
+#   one-repair_failed_group-call-per-group behaviour.
 
 # ---------------------------------------------------------------------------
 # Trainer step sizes (section 2.4-2.6: sampled once per optimiser step from

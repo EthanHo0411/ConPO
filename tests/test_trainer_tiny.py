@@ -672,7 +672,10 @@ def test_run_probe_records_a_cosine(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_forward_feasible_endpoints_reach_feasible_buffer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("repair_batch_generation", [True, False])
+def test_forward_feasible_endpoints_reach_feasible_buffer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repair_batch_generation: bool
+) -> None:
     # Force every generated response to fail every verifier so it is always
     # routed into failed_responses, independent of what the tiny random
     # model actually generates, and forward repair always runs.
@@ -684,10 +687,24 @@ def test_forward_feasible_endpoints_reach_feasible_buffer(tmp_path: Path, monkey
     # feasible_buffer with no verdict to wait for -- see
     # test_batched_veto_forward_endpoint_withheld_until_its_edges_are_kept in
     # tests/test_batched_veto_trainer.py for the withheld-until-kept case.
-    monkeypatch.setattr(
-        "conpo.forward.repair_failed_group",
-        lambda *args, **kwargs: RepairResult(feasible_endpoints=[sentinel], endpoint_sources=[[]]),
-    )
+    # RUN_REPAIR_BATCH_GENERATION (L2) picks which forward.py function
+    # _generate_and_score_completions' per-group loop actually reaches:
+    # repair_all_groups (default, "1") or the old per-group
+    # repair_failed_group ("0") -- patch whichever one this run's flag
+    # setting will call, both returning one RepairResult per group.
+    monkeypatch.setenv("RUN_REPAIR_BATCH_GENERATION", "1" if repair_batch_generation else "0")
+    if repair_batch_generation:
+        monkeypatch.setattr(
+            "conpo.forward.repair_all_groups",
+            lambda groups, *args, **kwargs: [
+                RepairResult(feasible_endpoints=[sentinel], endpoint_sources=[[]]) for _ in groups
+            ],
+        )
+    else:
+        monkeypatch.setattr(
+            "conpo.forward.repair_failed_group",
+            lambda *args, **kwargs: RepairResult(feasible_endpoints=[sentinel], endpoint_sources=[[]]),
+        )
 
     model, tokenizer = _tiny_model_and_tokenizer()
     rows = [ROW_A, ROW_B]
@@ -936,17 +953,32 @@ def test_arm_direction_gating_produces_only_the_enabled_direction(
 ) -> None:
     monkeypatch.setattr("conpo.trainer.verifier_vector", lambda constraints, text: [False] * len(constraints))
     enabled_direction = "forward" if arm_name == "forward_only" else "reverse"
-    disabled_target = "conpo.reverse.reverse_batch" if arm_name == "forward_only" else "conpo.forward.repair_failed_group"
+    # reverse_only: patch BOTH conpo.forward functions to raise, not just
+    # repair_failed_group -- RUN_REPAIR_BATCH_GENERATION (L2) defaults to
+    # "1", so the default call site is repair_all_groups, and this gating
+    # check must still catch a regression whichever one a future flag
+    # flip reaches.
+    disabled_targets = (
+        ["conpo.reverse.reverse_batch"]
+        if arm_name == "forward_only"
+        else ["conpo.forward.repair_failed_group", "conpo.forward.repair_all_groups"]
+    )
 
     def _raise_if_called(*args: object, **kwargs: object) -> None:
-        raise AssertionError(f"{disabled_target} must not run when its direction is disabled")
+        raise AssertionError(f"{disabled_targets} must not run when its direction is disabled")
 
-    monkeypatch.setattr(disabled_target, _raise_if_called)
+    for disabled_target in disabled_targets:
+        monkeypatch.setattr(disabled_target, _raise_if_called)
 
     if arm_name == "forward_only":
+        # RUN_REPAIR_BATCH_GENERATION defaults to "1" (L2): the enabled
+        # direction's call site is repair_all_groups, not repair_failed_group.
         monkeypatch.setattr(
-            "conpo.forward.repair_failed_group",
-            lambda *a, **kw: RepairResult(edges=[_canned_edge("forward")], feasible_endpoints=[], endpoint_sources=[]),
+            "conpo.forward.repair_all_groups",
+            lambda groups, *a, **kw: [
+                RepairResult(edges=[_canned_edge("forward")], feasible_endpoints=[], endpoint_sources=[])
+                for _ in groups
+            ],
         )
     else:
         monkeypatch.setattr(

@@ -292,6 +292,13 @@ class ConPOTrainer(GRPOTrainer):
         # Lifetime count of edges admitted into edge_buffer, independent of the
         # buffer's own FIFO/age-cap eviction, for the cumulative mechanism-log rate.
         self.cumulative_admitted_edges = 0
+        # RUN_REPAIR_BATCH_GENERATION (L2, default on): merge every failing
+        # group's forward-repair calls for a step into one
+        # forward.repair_all_groups call instead of one forward.
+        # repair_failed_group call per group (_generate_and_score_completions
+        # below). Read once here, not per step: nothing in a run changes it
+        # after this trainer is built.
+        self._repair_batch_generation = config.env("RUN_REPAIR_BATCH_GENERATION", "1") == "1"
 
         # Wall-clock accumulation across RUN_RESUME processes (scripts/train.py):
         # the node-local disk is wiped roughly every 48 hours, so one logical
@@ -500,6 +507,16 @@ class ConPOTrainer(GRPOTrainer):
         degenerate_groups = 0
         total_groups = 0
         multi_attempted = 0
+        # RUN_REPAIR_BATCH_GENERATION (L2): every failing group's own
+        # (key, row, failed_responses, judge_for_group) collected here
+        # instead of repaired inline, so ONE forward.repair_all_groups call
+        # below can merge every group's engine.generate calls for the whole
+        # step. judge_for_group is exactly what the flag-off branch below
+        # would have passed as repair_failed_group's own `judge` argument
+        # (a fresh _QueueingVetoCollector under the batched veto, else
+        # self.judge) -- one per group, never shared, so each group's
+        # captured veto requests stay lined up with that group's own edges.
+        pending_forward: list[tuple[str, PoolRow, list[str], object]] = []
 
         for start in range(0, len(inputs), n):
             end = start + n
@@ -533,43 +550,46 @@ class ConPOTrainer(GRPOTrainer):
 
             if self.arm.forward and failed_responses:
                 veto_flag = not self.overrides.no_veto
-                collector = _QueueingVetoCollector() if veto_flag else None
-                _t_forward = time.perf_counter()
-                result = forward.repair_failed_group(
-                    row,
-                    failed_responses,
-                    self.engine,
-                    collector if veto_flag else self.judge,
-                    self.rng,
-                    self.meter,
-                    current_update,
-                    veto=veto_flag,
-                    distance_gate=not self.overrides.no_distance,
-                )
-                self._phase_seconds["forward_repair"] += time.perf_counter() - _t_forward
-                if veto_flag:
-                    # Register a tracker for every trajectory-derived endpoint
-                    # BEFORE pushing its edges below (round2 finding 1): a
-                    # push can trigger an early flush when pending_queue is
-                    # already at pending_queue_max, and that flush must find
-                    # the tracker already in place or the edge's verdict
-                    # would resolve nothing. An endpoint with no source
-                    # edges (repair_trajectory's already-feasible-input
-                    # shape) needs no veto and goes straight in.
-                    for endpoint, edges in zip(result.feasible_endpoints, result.endpoint_sources):
-                        if edges:
-                            self._defer_feasible_endpoint(key, endpoint, edges)
-                        else:
-                            self.feasible_buffer.add(key, endpoint)
-                    # 1:1, in order: forward.py calls judge.veto() exactly once
-                    # per admitted candidate, right before appending it (see
-                    # _QueueingVetoCollector's docstring).
-                    for edge, req in zip(result.edges, collector.captured):
-                        self._push_pending(PendingPair(edge=edge, request=req, direction="forward"))
+                judge_for_group = _QueueingVetoCollector() if veto_flag else self.judge
+                if self._repair_batch_generation:
+                    pending_forward.append((key, row, failed_responses, judge_for_group))
                 else:
-                    new_edges.extend(result.edges)
-                    for endpoint in result.feasible_endpoints:
-                        self.feasible_buffer.add(key, endpoint)
+                    _t_forward = time.perf_counter()
+                    result = forward.repair_failed_group(
+                        row,
+                        failed_responses,
+                        self.engine,
+                        judge_for_group,
+                        self.rng,
+                        self.meter,
+                        current_update,
+                        veto=veto_flag,
+                        distance_gate=not self.overrides.no_distance,
+                    )
+                    self._phase_seconds["forward_repair"] += time.perf_counter() - _t_forward
+                    self._consume_forward_result(key, result, veto_flag, judge_for_group, new_edges)
+                    forward_reasons.update(result.reasons)
+
+        if self._repair_batch_generation and pending_forward:
+            # RUN_REPAIR_BATCH_GENERATION (L2): every group collected above
+            # shares one forward.repair_all_groups call -- see that
+            # function's docstring (conpo/forward.py) for the batching
+            # contract and the rng-seed ordering caveat this merge carries.
+            veto_flag = not self.overrides.no_veto
+            _t_forward = time.perf_counter()
+            results = forward.repair_all_groups(
+                [(row, failed_responses) for _, row, failed_responses, _ in pending_forward],
+                self.engine,
+                [judge_for_group for _, _, _, judge_for_group in pending_forward],
+                self.rng,
+                self.meter,
+                current_update,
+                veto=veto_flag,
+                distance_gate=not self.overrides.no_distance,
+            )
+            self._phase_seconds["forward_repair"] += time.perf_counter() - _t_forward
+            for (key, _, _, judge_for_group), result in zip(pending_forward, results):
+                self._consume_forward_result(key, result, veto_flag, judge_for_group, new_edges)
                 forward_reasons.update(result.reasons)
 
         if self.arm.reverse and len(self.feasible_buffer) > 0:
@@ -741,6 +761,51 @@ class ConPOTrainer(GRPOTrainer):
             self.control.should_training_stop = True
 
         return output
+
+    def _consume_forward_result(
+        self,
+        key: str,
+        result: forward.RepairResult,
+        veto_flag: bool,
+        judge_for_group: object,
+        new_edges: list[Edge],
+    ) -> None:
+        """Route one group's forward.RepairResult into feasible_buffer, the
+        pending veto queue, or new_edges -- exactly what
+        _generate_and_score_completions's per-group loop always did inline,
+        factored out (RUN_REPAIR_BATCH_GENERATION, L2) so both the per-group
+        forward.repair_failed_group call (flag off) and the merged
+        forward.repair_all_groups call (the default) consume their
+        RepairResult identically. `judge_for_group` is the same
+        `_QueueingVetoCollector` this group's repair call was given when
+        `veto_flag` is True (unused, since collector-only, when it is
+        False)."""
+        if veto_flag:
+            # Register a tracker for every trajectory-derived endpoint
+            # BEFORE pushing its edges below (round2 finding 1): a
+            # push can trigger an early flush when pending_queue is
+            # already at pending_queue_max, and that flush must find
+            # the tracker already in place or the edge's verdict
+            # would resolve nothing. An endpoint with no source
+            # edges (repair_trajectory's already-feasible-input
+            # shape) needs no veto and goes straight in.
+            for endpoint, edges in zip(result.feasible_endpoints, result.endpoint_sources):
+                if edges:
+                    self._defer_feasible_endpoint(key, endpoint, edges)
+                else:
+                    self.feasible_buffer.add(key, endpoint)
+            # 1:1, in order: forward.py calls judge.veto() exactly once
+            # per admitted candidate, right before appending it (see
+            # _QueueingVetoCollector's docstring). judge_for_group is a
+            # _QueueingVetoCollector here: veto_flag is only True when the
+            # call site built it as one (see pending_forward's own comment).
+            captured = judge_for_group.captured  # type: ignore[attr-defined]
+            for edge, req in zip(result.edges, captured):
+                self._push_pending(PendingPair(edge=edge, request=req, direction="forward"))
+        else:
+            new_edges.extend(result.edges)
+            for endpoint in result.feasible_endpoints:
+                self.feasible_buffer.add(key, endpoint)
 
     # -----------------------------------------------------------------
     # Batched veto

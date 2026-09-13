@@ -298,6 +298,11 @@ def main() -> None:
     # _install_vllm_reload_guard reads the same env var itself, directly, at
     # guard-install time.
     vllm_push_once_per_step = config.env("RUN_VLLM_PUSH_ONCE_PER_STEP", "1") == "1"
+    # RUN_REPAIR_BATCH_GENERATION (L2, devbox perf pass): same pattern --
+    # read here only to record the effective value in run_metadata below;
+    # conpo/trainer.py's ConPOTrainer.__init__ reads the same env var
+    # itself, directly.
+    repair_batch_generation = config.env("RUN_REPAIR_BATCH_GENERATION", "1") == "1"
     model_name = config.env("RUN_MODEL", config.POLICY_MODEL)
     veto_period_k = int(config.env("RUN_VETO_PERIOD", str(config.VETO_PERIOD_K)))
     # RUN_SAVE_STEPS (design choice, builder, 2026-09-11): overrides
@@ -595,6 +600,11 @@ def main() -> None:
         # run pushed the policy into vLLM once per step (default) instead of
         # before every generate() call.
         "vllm_push_once_per_step": vllm_push_once_per_step,
+        # RUN_REPAIR_BATCH_GENERATION (L2, devbox perf pass): whether this
+        # run merged every failing group's forward-repair engine.generate
+        # calls into one call per repair round for the whole step (default)
+        # instead of one repair_failed_group call per group.
+        "repair_batch_generation": repair_batch_generation,
     }
     (out_dir / "run_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
 

@@ -1,6 +1,8 @@
-"""build_repair_messages, monotone_admit, repair_trajectory and repair_failed_group."""
+"""build_repair_messages, monotone_admit, repair_trajectory, repair_failed_group
+and repair_all_groups."""
 
 import random
+from collections.abc import Callable, Mapping, Sequence
 
 from conpo import config
 from conpo.data import PoolRow, TokenMeter
@@ -10,6 +12,7 @@ from conpo.forward import (
     RepairResult,
     build_repair_messages,
     monotone_admit,
+    repair_all_groups,
     repair_failed_group,
     repair_trajectory,
 )
@@ -366,3 +369,116 @@ def test_repair_failed_group_batches_identically_to_sequential_repair() -> None:
         ["the platform rotates at a constant velocity."] * 3
     )
     assert dict(sequential.reasons) == dict(batched.reasons)
+
+
+# ---------------------------------------------------------------------------
+# repair_all_groups: merges repair_failed_group's own lock-step batch one
+# level up, across every failing group in a step (REPAIR_BATCH_GENERATION)
+# ---------------------------------------------------------------------------
+
+
+class _CountingEngine(FakeEngine):
+    """FakeEngine that also counts engine.generate() INVOCATIONS (not
+    prompts): FakeEngine.calls records one entry per prompt regardless of
+    how many prompts one generate() call batched together, so it cannot by
+    itself show that cross-group merging cut the number of round trips."""
+
+    def __init__(
+        self, responses: Callable[[Sequence[Mapping[str, str]], int], Sequence[str]] | Sequence[str]
+    ) -> None:
+        super().__init__(responses)
+        self.generate_call_count = 0
+
+    def generate(
+        self,
+        messages_batch: Sequence[Sequence[Mapping[str, str]]],
+        n: int,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        seed: int,
+    ) -> list[list[str]]:
+        self.generate_call_count += 1
+        return super().generate(messages_batch, n, max_tokens, temperature, top_p, seed)
+
+
+def test_repair_all_groups_batches_identically_to_per_group_repair_and_merges_calls() -> None:
+    """repair_all_groups pools every failing GROUP's active trajectories
+    into one engine.generate call per repair round, on top of
+    repair_failed_group's own per-response merge within a group (design
+    choice, Ethan devbox perf pass, 2026-09-13). `fixer` is a pure function
+    of message content -- ignorant of call order and the shared per-step
+    seed -- so it stands in for a real engine identically whichever way
+    groups are pooled into calls. This proves the cross-group merge admits
+    exactly the same edges, per group, as calling repair_failed_group once
+    per group (each with its own fresh engine/rng) and keeping the results
+    in group order would, while cutting the number of engine.generate
+    calls to at most max_steps for the WHOLE pool of groups instead of
+    max_steps PER group.
+    """
+
+    def fixer(messages: list[dict[str, str]], n: int) -> list[str]:
+        y_t = messages[1]["content"]
+        if "," in y_t:
+            candidate = y_t.replace(",", "")
+        elif not y_t.islower():
+            candidate = y_t.lower()
+        else:
+            candidate = y_t  # unreachable: an already-feasible response gets no engine call
+        return [candidate] * n
+
+    row_a = _row("group-a")
+    row_b = _row("group-b")
+    responses_a = [
+        Y0,  # fails NO_COMMA and LOWERCASE: 2 repair steps
+        "The platform rotates at a constant velocity.",  # fails only LOWERCASE: 1 step
+    ]
+    responses_b = [
+        "the platform rotates at a constant velocity.",  # already feasible: 0 engine calls
+        Y0,  # fails NO_COMMA and LOWERCASE: 2 repair steps
+    ]
+    groups = [(row_a, responses_a), (row_b, responses_b)]
+
+    reference = [
+        repair_failed_group(
+            row,
+            responses,
+            FakeEngine(fixer),
+            StaticJudge(keep=True),
+            random.Random(0),
+            TokenMeter(budget=0),
+            current_update=7,
+            max_steps=3,
+            max_candidates=2,
+        )
+        for row, responses in groups
+    ]
+
+    engine = _CountingEngine(fixer)
+    batched = repair_all_groups(
+        groups,
+        engine,
+        [StaticJudge(keep=True), StaticJudge(keep=True)],
+        random.Random(0),
+        TokenMeter(budget=0),
+        current_update=7,
+        max_steps=3,
+        max_candidates=2,
+    )
+
+    def edge_key(edges: list) -> list[tuple[str, str, str, list[str], int]]:
+        return sorted((e.prompt_id, e.y_minus, e.y_plus, sorted(e.families), e.step) for e in edges)
+
+    assert len(batched) == len(groups) == 2
+    for ref_result, batched_result in zip(reference, batched):
+        assert edge_key(ref_result.edges) == edge_key(batched_result.edges)
+        assert ref_result.admitted == batched_result.admitted
+        assert ref_result.proposals == batched_result.proposals
+        assert sorted(ref_result.feasible_endpoints) == sorted(batched_result.feasible_endpoints)
+        assert dict(ref_result.reasons) == dict(batched_result.reasons)
+
+    # The whole point: both groups need 2 repair rounds each (Y0 needs a
+    # comma fix then a case fix in every group it appears in), so running
+    # them one at a time costs 2 + 2 = 4 engine.generate calls; pooled here
+    # they share the SAME 2 rounds, so only 2 calls cover the whole step.
+    assert engine.generate_call_count == 2

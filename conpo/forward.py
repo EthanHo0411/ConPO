@@ -247,21 +247,27 @@ def repair_trajectory(
 
 @dataclass
 class _Trajectory:
-    """One response's mutable repair state inside repair_failed_group's
-    lock-step batch: the same y_t/before/edges a repair_trajectory call
-    would carry as locals, kept per-response so every trajectory can advance
-    independently between shared batched engine.generate calls."""
+    """One response's mutable repair state inside the lock-step batch
+    repair_all_groups runs: the same y_t/before/edges a repair_trajectory
+    call would carry as locals, kept per-response so every trajectory can
+    advance independently between shared batched engine.generate calls.
+    `row`/`group_index` say which group's PoolRow this trajectory belongs to
+    and which entry of repair_all_groups' per-group results list its edges
+    route back to; both are fixed for the trajectory's whole life
+    (repair_failed_group's single-group callers set group_index=0 for every
+    trajectory, since there is only one group)."""
 
+    row: PoolRow
+    group_index: int
     y_t: str
     before: tuple[bool, ...]
     edges: list[Edge] = field(default_factory=list)
 
 
-def repair_failed_group(
-    row: PoolRow,
-    responses: Sequence[str],
+def repair_all_groups(
+    groups: Sequence[tuple[PoolRow, Sequence[str]]],
     engine: Engine,
-    judge: Judge,
+    judges: Sequence[Judge],
     rng: random.Random,
     meter: TokenMeter,
     current_update: int,
@@ -269,32 +275,56 @@ def repair_failed_group(
     max_candidates: int = config.MAX_CANDIDATES,
     veto: bool = True,
     distance_gate: bool = True,
-) -> RepairResult:
-    """Run repair on every failed response of one clean group, lock-step
-    across responses (section 2.2).
+) -> list[RepairResult]:
+    """repair_failed_group's lock-step batching, merged one level up across
+    every group in a step (REPAIR_BATCH_GENERATION, Ethan devbox perf pass,
+    2026-09-13): every still-active trajectory from EVERY group in `groups`
+    shares ONE `engine.generate` call per repair round, instead of each
+    group running its own 1-to-max_steps call sequence before the next
+    group starts (conpo/trainer.py's per-group loop otherwise calls
+    repair_failed_group once per failing group, so N such groups cost N
+    independent call sequences; here the whole step costs at most max_steps
+    calls total). `engine.generate`'s own contract returns completions in
+    `messages_batch` order, so merging groups changes only how many round
+    trips a step costs, never which candidates a trajectory sees: each
+    trajectory's own gate checks, veto calls and admitted edges are
+    produced by the same `_admit_candidates` path repair_trajectory and
+    repair_failed_group use, fed that trajectory's own proposals in the
+    same per-step order.
 
-    Design choice (Ethan devbox perf pass, 2026-09-11): at each repair step,
-    every still-active trajectory's proposals are drawn in ONE
-    `engine.generate` call (messages_batch holding one entry per active
-    response) instead of the one-call-per-response-per-step the old
-    per-response loop made -- `engine.generate`'s own contract returns
-    completions in `messages_batch` order, so this changes only how many
-    engine round trips a step costs, never which candidates a response sees:
-    each trajectory's own gate checks, veto calls and admitted edges are
-    produced by the same `_admit_candidates` path repair_trajectory uses,
-    fed that trajectory's own proposals in the same per-step order. A
-    trajectory drops out of the batch the first step it has nothing left to
-    admit or is already fully feasible, exactly when repair_trajectory would
-    have `break` / stopped looping for it.
+    `groups[i]` is one clean group's `(row, failed_responses)`; `judges[i]`
+    is that group's own Judge (or `_QueueingVetoCollector` under the
+    batched veto) -- one per group, never shared, so a group's captured
+    veto requests stay in that group's own call order and line up 1:1 with
+    `results[i].edges` exactly as they would from an independent
+    `repair_failed_group(row, failed_responses, engine, judges[i], ...)`
+    call. Returns one RepairResult per group, in `groups` order.
 
-    tests/test_forward.py's FakeEngine-based equivalence test pins this: a
-    content-keyed FakeEngine (ignores call order and the shared per-step
-    seed) admits identical edges whether responses are repaired one at a
-    time or batched this way.
+    Ordering note: one `rng.randint(...)` seed per round now covers every
+    group's proposals in that round, instead of one seed per round PER
+    GROUP -- so the seed a given group's Nth round proposals are drawn with
+    shifts versus running groups sequentially. This is the same class of
+    caveat repair_failed_group's own docstring already accepted for
+    merging one group's responses into a lock-step batch; it extends
+    unchanged to merging across groups. Per-trajectory admission order is
+    otherwise unchanged: the only externally visible reordering is which
+    group's edges/veto requests are produced first when different groups'
+    trajectories interleave step-major across the whole pool rather than
+    completing group-by-group -- never a group's own edges, or their
+    step-relative order within that group.
+
+    tests/test_forward.py's cross-group equivalence test pins this: a
+    content-keyed FakeEngine (ignorant of call order and the shared
+    per-step seed) admits identical edges whether groups are repaired one
+    at a time (repair_failed_group per group, merged) or pooled here.
     """
-    trajs = [_Trajectory(y_t=r, before=tuple(verifier_vector(row.constraints, r))) for r in responses]
+    results = [RepairResult() for _ in groups]
+    trajs = [
+        _Trajectory(row=row, group_index=group_index, y_t=r, before=tuple(verifier_vector(row.constraints, r)))
+        for group_index, (row, responses) in enumerate(groups)
+        for r in responses
+    ]
     active = [i for i, t in enumerate(trajs) if not all(t.before)]
-    merged = RepairResult()
 
     for step in range(max_steps):
         if not active:
@@ -304,8 +334,8 @@ def repair_failed_group(
         for i in active:
             t = trajs[i]
             failed_idx = [j for j, ok in enumerate(t.before) if not ok]
-            failed = [(row.constraints[j], describe_failure(row.constraints[j], t.y_t)) for j in failed_idx]
-            messages_batch.append(build_repair_messages(row, t.y_t, failed))
+            failed = [(t.row.constraints[j], describe_failure(t.row.constraints[j], t.y_t)) for j in failed_idx]
+            messages_batch.append(build_repair_messages(t.row, t.y_t, failed))
             failed_idx_by_pos.append(failed_idx)
 
         all_proposals = engine.generate(
@@ -320,6 +350,7 @@ def repair_failed_group(
         still_active: list[int] = []
         for pos, i in enumerate(active):
             t = trajs[i]
+            merged = results[t.group_index]
             failed_idx = failed_idx_by_pos[pos]
             proposals = all_proposals[pos]
             merged.proposals += len(proposals)
@@ -328,7 +359,15 @@ def repair_failed_group(
             merged.generated_tokens += n_tokens
 
             admitted_y, admitted_after, admitted_reason, admitted_distance = _admit_candidates(
-                row, t.y_t, t.before, failed_idx, proposals, judge, veto, distance_gate, merged.reasons
+                t.row,
+                t.y_t,
+                t.before,
+                failed_idx,
+                proposals,
+                judges[t.group_index],
+                veto,
+                distance_gate,
+                merged.reasons,
             )
             if admitted_y is None:
                 continue
@@ -336,11 +375,11 @@ def repair_failed_group(
             merged.reasons[admitted_reason] += 1
             merged.admitted += 1
             edge = Edge(
-                prompt_id=row.key,
-                prompt=row.prompt,
+                prompt_id=t.row.key,
+                prompt=t.row.prompt,
                 y_plus=admitted_y,
                 y_minus=t.y_t,
-                families=frozenset(row.constraints[j].iid for j in failed_idx if admitted_after[j]),
+                families=frozenset(t.row.constraints[j].iid for j in failed_idx if admitted_after[j]),
                 direction="forward",
                 step=step,
                 logp_ref_plus=float("nan"),
@@ -360,6 +399,45 @@ def repair_failed_group(
 
     for t in trajs:
         if all(t.before):
+            merged = results[t.group_index]
             merged.feasible_endpoints.append(t.y_t)
             merged.endpoint_sources.append(list(t.edges))
-    return merged
+    return results
+
+
+def repair_failed_group(
+    row: PoolRow,
+    responses: Sequence[str],
+    engine: Engine,
+    judge: Judge,
+    rng: random.Random,
+    meter: TokenMeter,
+    current_update: int,
+    max_steps: int = config.MAX_STEPS,
+    max_candidates: int = config.MAX_CANDIDATES,
+    veto: bool = True,
+    distance_gate: bool = True,
+) -> RepairResult:
+    """Run repair on every failed response of one clean group, lock-step
+    across responses (section 2.2).
+
+    Delegates to repair_all_groups with a single group -- see that
+    function's docstring for the lock-step batching contract this shares
+    (one engine.generate call per repair round instead of one per
+    response). REPAIR_BATCH_GENERATION (conpo/trainer.py) is only about
+    merging MULTIPLE groups' calls together on top of this; this
+    single-group entry point's own behaviour, including exactly which
+    engine.generate calls it makes and in what order, is unchanged.
+    """
+    return repair_all_groups(
+        [(row, responses)],
+        engine,
+        [judge],
+        rng,
+        meter,
+        current_update,
+        max_steps,
+        max_candidates,
+        veto,
+        distance_gate,
+    )[0]
