@@ -339,13 +339,19 @@ class ConPOTrainer(GRPOTrainer):
         # instead of re-running the reference model on every replay. Read
         # once here, same convention as _repair_batch_generation above.
         self._cache_ref_logprobs = config.env("RUN_CACHE_REF_LOGPROBS", "1") == "1"
-        # RUN_KL_CLAMP (K4, default unset): clamps the KL-estimator diff
-        # (ref_per_token_logps - per_token_logps) to +/- this value before
-        # the exp, in the overridden _compute_loss below -- mirrors
-        # open-instruct's own KL clamp (at 40). Read once here, same
-        # convention as _repair_batch_generation/_cache_ref_logprobs above.
-        raw_kl_clamp = config.env("RUN_KL_CLAMP", "")
-        self._kl_clamp: float | None = float(raw_kl_clamp) if raw_kl_clamp else None
+        # RUN_KL_CLAMP (K4; decision 2026-09-14, default config.KL_CLAMP =
+        # 40.0): clamps the KL-estimator diff (ref_per_token_logps -
+        # per_token_logps) to +/- this value before the exp, in the
+        # overridden _compute_loss below -- mirrors open-instruct's own KL
+        # clamp (at 40). "none" (case-insensitive) or an explicitly empty
+        # value disables the clamp (self._kl_clamp = None); a numeric "0" is
+        # a real clamp, not the disable spelling (see config.py's KL_CLAMP
+        # comment). Read once here, same convention as
+        # _repair_batch_generation/_cache_ref_logprobs above.
+        raw_kl_clamp = config.env("RUN_KL_CLAMP", str(config.KL_CLAMP))
+        self._kl_clamp: float | None = (
+            None if raw_kl_clamp.strip().lower() in ("", "none") else float(raw_kl_clamp)
+        )
         # RUN_TOKEN_LOGRATIO_CLAMP (K6, default unset): clamps the per-token
         # policy-minus-reference log-ratio in _score_edge_pairs to +/- this
         # value before it is summed into Delta_theta(e)'s q_plus/q_minus, so
@@ -2188,9 +2194,10 @@ class ConPOTrainer(GRPOTrainer):
     #
     # The only change from TRL's own body is the "Compute the KL divergence"
     # block: the diff (ref_per_token_logps - per_token_logps) is clamped to
-    # +/- self._kl_clamp before the exp when RUN_KL_CLAMP is set (mirrors
-    # open-instruct's own KL clamp, at 40); self._kl_clamp is None
-    # (RUN_KL_CLAMP unset) leaves every line byte-identical to TRL's.
+    # +/- self._kl_clamp before the exp when self._kl_clamp is set (mirrors
+    # open-instruct's own KL clamp, at 40, config.KL_CLAMP's default);
+    # self._kl_clamp is None (RUN_KL_CLAMP="none", the disable spelling)
+    # leaves every line byte-identical to TRL's.
     #
     # PINNED TO trl==1.9.2: a TRL point release that changes _compute_loss
     # silently desyncs this copy. Recheck this method against the installed
@@ -2277,8 +2284,8 @@ class ConPOTrainer(GRPOTrainer):
             ref_per_token_logps = inputs["ref_per_token_logps"]
             diff = ref_per_token_logps - per_token_logps
             # RUN_KL_CLAMP (K4): clamp the diff to +/- self._kl_clamp before
-            # the exp when set; None (unset) is a no-op, keeping this branch
-            # byte-identical to TRL's own unmodified computation.
+            # the exp when set; None (disabled) is a no-op, keeping this
+            # branch byte-identical to TRL's own unmodified computation.
             if self._kl_clamp is not None:
                 diff = diff.clamp(min=-self._kl_clamp, max=self._kl_clamp)
             per_token_kl = torch.exp(diff) - diff - 1

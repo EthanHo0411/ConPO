@@ -1219,11 +1219,16 @@ def _kl_clamp_inputs() -> dict[str, torch.Tensor]:
     }
 
 
-def test_compute_loss_kl_clamp_unset_matches_trl(tmp_path: Path) -> None:
-    """RUN_KL_CLAMP unset -> self._kl_clamp is None -> the clamp branch in
-    ConPOTrainer._compute_loss is a no-op, so its result must be exactly
-    what TRL's own (un-subclassed) _compute_loss returns on the identical
-    trainer instance, model and inputs."""
+def test_compute_loss_kl_clamp_disabled_matches_trl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_KL_CLAMP="none" (the disable spelling, decision 2026-09-14 --
+    unset now defaults to config.KL_CLAMP=40.0, see
+    test_kl_clamp_and_loss_type_defaults below) -> self._kl_clamp is None ->
+    the clamp branch in ConPOTrainer._compute_loss is a no-op, so its result
+    must be exactly what TRL's own (un-subclassed) _compute_loss returns on
+    the identical trainer instance, model and inputs."""
+    monkeypatch.setenv("RUN_KL_CLAMP", "none")
     trainer = _kl_clamp_trainer(tmp_path)
     assert trainer._kl_clamp is None
     inputs = _kl_clamp_inputs()
@@ -1250,6 +1255,18 @@ def test_compute_loss_kl_clamp_zero_collapses_kl_to_zero(
     trainer._compute_loss(trainer.model, inputs)
 
     assert trainer._metrics["train"]["kl"][-1] == 0.0
+
+
+def test_kl_clamp_and_loss_type_defaults(tmp_path: Path) -> None:
+    """Loss-aggregation decision (Ethan, 2026-09-14): config.LOSS_TYPE's and
+    config.KL_CLAMP's defaults are "dapo" and 40.0, and RUN_KL_CLAMP unset
+    reaches the trainer as that same 40.0 (not None -- see
+    test_compute_loss_kl_clamp_disabled_matches_trl above for the explicit
+    "none" disable spelling)."""
+    assert config.LOSS_TYPE == "dapo"
+    assert config.KL_CLAMP == 40.0
+    trainer = _kl_clamp_trainer(tmp_path)
+    assert trainer._kl_clamp == config.KL_CLAMP == 40.0
 
 
 # ---------------------------------------------------------------------------

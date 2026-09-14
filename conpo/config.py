@@ -75,8 +75,13 @@ EFFECTIVE_BATCH = 128
 # GRPO
 # ---------------------------------------------------------------------------
 
-# TRL 1.9.2 defaults to "dapo", so explicit.
-LOSS_TYPE = "grpo"
+# Loss-aggregation decision (Ethan, 2026-09-14): every arm trains with
+# TRL's "dapo" loss aggregation, alongside KL_CLAMP below and
+# RUN_PAIR_SCALE_AUTO (already defaulted on). "grpo" is the
+# pre-2026-09-14 behaviour; reproduce an old run with RUN_LOSS_TYPE=grpo
+# (paired with RUN_KL_CLAMP=none below, since 2026-09-14 also introduced
+# the KL clamp).
+LOSS_TYPE = "dapo"
 # Section 2: standard GRPO clip ratio; not renamed or redefined in this
 # paper, so the conventional 0.2 is kept. DEV_SET.
 EPSILON = 0.2  # DEV_SET
@@ -87,6 +92,20 @@ EPSILON = 0.2  # DEV_SET
 # in the main text (beta is one of the values "selected once on the internal
 # development set", section 4.1). DEV_SET.
 KL_BETA = 0.001  # DEV_SET
+
+# KL-estimator clamp (decision 2026-09-14, alongside the dapo loss-type
+# decision above): conpo/trainer.py's ConPOTrainer._compute_loss clamps
+# the KL estimator's (ref_per_token_logps - per_token_logps) diff to
+# +/- this many nats before the exp, mirroring open-instruct's own KL
+# clamp. RUN_KL_CLAMP overrides config.env's default of this constant;
+# "none" (case-insensitive) or an explicitly empty value disables the
+# clamp (self._kl_clamp = None). A numeric "0" is NOT the disable
+# spelling -- it is a real clamp that collapses the KL estimate to
+# exactly zero (tests/test_trainer_tiny.py::
+# test_compute_loss_kl_clamp_zero_collapses_kl_to_zero), so disabling
+# needs the explicit "none". Reproduce a pre-2026-09-14 run:
+# RUN_KL_CLAMP=none.
+KL_CLAMP = 40.0
 
 # ---------------------------------------------------------------------------
 # Repair operator (section 4.1: "The repair operator proposes at most four

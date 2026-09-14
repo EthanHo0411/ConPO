@@ -376,7 +376,11 @@ def test_main_tiny_run_vllm_is_mode_kl_clamp_resample_and_token_logratio_clamp_r
     train_script.main()
     metadata_default = json.loads((out_dir_default / "run_metadata.json").read_text(encoding="utf-8"))
     assert metadata_default["vllm_is_mode"] is None
-    assert metadata_default["kl_clamp"] is None
+    # Loss-aggregation decision (Ethan, 2026-09-14): RUN_KL_CLAMP unset now
+    # defaults to config.KL_CLAMP (40.0), not None -- see
+    # test_main_tiny_defaults_are_dapo_and_kl_clamp_40_disable_gives_none
+    # below for the "none" disable spelling.
+    assert metadata_default["kl_clamp"] == pytest.approx(config.KL_CLAMP)
     assert metadata_default["resample_zero_std"] is False
     assert metadata_default["resample_max_rounds"] == 3
     assert metadata_default["token_logratio_clamp"] is None
@@ -395,6 +399,51 @@ def test_main_tiny_run_vllm_is_mode_kl_clamp_resample_and_token_logratio_clamp_r
     assert metadata_override["resample_zero_std"] is True
     assert metadata_override["resample_max_rounds"] == 2
     assert metadata_override["token_logratio_clamp"] == pytest.approx(0.5)
+
+
+def test_main_tiny_defaults_are_dapo_and_kl_clamp_40_disable_gives_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loss-aggregation decision (Ethan, 2026-09-14): config.LOSS_TYPE and
+    config.KL_CLAMP default to "dapo" and 40.0, and both RUN_LOSS_TYPE/
+    RUN_KL_CLAMP unset reach run_metadata.json as such. RUN_KL_CLAMP="none"
+    is the explicit disable spelling (a numeric "0" is a real clamp-to-zero,
+    see tests/test_trainer_tiny.py::test_compute_loss_kl_clamp_zero_collapses_kl_to_zero,
+    so it is not reused as the disable value): paired with
+    RUN_LOSS_TYPE=grpo it reproduces the pre-2026-09-14 (no clamp)
+    behaviour, and run_metadata.json must record kl_clamp as None for it.
+    """
+    monkeypatch.setattr(config, "LOSS_TYPE", config.LOSS_TYPE)
+    assert config.LOSS_TYPE == "dapo"
+    assert config.KL_CLAMP == 40.0
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.delenv("RUN_LOSS_TYPE", raising=False)
+    monkeypatch.delenv("RUN_KL_CLAMP", raising=False)
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    out_dir_default = tmp_path / "out_default"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_default))
+    train_script.main()
+    metadata_default = json.loads((out_dir_default / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata_default["loss_type"] == "dapo"
+    assert metadata_default["kl_clamp"] == pytest.approx(40.0)
+
+    out_dir_old = tmp_path / "out_old"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_old))
+    monkeypatch.setenv("RUN_LOSS_TYPE", "grpo")
+    monkeypatch.setenv("RUN_KL_CLAMP", "none")
+    train_script.main()
+    metadata_old = json.loads((out_dir_old / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata_old["loss_type"] == "grpo"
+    assert metadata_old["kl_clamp"] is None
 
 
 def test_main_tiny_run_pair_scale_auto_default_and_override_reach_metadata(
