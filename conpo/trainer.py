@@ -1782,7 +1782,7 @@ class ConPOTrainer(GRPOTrainer):
         above; always pays 2 reference-model forwards per response (4 per
         edge total) regardless of RUN_TOKEN_LOGRATIO_CLAMP, since span_local
         needs per-token reference log-probs unconditionally -- same cost
-        class `_token_clamped_q` already documents, just unconditional here.
+        class `_token_clamped_q` already documents, unconditional here.
         """
         margins, ages, anchors, hits = [], [], [], []
         span_lens_plus, span_lens_minus, empty_flags = [], [], []
