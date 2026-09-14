@@ -16,6 +16,7 @@ import random
 import shutil
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -578,31 +579,17 @@ def main() -> None:
     )
     pass1_callback.trainer = trainer
 
-    trainer.train(resume_from_checkpoint=str(resume_checkpoint_dir) if resume_checkpoint_dir is not None else None)
-    # The fourth flush condition (USER DECISIONS 2026-09-02): end of
-    # training, so nothing sits unscored in trainer.pending_queue when the
-    # run finishes normally (the other three -- period, queue size, and
-    # before a checkpoint save -- run inside ConPOTrainer itself).
-    trainer.flush_pending_veto()
-    # H6 part B: persists RUN_OUT_DIR/pair_stats.json at train end too (a
-    # no-op when RUN_MULTI is off, save_pair_stats's own contract).
-    trainer.save_pair_stats()
-
-    trainer.save_model(str(out_dir / "adapter"))
-    edge_buffer.save(out_dir / "edges.jsonl")
-    (out_dir / "family_stats.json").write_text(json.dumps(stats.snapshot(), indent=2), encoding="utf-8")
-
-    pass1_info: dict[str, object] = {"pass1_step": pass1_callback.pass1_step, "fired": pass1_callback.fired}
-    if not pass1_callback.fired:
-        # Token budget stopped the run before the first full pass: record
-        # how much of it completed instead of the (never-written) pass1.json.
-        pass1_info["fraction_completed"] = min(1.0, trainer.state.global_step / pass1_callback.pass1_step)
-    # RUN_RESUME: cumulative_wall_seconds() adds this process's own elapsed
-    # time (since trainer construction) on top of whatever a prior process's
-    # conpo_state.json recorded, so actual_h100h reflects the whole run
-    # across every resumed process, not only this one.
-    wall_hours = trainer.cumulative_wall_seconds() / 3600
-    run_metadata = {
+    # B4 (audit 2026-09-14): run_metadata.json is now written twice -- once
+    # here, before trainer.train(), with every configured knob and a
+    # "running" status, so a killed run leaves a real artefact behind
+    # instead of none, and a resumed run's stale copy is replaced by a
+    # fresh one for this process; and again after training below, with the
+    # outcome totals (pass1, tokens_generated, actual_h100h) merged in and
+    # status flipped to "finished". run_metadata is mutated in place
+    # between the two writes, so the finished file's schema is unchanged
+    # apart from the started_at/status fields added here.
+    started_at = datetime.now().isoformat()
+    run_metadata: dict[str, object] = {
         "arm": arm_name,
         "seed": seed,
         "model": model_name,
@@ -613,10 +600,7 @@ def main() -> None:
         # TASK G: how many of this run's rows had their prompt left-truncated
         # to config.MAX_PROMPT_TOKENS at load time (cap_pool_rows above).
         "prompt_truncated_rows": prompt_truncated_count,
-        "pass1": pass1_info,
         "token_budget": meter.budget,
-        "tokens_generated": meter.total,
-        "actual_h100h": wall_hours * num_processes,
         # Judge placement/model, veto period, and row cap: without these a
         # finished run's artefacts alone cannot say which judge placement it
         # used, what veto period it ran with, whether RUN_JUDGE_MODEL
@@ -702,8 +686,47 @@ def main() -> None:
         # duplicate. None when this run used HFEngine, which never had the
         # bug (num_return_sequences samples distinctly there already).
         "vllm_repair_sampling": ("unseeded" if use_vllm else None),
+        # B4 (audit 2026-09-14): start-of-run fields, written before
+        # trainer.train() so a killed run still leaves this file behind.
+        "started_at": started_at,
+        "status": "running",
     }
-    (out_dir / "run_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
+    run_metadata_path = out_dir / "run_metadata.json"
+    run_metadata_path.write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
+
+    trainer.train(resume_from_checkpoint=str(resume_checkpoint_dir) if resume_checkpoint_dir is not None else None)
+    # The fourth flush condition (USER DECISIONS 2026-09-02): end of
+    # training, so nothing sits unscored in trainer.pending_queue when the
+    # run finishes normally (the other three -- period, queue size, and
+    # before a checkpoint save -- run inside ConPOTrainer itself).
+    trainer.flush_pending_veto()
+    # H6 part B: persists RUN_OUT_DIR/pair_stats.json at train end too (a
+    # no-op when RUN_MULTI is off, save_pair_stats's own contract).
+    trainer.save_pair_stats()
+
+    trainer.save_model(str(out_dir / "adapter"))
+    edge_buffer.save(out_dir / "edges.jsonl")
+    (out_dir / "family_stats.json").write_text(json.dumps(stats.snapshot(), indent=2), encoding="utf-8")
+
+    pass1_info: dict[str, object] = {"pass1_step": pass1_callback.pass1_step, "fired": pass1_callback.fired}
+    if not pass1_callback.fired:
+        # Token budget stopped the run before the first full pass: record
+        # how much of it completed instead of the (never-written) pass1.json.
+        pass1_info["fraction_completed"] = min(1.0, trainer.state.global_step / pass1_callback.pass1_step)
+    # RUN_RESUME: cumulative_wall_seconds() adds this process's own elapsed
+    # time (since trainer construction) on top of whatever a prior process's
+    # conpo_state.json recorded, so actual_h100h reflects the whole run
+    # across every resumed process, not only this one.
+    wall_hours = trainer.cumulative_wall_seconds() / 3600
+    run_metadata.update(
+        {
+            "pass1": pass1_info,
+            "tokens_generated": meter.total,
+            "actual_h100h": wall_hours * num_processes,
+            "status": "finished",
+        }
+    )
+    run_metadata_path.write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
 
     print(f"done: {steps} step(s), arm={arm_name}, tokens={meter.total}, out_dir={out_dir}")
 

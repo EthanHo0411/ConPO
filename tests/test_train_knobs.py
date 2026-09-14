@@ -177,6 +177,51 @@ def test_main_tiny_writes_shape_knobs_to_run_metadata(
     assert metadata["num_generations"] == 2
     assert metadata["max_completion_tokens"] == 16
     assert metadata["effective_batch"] == config.EFFECTIVE_BATCH
+    # B4 (audit 2026-09-14): status flips to "finished" once main() returns
+    # normally, and started_at is stamped by the pre-train write.
+    assert metadata["status"] == "finished"
+    assert "started_at" in metadata
+
+
+# ---------------------------------------------------------------------------
+# scripts/train.py: run_metadata.json is written before trainer.train() too
+# (B4, audit 2026-09-14), so a run killed mid-train() still leaves a
+# "running" artefact behind instead of none.
+# ---------------------------------------------------------------------------
+
+
+def test_main_tiny_leaves_running_run_metadata_when_train_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    def _raising_train(self: ConPOTrainer, resume_from_checkpoint: str | None = None) -> None:
+        raise RuntimeError("simulated kill mid-train")
+
+    monkeypatch.setattr(ConPOTrainer, "train", _raising_train)
+
+    with pytest.raises(RuntimeError, match="simulated kill mid-train"):
+        train_script.main()
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["status"] == "running"
+    assert "started_at" in metadata
+    # Outcome-only fields never reach the file when train() never returns.
+    assert "tokens_generated" not in metadata
+    assert "pass1" not in metadata
+    assert "actual_h100h" not in metadata
+    # A configured knob, to show the pre-train write is not an empty stub.
+    assert metadata["arm"] == "solve_only"
 
 
 def test_main_tiny_run_tau_and_tau_p_reach_config_and_metadata(
