@@ -134,6 +134,18 @@ class VLLMColocateEngine:
     `trainer` is duck-typed (a `GRPOTrainer`) so importing trl is not forced
     on every caller of this module; only `trainer.state.global_step`,
     `trainer.vllm_generation` and `trainer.processing_class` are used.
+
+    B1 (audit 2026-09-14): `generate()`'s `seed` argument is accepted for
+    interface parity with `HFEngine` but never forwarded to vLLM. TRL's
+    colocate branch (`vllm_generation.py`'s `generate`) builds exactly one
+    `SamplingParams(**generation_kwargs)` for the whole `duplicated` prompt
+    list; a `seed` in there would give every one of the `n` duplicates of a
+    prompt an identically-seeded `torch.Generator`
+    (`vllm/v1/worker/gpu_model_runner.py`'s `RANDOM_SEED` branch), so they
+    would sample byte-identical completions. Repair candidates are therefore
+    no longer reproducible from the run seed alone: they come from vLLM's
+    own generator, seeded once at engine init the same way TRL's own
+    rollouts are.
     """
 
     def __init__(self, trainer: object) -> None:
@@ -178,15 +190,18 @@ class VLLMColocateEngine:
         # trainer's own num_generations duplication has to happen here.
         duplicated = [ids for ids in prompt_ids for _ in range(n)]
 
-        prior = (gen.temperature, gen.top_p, gen.max_completion_length, gen.generation_kwargs)
+        prior = (gen.temperature, gen.top_p, gen.max_completion_length)
         gen.temperature = temperature
         gen.top_p = top_p
         gen.max_completion_length = max_tokens
-        gen.generation_kwargs = {**prior[3], "seed": seed}
+        # `seed` is intentionally NOT written into gen.generation_kwargs here
+        # (B1, audit 2026-09-14): see this class's docstring for why a
+        # per-call seed made every duplicate of a prompt identical.
+        # gen.generation_kwargs itself is left as the trainer configured it.
         try:
             _, completion_ids, _, _ = gen.generate(prompts=duplicated, images=None, num_generations=n)
         finally:
-            gen.temperature, gen.top_p, gen.max_completion_length, gen.generation_kwargs = prior
+            gen.temperature, gen.top_p, gen.max_completion_length = prior
 
         texts = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
         return [[strip_think(t) for t in texts[i * n : (i + 1) * n]] for i in range(len(messages_batch))]

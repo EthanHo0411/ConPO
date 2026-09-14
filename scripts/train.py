@@ -695,6 +695,13 @@ def main() -> None:
         # instead of recomputing them from the reference model on every
         # replay (conpo/trainer.py's _prompt_margins).
         "cache_ref_logprobs": cache_ref_logprobs,
+        # B1 (audit 2026-09-14): VLLMColocateEngine.generate no longer
+        # forwards a per-call seed into vLLM's generation_kwargs (see
+        # conpo/engine.py) -- repair candidates come from vLLM's own
+        # generator instead of an identically-seeded one shared by every
+        # duplicate. None when this run used HFEngine, which never had the
+        # bug (num_return_sequences samples distinctly there already).
+        "vllm_repair_sampling": ("unseeded" if use_vllm else None),
     }
     (out_dir / "run_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
 

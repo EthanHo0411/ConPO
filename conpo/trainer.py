@@ -637,6 +637,11 @@ class ConPOTrainer(GRPOTrainer):
 
         forward_reasons: Counter[str] = Counter()
         reverse_reasons: Counter[str] = Counter()
+        # B1 (audit 2026-09-14): every forward.RepairResult this step's own
+        # candidate_calls/distinct_candidate_calls, summed across every
+        # group -- see forward_distinct_candidate_frac in `record` below.
+        forward_candidate_calls = 0
+        forward_distinct_candidate_calls = 0
         new_edges: list[Edge] = []
         degenerate_groups = 0
         total_groups = 0
@@ -703,6 +708,8 @@ class ConPOTrainer(GRPOTrainer):
                     self._phase_seconds["forward_repair"] += time.perf_counter() - _t_forward
                     self._consume_forward_result(key, result, veto_flag, judge_for_group, new_edges)
                     forward_reasons.update(result.reasons)
+                    forward_candidate_calls += result.candidate_calls
+                    forward_distinct_candidate_calls += result.distinct_candidate_calls
 
         if self._repair_batch_generation and pending_forward:
             # RUN_REPAIR_BATCH_GENERATION (L2): every group collected above
@@ -725,6 +732,8 @@ class ConPOTrainer(GRPOTrainer):
             for (key, _, _, judge_for_group), result in zip(pending_forward, results):
                 self._consume_forward_result(key, result, veto_flag, judge_for_group, new_edges)
                 forward_reasons.update(result.reasons)
+                forward_candidate_calls += result.candidate_calls
+                forward_distinct_candidate_calls += result.distinct_candidate_calls
 
         if self.arm.reverse and len(self.feasible_buffer) > 0:
             veto_flag = not self.overrides.no_veto
@@ -856,6 +865,17 @@ class ConPOTrainer(GRPOTrainer):
                 if self._cumulative_reverse_admitted
                 else 0.0
             ),
+            # B1 (audit 2026-09-14): fraction of this step's forward-repair
+            # engine.generate calls whose max_candidates proposals were
+            # pairwise distinct (a max_candidates=1 call is trivially
+            # distinct). Vacuously 1.0 when the step made no repair calls
+            # (arm.forward off, or every group's responses were already
+            # feasible). Against VLLMColocateEngine this is the regression
+            # test for the seeded-duplicate bug the fix above closes: it
+            # collapsed toward 0.0 whenever max_candidates > 1.
+            "forward_distinct_candidate_frac": (
+                (forward_distinct_candidate_calls / forward_candidate_calls) if forward_candidate_calls else 1.0
+            ),
         }
         # Not a copy, same reasoning as "phase_seconds" above: a same-step
         # flush_pending_veto's _wake_engine() call may still touch the
@@ -875,6 +895,12 @@ class ConPOTrainer(GRPOTrainer):
         # prompt_* diagnostics (prompt_gamma_theta included) and writes the
         # single record for this step.
         self._pending_mechanism_record = record
+        # B1: this method runs exactly once per optimiser step (TRL's own
+        # generation-batch cache, see this method's top), so one append here
+        # already gives TRL's log() a per-step value, not a 16-micro-batch
+        # mean the way compute_loss's own stats loop would.
+        mode = "train" if self.model.training else "eval"
+        self._metrics[mode]["forward_distinct_candidate_frac"].append(record["forward_distinct_candidate_frac"])
 
         # RUN_VLLM_PUSH_ONCE_PER_STEP (L1): run this step's deferred
         # llm.sleep() for real, if one is pending, before any of the three

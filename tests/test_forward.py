@@ -200,6 +200,49 @@ def test_repair_trajectory_already_feasible_response_needs_no_engine_call() -> N
 
 
 # ---------------------------------------------------------------------------
+# repair_trajectory: candidate_calls/distinct_candidate_calls (B1, audit
+# 2026-09-14) -- trainer.py divides these into forward_distinct_candidate_frac
+# ---------------------------------------------------------------------------
+
+
+def test_repair_trajectory_records_candidate_calls_and_distinctness() -> None:
+    """A repair call whose n proposals are all the same text (the seeded-
+    duplicate vLLM bug's symptom) must count as non-distinct; pairwise
+    distinct proposals must count as distinct."""
+    row = _row()
+
+    identical = repair_trajectory(
+        row,
+        Y0,
+        FakeEngine(["same text", "same text"]),
+        StaticJudge(keep=True),
+        random.Random(0),
+        TokenMeter(budget=0),
+        current_update=0,
+        max_steps=1,
+        max_candidates=2,
+    )
+    assert identical.candidate_calls == 1
+    assert identical.distinct_candidate_calls == 0
+    assert identical.distinct_candidate_calls / identical.candidate_calls == 0.0
+
+    distinct = repair_trajectory(
+        row,
+        Y0,
+        FakeEngine([PROPOSAL_1_BREAKS_BANANA, PROPOSAL_1_FIXES_COMMA]),
+        StaticJudge(keep=True),
+        random.Random(0),
+        TokenMeter(budget=0),
+        current_update=0,
+        max_steps=1,
+        max_candidates=2,
+    )
+    assert distinct.candidate_calls == 1
+    assert distinct.distinct_candidate_calls == 1
+    assert distinct.distinct_candidate_calls / distinct.candidate_calls == 1.0
+
+
+# ---------------------------------------------------------------------------
 # repair_trajectory: distance_gate (RUN_NO_DISTANCE) threading, section 2.2
 # ---------------------------------------------------------------------------
 

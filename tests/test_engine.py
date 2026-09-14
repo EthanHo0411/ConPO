@@ -106,12 +106,16 @@ class _RecordingGeneration:
         self.generation_kwargs: dict[str, object] = {}
         self.prompts: list[object] = []
         self.synced = 0
+        # Snapshot of generation_kwargs as generate() saw it, taken before
+        # VLLMColocateEngine's `finally` restores the caller's prior value.
+        self.generation_kwargs_seen: dict[str, object] | None = None
 
     def sync_weights(self) -> None:
         self.synced += 1
 
     def generate(self, prompts, images, num_generations):  # type: ignore[no-untyped-def]
         self.prompts = list(prompts)
+        self.generation_kwargs_seen = dict(self.generation_kwargs)
         return None, [[151644, 872] for _ in prompts], None, None
 
 
@@ -134,3 +138,27 @@ def test_vllm_colocate_engine_hands_vllm_plain_token_id_lists(tokenizer) -> None
     assert gen.synced == 1
     assert (gen.temperature, gen.top_p, gen.max_completion_length, gen.generation_kwargs) == (0.5, 0.9, 16, {})
     assert len(out) == 1 and len(out[0]) == 2
+
+
+def test_vllm_colocate_engine_never_forwards_a_seed_into_generation_kwargs(tokenizer) -> None:
+    """B1 (audit 2026-09-14): TRL's colocate branch builds ONE SamplingParams
+    for the whole duplicated-prompt list, so a per-call seed there would give
+    vLLM's request-level torch.Generator the same seed for every duplicate of
+    a prompt and every duplicate would sample identically. generate() must
+    never write "seed" into gen.generation_kwargs, and must restore whatever
+    generation_kwargs the trainer had configured, untouched, once it returns."""
+    from types import SimpleNamespace
+
+    from conpo.engine import VLLMColocateEngine
+
+    gen = _RecordingGeneration()
+    gen.generation_kwargs = {"top_k": 20}  # a trainer-configured kwarg, unrelated to seed
+    trainer = SimpleNamespace(processing_class=tokenizer, vllm_generation=gen, state=SimpleNamespace(global_step=3))
+    engine = VLLMColocateEngine(trainer)
+
+    engine.generate([[{"role": "user", "content": "hi"}]], n=4, max_tokens=8, temperature=0.1, top_p=1.0, seed=99)
+
+    assert gen.generation_kwargs_seen is not None
+    assert "seed" not in gen.generation_kwargs_seen
+    assert gen.generation_kwargs_seen == {"top_k": 20}
+    assert gen.generation_kwargs == {"top_k": 20}  # restored to the prior value, untouched

@@ -106,6 +106,14 @@ class RepairResult:
     endpoint is only as trustworthy as those edges' real veto verdicts turn
     out to be -- the endpoint's own text was reached under a placeholder
     keep=True from _QueueingVetoCollector, not a real judgment.
+
+    candidate_calls/distinct_candidate_calls (B1, audit 2026-09-14): one
+    engine.generate call produces `max_candidates` proposals for one
+    trajectory at one repair step; candidate_calls counts those calls,
+    distinct_candidate_calls the subset whose proposals were pairwise
+    distinct (a call with max_candidates=1 is trivially distinct). The
+    trainer divides the two into forward_distinct_candidate_frac -- a low
+    value against a vLLM engine means seeded/duplicate sampling regressed.
     """
 
     edges: list[Edge] = field(default_factory=list)
@@ -115,6 +123,8 @@ class RepairResult:
     admitted: int = 0
     generated_tokens: int = 0
     reasons: Counter[str] = field(default_factory=Counter)
+    candidate_calls: int = 0
+    distinct_candidate_calls: int = 0
 
 
 def _admit_candidates(
@@ -207,6 +217,9 @@ def repair_trajectory(
             rng.randint(0, 2**31 - 1),
         )[0]
         result.proposals += len(proposals)
+        result.candidate_calls += 1
+        if len(set(proposals)) == len(proposals):
+            result.distinct_candidate_calls += 1
         n_tokens = engine.count_tokens(proposals)
         meter.add(n_tokens)
         result.generated_tokens += n_tokens
@@ -354,6 +367,9 @@ def repair_all_groups(
             failed_idx = failed_idx_by_pos[pos]
             proposals = all_proposals[pos]
             merged.proposals += len(proposals)
+            merged.candidate_calls += 1
+            if len(set(proposals)) == len(proposals):
+                merged.distinct_candidate_calls += 1
             n_tokens = engine.count_tokens(proposals)
             meter.add(n_tokens)
             merged.generated_tokens += n_tokens
