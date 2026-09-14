@@ -391,6 +391,26 @@ class ConPOTrainer(GRPOTrainer):
         # under the "sequence" objective; read unconditionally anyway, same
         # convention as every other knob above.
         self._pos_anchor_weight = float(config.env("RUN_POS_ANCHOR_WEIGHT", "0"))
+        # RUN_PAIR_SCALE_AUTO (fix devbox 2026-09-14, default on): compute_loss
+        # adds loss_resp/loss_prompt (plain per-micro-batch means) to `total`
+        # AFTER super().compute_loss() has already applied TRL's own
+        # normalisation for loss_type; GRPOTrainer disables Trainer's usual
+        # /gradient_accumulation_steps scaling of the whole returned loss for
+        # every loss_type (it sets compute_loss_func so Trainer skips it,
+        # trl/trainer/grpo_trainer.py), so backward() accumulates
+        # gradient_accumulation_steps copies of that per-micro-batch pair-loss
+        # mean per optimiser step -- inflating PAIR_LOSS_WEIGHT's effective
+        # weight by ~gradient_accumulation_steps versus its intended meaning
+        # (a batch-mean pair loss), independent of loss_type. "1" divides
+        # both pair terms in compute_loss by
+        # self.current_gradient_accumulation_steps (the same attribute TRL's
+        # own _compute_loss divides the clean loss by) so PAIR_LOSS_WEIGHT
+        # means one optimiser step sees PAIR_LOSS_WEIGHT times a batch-mean
+        # pair loss, for grpo and dapo alike. "0" reproduces today's
+        # byte-for-byte behaviour (existing runs' tuned PAIR_LOSS_WEIGHT
+        # already implicitly absorbs the inflation). Read once here, same
+        # convention as _kl_clamp/_token_logratio_clamp above.
+        self._pair_scale_auto = config.env("RUN_PAIR_SCALE_AUTO", "1") == "1"
         # Side channel from _score_edge_pairs_span_local to compute_loss's
         # resp block (RUN_POS_ANCHOR_WEIGHT term): set immediately before
         # use and cleared immediately after, within the same compute_loss
@@ -1994,6 +2014,17 @@ class ConPOTrainer(GRPOTrainer):
         total = config.LAMBDA_G * clean
         current_update = self.state.global_step
         stats: dict[str, float] = {"clean_loss": clean.item()}
+        # RUN_PAIR_SCALE_AUTO (see __init__): current_gradient_accumulation_steps
+        # is set by transformers.Trainer before every training compute_loss
+        # call (Trainer._inner_training_loop); the static config value is only
+        # a fallback for a compute_loss call made outside that loop (e.g. a
+        # unit test constructing ConPOTrainer directly).
+        pair_scale_factor = (
+            1.0 / getattr(self, "current_gradient_accumulation_steps", self.args.gradient_accumulation_steps)
+            if self._pair_scale_auto
+            else 1.0
+        )
+        stats["resp_pair_scale"] = pair_scale_factor
         # Perf-pass instrumentation (Ethan devbox, 2026-09-11): wall time and
         # forward-pass count for this micro-batch's own pair-loss scoring
         # below (_score_edge_pairs, _prompt_margins), one model(...) forward
@@ -2060,7 +2091,7 @@ class ConPOTrainer(GRPOTrainer):
                     loss_resp, resp_stats = losses.resp_loss(
                         delta, ages, tau=config.TAU, gamma=config.GAMMA, kappa=config.KAPPA
                     )
-                total = total + config.PAIR_LOSS_WEIGHT * loss_resp
+                total = total + pair_scale_factor * config.PAIR_LOSS_WEIGHT * loss_resp
                 stats["resp_loss"] = loss_resp.item()
                 stats["resp_mean_age"] = ages.float().mean().item()
                 stats.update({f"resp_{k}": v for k, v in resp_stats.items()})
@@ -2118,7 +2149,7 @@ class ConPOTrainer(GRPOTrainer):
                     clamp=config.MARGIN_CLAMP_MULT * config.KAPPA * config.TAU_P,
                 )
                 if self.overrides.lambda_p > 0:
-                    total = total + config.PAIR_LOSS_WEIGHT * self.overrides.lambda_p * loss_prompt
+                    total = total + pair_scale_factor * config.PAIR_LOSS_WEIGHT * self.overrides.lambda_p * loss_prompt
                 stats["prompt_loss"] = loss_prompt.item()
                 stats.update({f"prompt_{k}": v for k, v in prompt_stats.items()})
 

@@ -300,6 +300,15 @@ def env(name: str, default: str) -> str:
 #   the cache instead of re-running the reference model; "0" reproduces the
 #   old always-recompute behaviour (also the numerical cross-check that
 #   both paths agree, since the reference policy is frozen).
+# RUN_PAIR_SCALE_AUTO: "1" (default) divides the pair terms
+#   (PAIR_LOSS_WEIGHT * loss_resp / loss_prompt) in conpo/trainer.py's
+#   compute_loss by self.current_gradient_accumulation_steps, so
+#   PAIR_LOSS_WEIGHT means one optimiser step sees PAIR_LOSS_WEIGHT times a
+#   batch-mean pair loss regardless of loss_type or gradient_accumulation_steps
+#   (fix devbox 2026-09-14: neither Trainer nor TRL's own loss_type-specific
+#   normalisation ever divides these terms, since GRPOTrainer unconditionally
+#   disables Trainer's automatic /gradient_accumulation_steps scaling); "0"
+#   reproduces today's byte-for-byte behaviour.
 
 # ---------------------------------------------------------------------------
 # Trainer step sizes (section 2.4-2.6: sampled once per optimiser step from

@@ -1269,7 +1269,9 @@ def test_compute_loss_kl_clamp_zero_collapses_kl_to_zero(
 # ---------------------------------------------------------------------------
 
 
-def _pair_loss_weight_trainer(tmp_path: Path) -> ConPOTrainer:
+def _pair_loss_weight_trainer(
+    tmp_path: Path, loss_type: str = "grpo", gradient_accumulation_steps: int = 1
+) -> ConPOTrainer:
     model, tokenizer = _tiny_model_and_tokenizer()
     rows = [ROW_A, ROW_B]
     rows_by_key = {r.key: r for r in rows}
@@ -1282,11 +1284,11 @@ def _pair_loss_weight_trainer(tmp_path: Path) -> ConPOTrainer:
         max_steps=1,
         use_vllm=False,
         beta=config.KL_BETA,
-        loss_type="grpo",
+        loss_type=loss_type,
         learning_rate=1e-3,
         report_to=[],
         logging_steps=1,
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
         seed=0,
         use_cpu=True,
@@ -1330,6 +1332,16 @@ def _pair_loss_weight_trainer(tmp_path: Path) -> ConPOTrainer:
     return trainer
 
 
+def _pair_scale_inputs(loss_type: str) -> dict[str, torch.Tensor]:
+    """_kl_clamp_inputs's GRPO-shaped micro-batch, plus a fixed
+    num_items_in_batch for loss_type in {dapo, cispo, vespo} (_compute_loss's
+    dapo branch requires it; grpo/bnpo/dr_grpo/luspo never read it)."""
+    inputs = _kl_clamp_inputs()
+    if loss_type not in ("grpo", "sapo", "bnpo", "dr_grpo", "luspo"):
+        inputs["num_items_in_batch"] = torch.tensor(24.0)
+    return inputs
+
+
 def test_compute_loss_pair_loss_weight_scales_pair_contribution_not_clean_loss(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1351,6 +1363,179 @@ def test_compute_loss_pair_loss_weight_scales_pair_contribution_not_clean_loss(
     pair_2x = total_2x.item() - stats_2x["clean_loss"] * config.LAMBDA_G
     assert pair_1x != pytest.approx(0.0)
     assert pair_2x == pytest.approx(2 * pair_1x)
+
+
+# ---------------------------------------------------------------------------
+# RUN_PAIR_SCALE_AUTO (fix devbox 2026-09-14): neither Trainer nor TRL's own
+# loss_type-specific normalisation ever divides loss_resp/loss_prompt by
+# gradient_accumulation_steps (GRPOTrainer unconditionally disables
+# Trainer's automatic scaling for every loss_type), so backward()
+# accumulates gradient_accumulation_steps copies of that per-micro-batch
+# pair-loss mean per optimiser step. "1" (default) compensates by dividing
+# both pair terms by self.current_gradient_accumulation_steps.
+# ---------------------------------------------------------------------------
+
+
+def test_resp_pair_scale_stat_matches_grad_accum_and_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """stats["resp_pair_scale"] == 1/gradient_accumulation_steps when the
+    flag is on (default), for both loss types, and == 1.0 (today's
+    behaviour) when the flag is off."""
+    monkeypatch.delenv("RUN_PAIR_SCALE_AUTO", raising=False)
+    for loss_type in ("grpo", "dapo"):
+        trainer = _pair_loss_weight_trainer(tmp_path, loss_type=loss_type, gradient_accumulation_steps=4)
+        trainer.compute_loss(trainer.model, _pair_scale_inputs(loss_type))
+        assert trainer.last_loss_stats["resp_pair_scale"] == pytest.approx(0.25)
+
+    monkeypatch.setenv("RUN_PAIR_SCALE_AUTO", "0")
+    trainer_off = _pair_loss_weight_trainer(tmp_path, loss_type="grpo", gradient_accumulation_steps=4)
+    trainer_off.compute_loss(trainer_off.model, _pair_scale_inputs("grpo"))
+    assert trainer_off.last_loss_stats["resp_pair_scale"] == pytest.approx(1.0)
+
+
+def _pair_scale_grad_trainer(
+    tmp_path: Path, loss_type: str, gradient_accumulation_steps: int, resp_loss_enabled: bool
+) -> ConPOTrainer:
+    """Same shape as _pair_loss_weight_trainer, but _score_edge_pairs is
+    stubbed to a small function of one real LoRA parameter (instead of that
+    fixture's autograd-DISCONNECTED constant tensors) -- needed to inspect
+    .grad directly. A real (unstubbed) forward through the tiny random
+    model on _hand_built_edges was tried first and produced NaN deltas
+    outside trainer.train()'s own setup path (the existing tests that score
+    real edges all go through trainer.train(), never raw compute_loss()
+    calls); this stub keeps the pair term genuinely differentiable and
+    bounded without depending on that setup."""
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A, ROW_B]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type=loss_type,
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    arm = ArmSpec(reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=resp_loss_enabled)
+    edge_buffer = EdgeBuffer()
+    for edge in _hand_built_edges():
+        edge_buffer.push(edge)
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=edge_buffer,
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=Overrides(),
+        peft_config=_lora_config(),
+        probe_enabled=False,
+    )
+
+    def stub_score_edge_pairs(
+        model: torch.nn.Module, edges: list[Edge]
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+        lora_param = next(p for n, p in model.named_parameters() if "lora_A" in n and p.requires_grad)
+        # kappa*tau (config defaults: 5.0*0.1 = 0.5) bounds where the edge
+        # counts as saturated; centering near -2.0 keeps every edge's
+        # weight at 1 (a real gradient path) while lora_param.sum() (a
+        # freshly-initialised LoRA A row, magnitude << 1) can only nudge it
+        # slightly, so delta/weights never leave a well-behaved range.
+        delta = lora_param.sum().expand(len(edges)) - 2.0
+        ages = torch.zeros(len(edges), dtype=torch.long)
+        return delta, ages, {}
+
+    trainer._score_edge_pairs = stub_score_edge_pairs  # type: ignore[method-assign]
+    trainer.current_gradient_accumulation_steps = gradient_accumulation_steps
+    return trainer
+
+
+def _accumulated_pair_grad(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    loss_type: str,
+    gradient_accumulation_steps: int,
+    pair_scale_auto: str,
+) -> torch.Tensor:
+    """One simulated accumulation window (gradient_accumulation_steps
+    compute_loss + backward() calls, no zero_grad/optimizer.step in
+    between -- matching how transformers.Trainer._inner_training_loop
+    itself accumulates), run once with the pair term on and once off, on
+    two independently-constructed but identically-seeded models. Both see
+    an identical L_clean forward and gradient (arm never touches
+    super().compute_loss), so subtracting the two accumulated-gradient
+    tensors isolates exactly loss_resp's own contribution."""
+    monkeypatch.setenv("RUN_PAIR_SCALE_AUTO", pair_scale_auto)
+    inputs = _pair_scale_inputs(loss_type)
+
+    def run(resp_loss_enabled: bool) -> torch.Tensor:
+        trainer = _pair_scale_grad_trainer(
+            tmp_path,
+            loss_type=loss_type,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            resp_loss_enabled=resp_loss_enabled,
+        )
+        for _ in range(gradient_accumulation_steps):
+            total = trainer.compute_loss(trainer.model, inputs)
+            total.backward()
+        name, param = next((n, p) for n, p in trainer.model.named_parameters() if "lora_A" in n and p.requires_grad)
+        assert param.grad is not None, name
+        return param.grad.clone()
+
+    return run(True) - run(False)
+
+
+def test_pair_scale_auto_default_matches_across_grad_accum_and_loss_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_PAIR_SCALE_AUTO=1 (default): the pair term's accumulated gradient
+    contribution over one optimiser step is independent of
+    gradient_accumulation_steps (scale-invariance) and of loss_type (grpo
+    vs dapo), within floating-point tolerance -- the goal's two required
+    properties."""
+    baseline = _accumulated_pair_grad(tmp_path, monkeypatch, "grpo", 1, "1")
+    grpo_accum4 = _accumulated_pair_grad(tmp_path, monkeypatch, "grpo", 4, "1")
+    dapo_accum1 = _accumulated_pair_grad(tmp_path, monkeypatch, "dapo", 1, "1")
+    dapo_accum4 = _accumulated_pair_grad(tmp_path, monkeypatch, "dapo", 4, "1")
+
+    assert baseline.abs().sum().item() > 0.0  # the pair term does contribute a real gradient
+
+    for other in (grpo_accum4, dapo_accum1, dapo_accum4):
+        assert torch.allclose(other, baseline, rtol=1e-3, atol=1e-6)
+
+
+def test_pair_scale_auto_off_reproduces_old_grad_accum_scaled_behaviour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_PAIR_SCALE_AUTO=0: today's byte-for-byte behaviour -- the pair
+    term's accumulated gradient over a gradient_accumulation_steps=4 window
+    is gradient_accumulation_steps times the gradient_accumulation_steps=1
+    case (nothing compensates Trainer's disabled automatic scaling), for
+    both loss types."""
+    for loss_type in ("grpo", "dapo"):
+        accum1 = _accumulated_pair_grad(tmp_path, monkeypatch, loss_type, 1, "0")
+        accum4 = _accumulated_pair_grad(tmp_path, monkeypatch, loss_type, 4, "0")
+        assert torch.allclose(accum4, 4 * accum1, rtol=1e-3, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

@@ -653,6 +653,15 @@ def main() -> None:
         # knobs above.
         "pair_objective": trainer._pair_objective,
         "pos_anchor_weight": trainer._pos_anchor_weight,
+        # RUN_PAIR_SCALE_AUTO (fix devbox 2026-09-14): pair_scale_auto is
+        # read back off the trainer instance (same pattern as above);
+        # pair_scale_factor is the steady-state divisor conpo/trainer.py's
+        # compute_loss applies (1/gradient_accumulation_steps when on, 1.0
+        # when off) -- the per-micro-batch exact value is also on record via
+        # last_loss_stats/the trainer's own metrics logging (stats's
+        # "resp_pair_scale").
+        "pair_scale_auto": trainer._pair_scale_auto,
+        "pair_scale_factor": (1.0 / gradient_accumulation_steps) if trainer._pair_scale_auto else 1.0,
         "row_limit": row_limit or None,
         # RUN_RESUME (devbox 2026-09-11): the checkpoint step this run
         # resumed from, or None for a fresh run.
