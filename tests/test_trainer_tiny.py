@@ -2091,7 +2091,7 @@ def test_pos_anchor_weight_env_override_reaches_trainer_attribute(
 # ---------------------------------------------------------------------------
 
 
-def _resample_trainer(tmp_path: Path, rows_by_key: dict[str, PoolRow]) -> ConPOTrainer:
+def _resample_trainer(tmp_path: Path, rows_by_key: dict[str, PoolRow], loss_type: str = "grpo") -> ConPOTrainer:
     model, tokenizer = _tiny_model_and_tokenizer()
     dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": ROW_A.prompt}], "key": ROW_A.key}])
     grpo_config = GRPOConfig(
@@ -2102,7 +2102,7 @@ def _resample_trainer(tmp_path: Path, rows_by_key: dict[str, PoolRow]) -> ConPOT
         max_steps=1,
         use_vllm=False,
         beta=config.KL_BETA,
-        loss_type="grpo",
+        loss_type=loss_type,
         learning_rate=1e-3,
         report_to=[],
         logging_steps=1,
@@ -2140,14 +2140,26 @@ def _mechanism_records(mechanism_log_path: Path) -> list[dict[str, object]]:
     return [r for r in (json.loads(line) for line in lines if line.strip()) if "event" not in r]
 
 
-def test_resample_zero_std_replaces_degenerate_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("loss_type", ["grpo", "dapo"])
+def test_resample_zero_std_replaces_degenerate_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loss_type: str
+) -> None:
     """The dataset holds only ROW_A, whose rigged reward is constant (zero
     std, degenerate); rows_by_key also carries ROW_B, whose rigged reward
     alternates within any group (nonzero std). RUN_RESAMPLE_ZERO_STD must
     draw ROW_B as ROW_A's only candidate substitute, splice its freshly
     generated group into `output`, and report the swap -- with the
     degenerate_group_rate the existing per-group loop computes afterward
-    improving to 0.0."""
+    improving to 0.0. Parametrised over loss_type (B6, audit 2026-09-14):
+    before this, the fixture only ever built loss_type="grpo" trainers, so
+    the real _splice_group_output -> dapo-normalizer path (4dcda75's K5 x
+    dapo num_items_in_batch fix) never ran end to end -- a crash in that
+    path (e.g. a missing/mis-shaped num_items_in_batch reaching
+    _compute_loss's dapo branch) would have gone undetected here.
+    test_dapo_loss_changes_with_splice_length below asserts the actual
+    loss-value effect deterministically; real generation lengths are not
+    controllable enough to assert that precisely against this rigged,
+    trainer.train()-driven path without risking flakiness."""
 
     def rigged_reward(self: ConPOTrainer, completions: object, key: list[str], **_: object) -> list[float]:
         return [1.0 if k == ROW_A.key else float(i % 2) for i, k in enumerate(key)]
@@ -2155,10 +2167,10 @@ def test_resample_zero_std_replaces_degenerate_group(tmp_path: Path, monkeypatch
     monkeypatch.setattr(ConPOTrainer, "reward_conjunctive", rigged_reward)
     monkeypatch.setenv("RUN_RESAMPLE_ZERO_STD", "1")
 
-    trainer = _resample_trainer(tmp_path, {ROW_A.key: ROW_A, ROW_B.key: ROW_B})
+    trainer = _resample_trainer(tmp_path, {ROW_A.key: ROW_A, ROW_B.key: ROW_B}, loss_type=loss_type)
     assert trainer._resample_zero_std is True
 
-    trainer.train()
+    trainer.train()  # must complete without error under dapo too (exercises the real splice + dapo loss path)
 
     records = _mechanism_records(trainer.mechanism_log_path)
     assert len(records) == 1
@@ -2218,6 +2230,65 @@ def test_splice_group_output_adjusts_num_items_in_batch_by_token_delta(tmp_path:
     trainer._splice_group_output(output, sub_output, start=0, end=2)
 
     assert output["num_items_in_batch"].item() == pytest.approx(11.0)  # 10 + (6 - 5)
+
+
+def test_dapo_loss_changes_with_splice_length(tmp_path: Path) -> None:
+    """B6 (audit 2026-09-14): the K5 x dapo fix (4dcda75) is only worth
+    testing if the num_items_in_batch delta _splice_group_output computes
+    (proved above) actually reaches the loss under loss_type=dapo, where it
+    is the normalizer (_compute_loss, trainer.py ~2536). Driving this
+    through a real trainer.train() (parametrized loss_type above) cannot
+    assert a precise loss-value effect without flakiness: the completion
+    length of a freshly generated replacement group, from an untrained tiny
+    model, is not controllable. So this isolates the mechanism
+    deterministically instead: row 0's advantage is 0 both times, and dapo's
+    per_token_loss = -min(coef_1, coef_2) * advantage is exactly 0 at every
+    position regardless of mask (advantage broadcasts over T), so row 0
+    contributes nothing to the loss numerator no matter how long its
+    spliced-in replacement is; row 1 is untouched by the splice (start=0,
+    end=1) and old_per_token_logps defaults to per_token_logps.detach(), so
+    coef_1 is exactly 1.0 for it regardless of the model's actual output,
+    making its contribution a fixed -1.0 per valid token too. With beta=0
+    (no KL term), the numerator is therefore bit-identical between the two
+    splices below, and only the normalizer (num_items_in_batch, moved by
+    the differing replacement lengths) differs -- so the loss ratio must
+    equal the inverse ratio of the two num_items_in_batch values exactly. A
+    reverted fix (output["num_items_in_batch"] left untouched by the
+    splice) would make num_items_in_batch, and so the loss, identical
+    between the two calls."""
+    trainer = _resample_trainer(tmp_path, {ROW_A.key: ROW_A}, loss_type="dapo")
+    trainer.current_gradient_accumulation_steps = 1  # normally set per-batch by Trainer._inner_training_loop
+    trainer.beta = 0.0  # isolate the normalizer effect from the KL term
+
+    torch.manual_seed(0)
+    base_inputs = {
+        "prompt_ids": torch.randint(0, _KL_TEST_VOCAB_SIZE, (2, 4)),
+        "prompt_mask": torch.ones(2, 4, dtype=torch.long),
+        "completion_ids": torch.randint(0, _KL_TEST_VOCAB_SIZE, (2, 5)),
+        "completion_mask": torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]]),  # row 0: 3 valid (discarded_valid)
+        "advantages": torch.tensor([0.0, 1.0]),
+        "ref_per_token_logps": torch.full((2, 5), -50.0),
+        "num_items_in_batch": torch.tensor(20.0),
+    }
+
+    def spliced_loss(replacement_valid_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        output = {k: v.clone() for k, v in base_inputs.items()}
+        mask_row = [1] * replacement_valid_tokens + [0] * (5 - replacement_valid_tokens)
+        sub_output = {
+            "completion_mask": torch.tensor([mask_row]),
+            "advantages": torch.tensor([0.0]),
+            "num_items_in_batch": torch.tensor(-1.0),  # must be ignored: only output's own copy is updated
+        }
+        trainer._splice_group_output(output, sub_output, start=0, end=1)
+        return trainer._compute_loss(trainer.model, output), output["num_items_in_batch"]
+
+    loss_short, num_items_short = spliced_loss(1)  # 20 + (1 - 3) = 18
+    loss_long, num_items_long = spliced_loss(4)  # 20 + (4 - 3) = 21
+
+    assert num_items_short.item() == pytest.approx(18.0)
+    assert num_items_long.item() == pytest.approx(21.0)
+    assert loss_short.item() != pytest.approx(loss_long.item())
+    assert (loss_short / loss_long).item() == pytest.approx(num_items_long.item() / num_items_short.item())
 
 
 # ---------------------------------------------------------------------------
