@@ -359,7 +359,7 @@ class ConPOTrainer(GRPOTrainer):
         # pair_scoring_forwards are single-micro-batch samples in the
         # mechanism record (unchanged, see sampled_fields below), but the
         # true per-optimiser-step totals need every micro-batch's
-        # contribution, not just the first. Accumulated here across
+        # contribution, not only the first. Accumulated here across
         # compute_loss's calls for one cycle, reset at the top of
         # _generate_and_score_completions (the one call per cycle) once its
         # value has been captured into that new cycle's record as the
@@ -368,7 +368,7 @@ class ConPOTrainer(GRPOTrainer):
         self._resp_evicted_step_accum = 0
         self._pair_scoring_seconds_step_accum = 0.0
         self._pair_scoring_forwards_step_accum = 0
-        # B3 (audit 2026-09-14): realised edge/prompt pairs actually drawn
+        # B3 (audit 2026-09-14): realised edge/prompt pairs drawn
         # this cycle (post edge_buffer.sample/sample_where, so a buffer
         # running dry still counts truthfully), accumulated and surfaced
         # the same way as the three counters above.
@@ -657,7 +657,7 @@ class ConPOTrainer(GRPOTrainer):
         # runs, every compute_loss call of the PREVIOUS cycle has already
         # added its contribution to the three accumulators below -- capture
         # that finished total before resetting for the new cycle. Absent on
-        # the very first call of the run (nothing preceded it).
+        # the first call of the run (nothing preceded it).
         previous_step_totals: dict[str, object] | None = None
         if self._step_totals_initialized:
             previous_step_totals = {

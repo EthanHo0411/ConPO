@@ -609,7 +609,7 @@ def test_mechanism_record_carries_previous_step_pair_totals(tmp_path: Path, monk
     assert "previous_step_totals" not in records[0]
 
     # Step 1 (records[1]): step 0's totals, from BOTH of its compute_loss
-    # calls, not just the first.
+    # calls, not only the first.
     prev = records[1]["previous_step_totals"]
     assert prev["step"] == 0
     assert prev["resp_evicted_step"] == sum(evicted_calls[:2])
@@ -973,7 +973,7 @@ def test_forward_feasible_endpoints_reach_feasible_buffer(
     # test_batched_veto_forward_endpoint_withheld_until_its_edges_are_kept in
     # tests/test_batched_veto_trainer.py for the withheld-until-kept case.
     # RUN_REPAIR_BATCH_GENERATION (L2) picks which forward.py function
-    # _generate_and_score_completions' per-group loop actually reaches:
+    # _generate_and_score_completions' per-group loop reaches:
     # repair_all_groups (default, "1") or the old per-group
     # repair_failed_group ("0") -- patch whichever one this run's flag
     # setting will call, both returning one RepairResult per group.
@@ -2235,7 +2235,7 @@ def test_splice_group_output_adjusts_num_items_in_batch_by_token_delta(tmp_path:
 def test_dapo_loss_changes_with_splice_length(tmp_path: Path) -> None:
     """B6 (audit 2026-09-14): the K5 x dapo fix (4dcda75) is only worth
     testing if the num_items_in_batch delta _splice_group_output computes
-    (proved above) actually reaches the loss under loss_type=dapo, where it
+    (proved above) reaches the loss under loss_type=dapo, where it
     is the normalizer (_compute_loss, trainer.py ~2536). Driving this
     through a real trainer.train() (parametrized loss_type above) cannot
     assert a precise loss-value effect without flakiness: the completion

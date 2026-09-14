@@ -1087,7 +1087,7 @@ def test_main_tiny_done_message_reports_completed_steps_not_max_steps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """B5 (vii, audit 2026-09-14): the final "done: N step(s)" message must
-    report trainer.state.global_step (steps actually run), not the RUN_STEPS
+    report trainer.state.global_step (steps run), not the RUN_STEPS
     budget -- RUN_STOP_AT_STEP (same fixture as the halt test above) stops
     the run at step 2 while RUN_STEPS asks for 4, so the old `steps`
     (max_steps) value in the message overstated how far training got."""

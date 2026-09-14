@@ -732,7 +732,7 @@ def main() -> None:
     )
     run_metadata_path.write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
 
-    # B5 (vii, audit 2026-09-14): trainer.state.global_step (steps actually
+    # B5 (vii, audit 2026-09-14): trainer.state.global_step (steps
     # run), not `steps` (the RUN_STEPS budget) -- RUN_STOP_AT_STEP or a
     # resumed/token-budget-exhausted run can stop short of `steps`.
     print(f"done: {trainer.state.global_step} step(s), arm={arm_name}, tokens={meter.total}, out_dir={out_dir}")
