@@ -6,6 +6,8 @@ functions only; the trainer owns model calls, buffering, and active
 selection.
 """
 
+from collections.abc import Sequence
+
 import torch
 import torch.nn.functional as F
 
@@ -146,6 +148,98 @@ def resp_loss(
         "frac_retired": (~saturated).float().mean().item(),
         "mean_weight": weights.mean().item(),
     }
+    return loss, stats
+
+
+def diff_span(ids_a: Sequence[int], ids_b: Sequence[int]) -> tuple[tuple[int, int], tuple[int, int]]:
+    """The differing span between two token-id sequences (RUN_PAIR_OBJECTIVE
+    span_local): the maximal common prefix and common suffix bound a span
+    on each side that needs no edit metadata to find. Returns
+    `((start_a, end_a), (start_b, end_b))`; identical sequences give both
+    spans empty (`start == end`), a pure insertion or deletion gives one
+    side empty, and two sequences with nothing in common give the whole of
+    each.
+    """
+    n = min(len(ids_a), len(ids_b))
+    prefix = 0
+    while prefix < n and ids_a[prefix] == ids_b[prefix]:
+        prefix += 1
+    max_suffix = n - prefix
+    suffix = 0
+    while suffix < max_suffix and ids_a[len(ids_a) - 1 - suffix] == ids_b[len(ids_b) - 1 - suffix]:
+        suffix += 1
+    return (prefix, len(ids_a) - suffix), (prefix, len(ids_b) - suffix)
+
+
+def clamp_span_logratio(diff: torch.Tensor, clamp: float | None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Elementwise-clamp one side's span-token log-ratios to +/-`clamp`
+    (RUN_TOKEN_LOGRATIO_CLAMP, reused here), returning the clamped tensor
+    itself (not a sum -- `span_local_margin_and_anchor` below means it,
+    unlike `clamp_token_logratio`'s whole-sequence sum) alongside a
+    same-shape boolean of which entries the raw value exceeded. `clamp=None`
+    passes `diff` through unchanged with an all-False hits tensor.
+    """
+    if clamp is None:
+        return diff, torch.zeros_like(diff, dtype=torch.bool)
+    hits = diff.detach().abs() > clamp
+    return diff.clamp(min=-clamp, max=clamp), hits
+
+
+def _safe_mean(x: torch.Tensor) -> torch.Tensor:
+    """`x.mean()`, or a 0.0 scalar (not NaN) when `x` is empty."""
+    return x.mean() if x.numel() else x.new_zeros(())
+
+
+def span_local_margin_and_anchor(
+    r_plus_span: torch.Tensor,
+    r_minus_span: torch.Tensor,
+    clamp: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One edge's span-local margin and positive-anchor term
+    (RUN_PAIR_OBJECTIVE=span_local): `r_plus_span`/`r_minus_span` are the
+    per-token policy-minus-reference log-ratios over each side's differing
+    span only (`diff_span`) -- shared tokens never reach this function, so
+    they carry no gradient at all. The margin is
+    `mean(r_plus_span) - mean(r_minus_span)`, each clamped first
+    (`clamp_span_logratio`); an empty span contributes exactly 0 to its
+    side (`_safe_mean`), so a pair with both spans empty has margin 0. The
+    anchor is `mean(max(0, -r_t))` over the clamped y_plus span only (the
+    DPO-Positive penalty for a repaired token whose policy log-prob falls
+    below the reference's).
+
+    Returns `(margin, anchor, hits)`, `hits` the two sides' clamp-hit
+    booleans concatenated (y_plus first) for the caller to pool across
+    edges into `resp_token_clamp_frac`.
+    """
+    r_plus_c, hits_plus = clamp_span_logratio(r_plus_span, clamp)
+    r_minus_c, hits_minus = clamp_span_logratio(r_minus_span, clamp)
+    margin = _safe_mean(r_plus_c) - _safe_mean(r_minus_c)
+    anchor = _safe_mean(torch.clamp(-r_plus_c, min=0.0))
+    return margin, anchor, torch.cat([hits_plus, hits_minus])
+
+
+def span_local_resp_loss(
+    m: torch.Tensor,
+    ages: torch.LongTensor,
+    anchor_terms: torch.Tensor,
+    tau: float = config.TAU,
+    gamma: float = config.GAMMA,
+    kappa: float = config.KAPPA,
+    pos_anchor_weight: float = 0.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """L_resp under RUN_PAIR_OBJECTIVE=span_local: `resp_loss` unchanged
+    (its retirement rule only ever saw a generic margin tensor, so it
+    applies to `m` exactly as it does to the sequence-level Delta_theta),
+    plus `pos_anchor_weight * mean(anchor_terms)` (RUN_POS_ANCHOR_WEIGHT,
+    0 = off). `stats["pos_anchor"]` is always recorded, even when the
+    weight is 0, mirroring how `prompt_stats["gamma_theta"]` is logged
+    regardless of `overrides.lambda_p` (conpo/trainer.py's compute_loss).
+    """
+    loss, stats = resp_loss(m, ages, tau=tau, gamma=gamma, kappa=kappa)
+    anchor_mean = _safe_mean(anchor_terms)
+    if pos_anchor_weight:
+        loss = loss + pos_anchor_weight * anchor_mean
+    stats["pos_anchor"] = anchor_mean.item()
     return loss, stats
 
 

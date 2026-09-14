@@ -13,7 +13,18 @@ import torch.nn.functional as F
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from conpo import config
-from conpo.losses import clamp_token_logratio, completion_lengths, prompt_loss, q_theta, resp_loss, sequence_logprobs
+from conpo.losses import (
+    clamp_span_logratio,
+    clamp_token_logratio,
+    completion_lengths,
+    diff_span,
+    prompt_loss,
+    q_theta,
+    resp_loss,
+    sequence_logprobs,
+    span_local_margin_and_anchor,
+    span_local_resp_loss,
+)
 
 
 def _tiny_model() -> Qwen3ForCausalLM:
@@ -189,3 +200,204 @@ def test_clamp_token_logratio_clamps_and_reports_hits() -> None:
 
     assert torch.allclose(clamped_sum, torch.tensor(0.5 - 1.0))
     assert hits.tolist() == [False, True]  # 1 of 2 tokens clamped
+
+
+# --- (h) K8 span_local: diff_span (common-prefix/suffix span finder) -----------
+
+
+def test_diff_span_identical_sequences_gives_both_spans_empty() -> None:
+    a, b = [1, 2, 3, 4], [1, 2, 3, 4]
+    span_a, span_b = diff_span(a, b)
+    assert span_a == (4, 4)
+    assert span_b == (4, 4)
+
+
+def test_diff_span_pure_insertion_gives_one_side_empty() -> None:
+    a, b = [1, 2, 4], [1, 2, 3, 4]  # b inserts a 3 before the trailing 4
+    span_a, span_b = diff_span(a, b)
+    assert span_a == (2, 2)  # nothing missing from a's own tokens
+    assert span_b == (2, 3)  # the inserted token
+    assert b[span_b[0] : span_b[1]] == [3]
+
+
+def test_diff_span_pure_deletion_gives_one_side_empty() -> None:
+    a, b = [1, 2, 3, 4], [1, 2, 4]  # mirror of the insertion case
+    span_a, span_b = diff_span(a, b)
+    assert span_a == (2, 3)
+    assert a[span_a[0] : span_a[1]] == [3]
+    assert span_b == (2, 2)
+
+
+def test_diff_span_single_token_substitution_in_the_middle() -> None:
+    a, b = [1, 2, 3, 4], [1, 2, 9, 4]
+    span_a, span_b = diff_span(a, b)
+    assert a[span_a[0] : span_a[1]] == [3]
+    assert b[span_b[0] : span_b[1]] == [9]
+
+
+def test_diff_span_disjoint_sequences_spans_the_whole_of_each() -> None:
+    a, b = [1, 2, 3], [4, 5, 6]
+    span_a, span_b = diff_span(a, b)
+    assert span_a == (0, 3)
+    assert span_b == (0, 3)
+
+
+def test_diff_span_common_prefix_only() -> None:
+    a, b = [1, 2, 3, 4], [1, 2, 8, 9]
+    span_a, span_b = diff_span(a, b)
+    assert a[span_a[0] : span_a[1]] == [3, 4]
+    assert b[span_b[0] : span_b[1]] == [8, 9]
+
+
+def test_diff_span_common_suffix_only() -> None:
+    a, b = [1, 2, 3, 4], [8, 9, 3, 4]
+    span_a, span_b = diff_span(a, b)
+    assert a[span_a[0] : span_a[1]] == [1, 2]
+    assert b[span_b[0] : span_b[1]] == [8, 9]
+
+
+def test_diff_span_degenerate_empty_sequences() -> None:
+    assert diff_span([], []) == ((0, 0), (0, 0))
+    span_a, span_b = diff_span([], [1, 2, 3])
+    assert span_a == (0, 0)
+    assert span_b == (0, 3)
+
+
+# --- (i) K8 span_local: clamp_span_logratio (elementwise, not a reduction) -----
+
+
+def test_clamp_span_logratio_clamps_elementwise_and_reports_hits() -> None:
+    diff = torch.tensor([0.5, -3.0, 2.0])
+    clamped, hits = clamp_span_logratio(diff, clamp=1.0)
+
+    assert torch.allclose(clamped, torch.tensor([0.5, -1.0, 1.0]))
+    assert hits.tolist() == [False, True, True]
+
+
+def test_clamp_span_logratio_none_clamp_is_a_passthrough() -> None:
+    diff = torch.tensor([0.5, -30.0])
+    clamped, hits = clamp_span_logratio(diff, clamp=None)
+
+    assert torch.equal(clamped, diff)
+    assert hits.tolist() == [False, False]
+
+
+def test_clamp_span_logratio_empty_tensor() -> None:
+    diff = torch.empty(0)
+    clamped, hits = clamp_span_logratio(diff, clamp=1.0)
+    assert clamped.numel() == 0
+    assert hits.numel() == 0
+
+
+# --- (j) K8 span_local: span_local_margin_and_anchor ---------------------------
+
+
+def test_span_local_margin_matches_mean_difference_of_clamped_spans() -> None:
+    r_plus = torch.tensor([0.2, 0.4, 0.6])
+    r_minus = torch.tensor([-0.1, 0.3])
+    margin, anchor, hits = span_local_margin_and_anchor(r_plus, r_minus, clamp=None)
+
+    assert margin == pytest.approx(r_plus.mean().item() - r_minus.mean().item())
+    assert hits.numel() == 5  # pooled across both sides
+
+
+def test_span_local_margin_empty_span_on_one_side_contributes_zero() -> None:
+    r_plus = torch.empty(0)
+    r_minus = torch.tensor([-0.5, 0.5])
+    margin, anchor, hits = span_local_margin_and_anchor(r_plus, r_minus, clamp=None)
+
+    assert margin == pytest.approx(0.0 - r_minus.mean().item())
+    assert anchor == pytest.approx(0.0)  # anchor only looks at the (empty) y_plus span
+
+
+def test_span_local_margin_both_spans_empty_is_exactly_zero() -> None:
+    margin, anchor, hits = span_local_margin_and_anchor(torch.empty(0), torch.empty(0), clamp=None)
+    assert margin.item() == 0.0
+    assert anchor.item() == 0.0
+    assert hits.numel() == 0
+
+
+def test_span_local_anchor_only_penalises_negative_span_tokens() -> None:
+    r_plus = torch.tensor([0.3, -0.2, -0.5, 0.1])  # two tokens below the reference
+    _, anchor, _ = span_local_margin_and_anchor(r_plus, torch.tensor([0.0]), clamp=None)
+
+    expected = torch.clamp(-r_plus, min=0.0).mean()
+    assert anchor == pytest.approx(expected.item())
+    assert anchor.item() > 0.0
+
+
+def test_span_local_margin_and_anchor_report_clamp_hits() -> None:
+    r_plus = torch.tensor([5.0, 0.1])  # entry 0 exceeds the clamp
+    r_minus = torch.tensor([-5.0])  # exceeds the clamp
+    _, _, hits = span_local_margin_and_anchor(r_plus, r_minus, clamp=1.0)
+    assert hits.tolist() == [True, False, True]
+
+
+def test_span_local_gradient_touches_only_the_differing_span() -> None:
+    """Shared tokens (outside the diff_span slice) get exactly zero gradient
+    -- not merely a diluted one -- because they never enter the computation
+    graph the margin is built from."""
+    ids_plus = [1, 2, 3, 4, 5]
+    ids_minus = [1, 2, 9, 4, 5]
+    (sp_start, sp_end), (sm_start, sm_end) = diff_span(ids_plus, ids_minus)
+
+    r_plus_full = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5], requires_grad=True)
+    r_minus_full = torch.tensor([0.1, 0.2, -0.9, 0.4, 0.5], requires_grad=True)
+    margin, anchor, _ = span_local_margin_and_anchor(
+        r_plus_full[sp_start:sp_end], r_minus_full[sm_start:sm_end], clamp=None
+    )
+    (margin + anchor).backward()
+
+    in_span_plus = torch.zeros_like(r_plus_full, dtype=torch.bool)
+    in_span_plus[sp_start:sp_end] = True
+    in_span_minus = torch.zeros_like(r_minus_full, dtype=torch.bool)
+    in_span_minus[sm_start:sm_end] = True
+
+    assert torch.all(r_plus_full.grad[~in_span_plus] == 0.0)
+    assert torch.all(r_minus_full.grad[~in_span_minus] == 0.0)
+    assert torch.any(r_plus_full.grad[in_span_plus] != 0.0)
+    assert torch.any(r_minus_full.grad[in_span_minus] != 0.0)
+
+
+# --- (k) K8 span_local: span_local_resp_loss ------------------------------------
+
+
+def test_span_local_resp_loss_matches_resp_loss_when_anchor_weight_is_zero() -> None:
+    m = torch.tensor([0.05, -0.02, 0.2])
+    ages = torch.tensor([0, 1, 2])
+    anchor_terms = torch.tensor([0.3, 0.1, 0.0])
+
+    plain_loss, plain_stats = resp_loss(m, ages)
+    span_loss, span_stats = span_local_resp_loss(m, ages, anchor_terms, pos_anchor_weight=0.0)
+
+    assert torch.allclose(span_loss, plain_loss)
+    for key in plain_stats:
+        assert span_stats[key] == pytest.approx(plain_stats[key])
+    assert span_stats["pos_anchor"] == pytest.approx(anchor_terms.mean().item())
+
+
+def test_span_local_resp_loss_adds_weighted_anchor_mean() -> None:
+    m = torch.tensor([0.05, -0.02, 0.2])
+    ages = torch.tensor([0, 1, 2])
+    anchor_terms = torch.tensor([0.3, 0.1, 0.0])
+
+    plain_loss, _ = resp_loss(m, ages)
+    weighted_loss, stats = span_local_resp_loss(m, ages, anchor_terms, pos_anchor_weight=2.0)
+
+    assert torch.allclose(weighted_loss, plain_loss + 2.0 * anchor_terms.mean())
+    assert stats["pos_anchor"] == pytest.approx(anchor_terms.mean().item())
+
+
+def test_span_local_resp_loss_retirement_matches_resp_loss_on_same_delta_ages() -> None:
+    tau, kappa, gamma = config.TAU, config.KAPPA, config.GAMMA
+    m = torch.tensor([kappa * tau + 0.05, kappa * tau - 0.05])
+    ages = torch.tensor([2, 3])
+    anchor_terms = torch.zeros(2)
+
+    plain_loss, plain_stats = resp_loss(m, ages, tau=tau, kappa=kappa, gamma=gamma)
+    span_loss, span_stats = span_local_resp_loss(
+        m, ages, anchor_terms, tau=tau, kappa=kappa, gamma=gamma, pos_anchor_weight=0.0
+    )
+
+    assert torch.allclose(span_loss, plain_loss)
+    assert span_stats["frac_retired"] == plain_stats["frac_retired"] == 0.5

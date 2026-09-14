@@ -368,6 +368,36 @@ class ConPOTrainer(GRPOTrainer):
         # above.
         self._resample_zero_std = config.env("RUN_RESAMPLE_ZERO_STD", "0") == "1"
         self._resample_max_rounds = int(config.env("RUN_RESAMPLE_MAX_ROUNDS", "3"))
+        # RUN_PAIR_OBJECTIVE (K8, default "sequence"): "sequence" keeps
+        # _score_edge_pairs's existing whole-sequence margin (cached-scalar,
+        # or K6-clamped) byte for byte; "span_local" replaces Delta_theta(e)
+        # with a margin over ONLY the tokens where y_plus and y_minus differ
+        # (conpo/losses.py's diff_span), so the tokens the pair shares carry
+        # no gradient at all instead of diluting/cancelling it -- the fix
+        # for the likelihood-displacement diagnosis (devbox 2026-09-13).
+        # Validated eagerly, same convention as arms.py's resolve_arm, so a
+        # typo fails at construction rather than silently training as
+        # "sequence". Read once here, same convention as
+        # _kl_clamp/_token_logratio_clamp above.
+        raw_pair_objective = config.env("RUN_PAIR_OBJECTIVE", "sequence")
+        if raw_pair_objective not in ("sequence", "span_local"):
+            raise ValueError(
+                f"Unknown RUN_PAIR_OBJECTIVE: {raw_pair_objective!r}, expected 'sequence' or 'span_local'"
+            )
+        self._pair_objective = raw_pair_objective
+        # RUN_POS_ANCHOR_WEIGHT (K8, default 0 = off): weight on span_local's
+        # positive-anchor term (DPO-Positive: penalise a repaired token
+        # whose policy log-prob falls below the reference's). Meaningless
+        # under the "sequence" objective; read unconditionally anyway, same
+        # convention as every other knob above.
+        self._pos_anchor_weight = float(config.env("RUN_POS_ANCHOR_WEIGHT", "0"))
+        # Side channel from _score_edge_pairs_span_local to compute_loss's
+        # resp block (RUN_POS_ANCHOR_WEIGHT term): set immediately before
+        # use and cleared immediately after, within the same compute_loss
+        # call, so it never leaks across micro-batches or into the T_c
+        # probe's own _score_edge_pairs call. Mirrors
+        # self._pending_mechanism_record's existing across-call handoff.
+        self._pending_span_anchor: torch.Tensor | None = None
 
         # Wall-clock accumulation across RUN_RESUME processes (scripts/train.py):
         # the node-local disk is wiped roughly every 48 hours, so one logical
@@ -1604,6 +1634,8 @@ class ConPOTrainer(GRPOTrainer):
         batched scoring if per-step throughput on the real GPU run measures
         as a bottleneck.
         """
+        if self._pair_objective == "span_local":
+            return self._score_edge_pairs_span_local(model, edges)
         if self._token_logratio_clamp is not None:
             return self._score_edge_pairs_clamped(model, edges, self._token_logratio_clamp)
 
@@ -1689,6 +1721,96 @@ class ConPOTrainer(GRPOTrainer):
         length = losses.completion_lengths(completion_mask)
         q = losses.q_theta_from_logratio(clamped_sum.unsqueeze(0), length)[0]
         return q, hits
+
+    def _response_logratios(
+        self, model: torch.nn.Module, prompt_text: str, response: str
+    ) -> tuple[torch.Tensor, list[int]]:
+        """One response's per-token policy-minus-reference log-ratio, plus
+        its own token ids in the same left-to-right order (RUN_PAIR_OBJECTIVE
+        span_local, K8): `losses.diff_span` slices both consistently since
+        they come from masking the identical axis of the identical
+        tokenized ids. Same tokenize-once/policy-and-reference-forward-twice
+        shape as `_token_clamped_q` above -- span_local always needs the
+        reference model's PER-TOKEN log-probs (not the cached sequence-level
+        scalar on the edge), so this always pays that method's documented
+        doubled reference-forward cost, unconditionally whenever span_local
+        is the active objective (not only when RUN_TOKEN_LOGRATIO_CLAMP is
+        also set).
+
+        ponytail: one response at a time, same shape as _token_clamped_q and
+        _score_edge_pairs' own "one edge at a time" note; share a
+        tokenize+forward helper across all three if a fourth caller needs
+        this shape.
+        """
+        input_ids, attention_mask, completion_mask = _tokenize_prompt_response(
+            self.processing_class, prompt_text, response
+        )
+        device = next(model.parameters()).device
+        input_ids, attention_mask, completion_mask = (
+            input_ids.to(device),
+            attention_mask.to(device),
+            completion_mask.to(device),
+        )
+        _, policy_tok = losses.sequence_logprobs_with_tokens(model, input_ids, attention_mask, completion_mask)
+        with self._reference_model(model) as ref_model:
+            _, ref_tok = losses.sequence_logprobs_with_tokens(ref_model, input_ids, attention_mask, completion_mask)
+        mask = completion_mask[:, 1:].bool()
+        diff = (policy_tok - ref_tok)[mask]
+        response_ids = input_ids[0][completion_mask[0].bool()].tolist()
+        return diff, response_ids
+
+    def _score_edge_pairs_span_local(
+        self, model: torch.nn.Module, edges: Sequence[Edge]
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+        """_score_edge_pairs under RUN_PAIR_OBJECTIVE=span_local (K8): per
+        edge, the margin is the span-normalised mean over ONLY the tokens
+        where y_plus and y_minus differ (`losses.diff_span`), instead of the
+        whole-sequence length-normalised sum every other path uses -- the
+        tokens a near-identical counterfactual pair shares carry no
+        gradient at all rather than a diluted or cancelling one (yesterday's
+        likelihood-displacement diagnosis). RUN_TOKEN_LOGRATIO_CLAMP is
+        reused as the span-token clamp when set.
+
+        Sets `self._pending_span_anchor` as a side channel to compute_loss's
+        resp block (RUN_POS_ANCHOR_WEIGHT term) instead of returning it,
+        mirroring `self._pending_mechanism_record`'s existing across-call
+        handoff in this class: every `_score_edge_pairs*` branch and both of
+        its callers (`compute_loss`, `_run_probe`) keep relying on the same
+        3-tuple contract.
+
+        ponytail: one edge at a time, same as the sequence/clamped paths
+        above; always pays 2 reference-model forwards per response (4 per
+        edge total) regardless of RUN_TOKEN_LOGRATIO_CLAMP, since span_local
+        needs per-token reference log-probs unconditionally -- same cost
+        class `_token_clamped_q` already documents, just unconditional here.
+        """
+        margins, ages, anchors, hits = [], [], [], []
+        span_lens_plus, span_lens_minus, empty_flags = [], [], []
+        for edge in edges:
+            diff_plus, ids_plus = self._response_logratios(model, edge.prompt, edge.y_plus)
+            diff_minus, ids_minus = self._response_logratios(model, edge.prompt, edge.y_minus)
+            (start_plus, end_plus), (start_minus, end_minus) = losses.diff_span(ids_plus, ids_minus)
+            margin, anchor, span_hits = losses.span_local_margin_and_anchor(
+                diff_plus[start_plus:end_plus], diff_minus[start_minus:end_minus], self._token_logratio_clamp
+            )
+            margins.append(margin)
+            anchors.append(anchor)
+            hits.append(span_hits)
+            span_lens_plus.append(end_plus - start_plus)
+            span_lens_minus.append(end_minus - start_minus)
+            empty_flags.append(end_plus == start_plus and end_minus == start_minus)
+            ages.append(self.edge_buffer.age(edge, self.state.global_step))
+        device = margins[0].device
+        ages_t = torch.tensor(ages, dtype=torch.long, device=device)
+        self._pending_span_anchor = torch.stack(anchors)
+        all_hits = torch.cat(hits)
+        resp_stats = {
+            "token_clamp_frac": all_hits.float().mean().item() if all_hits.numel() else 0.0,
+            "span_len_plus_mean": sum(span_lens_plus) / len(span_lens_plus),
+            "span_len_minus_mean": sum(span_lens_minus) / len(span_lens_minus),
+            "empty_span_frac": sum(empty_flags) / len(empty_flags),
+        }
+        return torch.stack(margins), ages_t, resp_stats
 
     def _prompt_margins(self, model: torch.nn.Module, edges: Sequence[Edge]) -> tuple[torch.Tensor, torch.Tensor]:
         """m_plus = m_theta(x^+A), m_minus = m_theta(x^-A) (ConPO.pdf section 2.5).
@@ -1917,11 +2039,27 @@ class ConPOTrainer(GRPOTrainer):
                 pair_scoring_seconds += time.perf_counter() - _t_score
                 # score_response(y_plus), score_response(y_minus); doubled by
                 # RUN_TOKEN_LOGRATIO_CLAMP's fresh per-edge reference forward
-                # (_score_edge_pairs_clamped), which the cached path above skips.
-                pair_scoring_forwards += (4 if self._token_logratio_clamp is not None else 2) * len(resp_edges)
-                loss_resp, resp_stats = losses.resp_loss(
-                    delta, ages, tau=config.TAU, gamma=config.GAMMA, kappa=config.KAPPA
-                )
+                # (_score_edge_pairs_clamped) or by RUN_PAIR_OBJECTIVE=span_local
+                # (_score_edge_pairs_span_local, K8), which the cached path
+                # above skips and which span_local pays unconditionally.
+                pair_scoring_forwards += (
+                    4 if self._token_logratio_clamp is not None or self._pair_objective == "span_local" else 2
+                ) * len(resp_edges)
+                if self._pair_objective == "span_local":
+                    loss_resp, resp_stats = losses.span_local_resp_loss(
+                        delta,
+                        ages,
+                        self._pending_span_anchor,
+                        tau=config.TAU,
+                        gamma=config.GAMMA,
+                        kappa=config.KAPPA,
+                        pos_anchor_weight=self._pos_anchor_weight,
+                    )
+                    self._pending_span_anchor = None
+                else:
+                    loss_resp, resp_stats = losses.resp_loss(
+                        delta, ages, tau=config.TAU, gamma=config.GAMMA, kappa=config.KAPPA
+                    )
                 total = total + config.PAIR_LOSS_WEIGHT * loss_resp
                 stats["resp_loss"] = loss_resp.item()
                 stats["resp_mean_age"] = ages.float().mean().item()

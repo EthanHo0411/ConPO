@@ -397,6 +397,42 @@ def test_main_tiny_run_vllm_is_mode_kl_clamp_resample_and_token_logratio_clamp_r
     assert metadata_override["token_logratio_clamp"] == pytest.approx(0.5)
 
 
+def test_main_tiny_run_pair_objective_and_pos_anchor_weight_reach_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_PAIR_OBJECTIVE / RUN_POS_ANCHOR_WEIGHT (K8, devbox 2026-09-14):
+    same "read back off the constructed trainer instance" pattern as
+    kl_clamp/token_logratio_clamp above, since main() never binds their raw
+    env values to a local variable."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    out_dir_default = tmp_path / "out_default"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_default))
+    monkeypatch.delenv("RUN_PAIR_OBJECTIVE", raising=False)
+    monkeypatch.delenv("RUN_POS_ANCHOR_WEIGHT", raising=False)
+    train_script.main()
+    metadata_default = json.loads((out_dir_default / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata_default["pair_objective"] == "sequence"
+    assert metadata_default["pos_anchor_weight"] == pytest.approx(0.0)
+
+    out_dir_override = tmp_path / "out_override"
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir_override))
+    monkeypatch.setenv("RUN_PAIR_OBJECTIVE", "span_local")
+    monkeypatch.setenv("RUN_POS_ANCHOR_WEIGHT", "0.3")
+    train_script.main()
+    metadata_override = json.loads((out_dir_override / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata_override["pair_objective"] == "span_local"
+    assert metadata_override["pos_anchor_weight"] == pytest.approx(0.3)
+
+
 def test_main_tiny_raises_when_run_limit_below_prompts_per_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

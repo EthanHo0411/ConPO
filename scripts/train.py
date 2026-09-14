@@ -648,6 +648,11 @@ def main() -> None:
         "resample_zero_std": trainer._resample_zero_std,
         "resample_max_rounds": trainer._resample_max_rounds,
         "token_logratio_clamp": trainer._token_logratio_clamp,
+        # RUN_PAIR_OBJECTIVE / RUN_POS_ANCHOR_WEIGHT (K8, devbox 2026-09-14):
+        # same "read back off the trainer instance" pattern as the four
+        # knobs above.
+        "pair_objective": trainer._pair_objective,
+        "pos_anchor_weight": trainer._pos_anchor_weight,
         "row_limit": row_limit or None,
         # RUN_RESUME (devbox 2026-09-11): the checkpoint step this run
         # resumed from, or None for a fresh run.

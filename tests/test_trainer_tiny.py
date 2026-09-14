@@ -1447,6 +1447,98 @@ def test_score_edge_pairs_token_clamp_reports_frac_in_unit_interval(
 
 
 # ---------------------------------------------------------------------------
+# K8 RUN_PAIR_OBJECTIVE / RUN_POS_ANCHOR_WEIGHT (devbox 2026-09-14):
+# _score_edge_pairs's span_local branch (_score_edge_pairs_span_local /
+# _response_logratios) replaces Delta_theta(e) with a margin over only the
+# tokens where y_plus and y_minus differ (conpo/losses.py's diff_span),
+# instead of the whole-sequence sum every other path uses. Reuses
+# _token_logratio_clamp_trainer (same hand-built-edges / resp_loss-only
+# isolation idiom above) since span_local is just another _score_edge_pairs
+# branch selected by env, at construction time.
+# ---------------------------------------------------------------------------
+
+
+def test_pair_objective_invalid_value_raises_at_construction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUN_PAIR_OBJECTIVE", "bogus")
+    with pytest.raises(ValueError, match="RUN_PAIR_OBJECTIVE"):
+        _token_logratio_clamp_trainer(tmp_path)
+
+
+def test_pair_objective_unset_defaults_to_sequence_and_is_byte_identical(tmp_path: Path) -> None:
+    """RUN_PAIR_OBJECTIVE unset -> self._pair_objective == "sequence" ->
+    _score_edge_pairs takes the exact pre-span_local branch. Forcing the
+    same trainer's _pair_objective to the explicit string "sequence" and
+    re-scoring the identical edges against the identical (untouched, since
+    neither call takes a training step) model weights gives an identical
+    delta, proving "unset" and "sequence" are indistinguishable to the
+    dispatcher -- i.e. this change left the default path byte for byte.
+    logp_ref_plus/minus are NaN on these hand-built edges (by design, see
+    _hand_built_edges), so the comparison needs equal_nan.
+    """
+    trainer = _token_logratio_clamp_trainer(tmp_path)
+    assert trainer._pair_objective == "sequence"
+    edges = _hand_built_edges()
+
+    with torch.no_grad():
+        delta_unset, _, stats_unset = trainer._score_edge_pairs(trainer.model, edges)
+        trainer._pair_objective = "sequence"
+        delta_explicit, _, stats_explicit = trainer._score_edge_pairs(trainer.model, edges)
+
+    assert torch.allclose(delta_unset, delta_explicit, equal_nan=True)
+    assert stats_unset == stats_explicit == {}
+
+
+def test_pair_objective_span_local_reports_new_stats_in_sane_ranges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_PAIR_OBJECTIVE=span_local -> _score_edge_pairs_span_local runs
+    (fresh per-token policy/reference forwards, diff_span-sliced margin),
+    and every new stat lands in trainer.last_loss_stats via the SAME
+    generic resp_-prefixing compute_loss already applies to
+    token_clamp_stats/resp_stats -- no new plumbing needed for this."""
+    monkeypatch.delenv("RUN_POS_ANCHOR_WEIGHT", raising=False)
+    monkeypatch.setenv("RUN_PAIR_OBJECTIVE", "span_local")
+    trainer = _token_logratio_clamp_trainer(tmp_path)
+    assert trainer._pair_objective == "span_local"
+    assert trainer._pos_anchor_weight == 0.0
+
+    trainer.train()
+    stats = trainer.last_loss_stats
+
+    assert stats["resp_span_len_plus_mean"] >= 0.0
+    assert stats["resp_span_len_minus_mean"] >= 0.0
+    assert 0.0 <= stats["resp_empty_span_frac"] <= 1.0
+    assert 0.0 <= stats["resp_token_clamp_frac"] <= 1.0
+    assert stats["resp_pos_anchor"] >= 0.0  # mean of max(0, -r_t): never negative
+
+
+def test_pair_objective_span_local_combined_with_token_logratio_clamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """span_local reuses RUN_TOKEN_LOGRATIO_CLAMP as its own span-token
+    clamp (not a second, separate knob): setting both together still
+    reports a valid fraction."""
+    monkeypatch.setenv("RUN_PAIR_OBJECTIVE", "span_local")
+    monkeypatch.setenv("RUN_TOKEN_LOGRATIO_CLAMP", "0.1")
+    trainer = _token_logratio_clamp_trainer(tmp_path)
+    assert trainer._pair_objective == "span_local"
+    assert trainer._token_logratio_clamp == 0.1
+
+    trainer.train()
+
+    frac = trainer.last_loss_stats["resp_token_clamp_frac"]
+    assert 0.0 <= frac <= 1.0
+
+
+def test_pos_anchor_weight_env_override_reaches_trainer_attribute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUN_POS_ANCHOR_WEIGHT", "0.3")
+    trainer = _token_logratio_clamp_trainer(tmp_path)
+    assert trainer._pos_anchor_weight == pytest.approx(0.3)
+
+
+# ---------------------------------------------------------------------------
 # K5 RUN_RESAMPLE_ZERO_STD (devbox 2026-09-13): a degenerate (zero-reward-std)
 # prompt group is replaced with a freshly drawn, freshly generated substitute
 # from rows_by_key, up to RUN_RESAMPLE_MAX_ROUNDS extra rounds. Both tests
