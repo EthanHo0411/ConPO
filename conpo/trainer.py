@@ -417,6 +417,11 @@ class ConPOTrainer(GRPOTrainer):
         # value before it is summed into Delta_theta(e)'s q_plus/q_minus, so
         # no single token can carry more than this many nats of margin. Read
         # once here, same convention as _kl_clamp above.
+        # B5 (viii, audit 2026-09-14): acts on L_resp only (_score_edge_pairs
+        # feeds resp_loss). L_prompt's m_theta margins (_prompt_margins,
+        # losses.prompt_loss) are untouched and stay whole-sequence
+        # regardless of this flag -- L_prompt's own on/off switch is
+        # overrides.lambda_p / RUN_LAMBDA_P, unrelated to this one.
         raw_token_logratio_clamp = config.env("RUN_TOKEN_LOGRATIO_CLAMP", "")
         self._token_logratio_clamp: float | None = (
             float(raw_token_logratio_clamp) if raw_token_logratio_clamp else None
@@ -445,6 +450,11 @@ class ConPOTrainer(GRPOTrainer):
         # typo fails at construction rather than silently training as
         # "sequence". Read once here, same convention as
         # _kl_clamp/_token_logratio_clamp above.
+        # B5 (viii, audit 2026-09-14): like RUN_TOKEN_LOGRATIO_CLAMP above,
+        # span_local only ever replaces _score_edge_pairs's L_resp margin;
+        # L_prompt (overrides.lambda_p / RUN_LAMBDA_P) always stays the
+        # whole-sequence m_theta margin from _prompt_margins, unaffected by
+        # this flag.
         raw_pair_objective = config.env("RUN_PAIR_OBJECTIVE", "sequence")
         if raw_pair_objective not in ("sequence", "span_local"):
             raise ValueError(
@@ -702,6 +712,13 @@ class ConPOTrainer(GRPOTrainer):
         # runs only on the first micro-batch of an accumulation
         # cycle, so phase timing must start from that same call.
         self._phase_seconds = {
+            # B5 (i, audit 2026-09-14): times the whole
+            # super()._generate_and_score_completions() call above, not
+            # rollout sampling alone -- TRL's own GRPOTrainer also runs its
+            # reward function(s) and the two no-grad log-prob passes (old
+            # policy, reference) inside that same call. Field name kept as
+            # "trl_generation" (mechanism.jsonl / trainer metrics reader
+            # contract); this is a documentation-only note.
             "trl_generation": time.perf_counter() - t0,
             "forward_repair": 0.0,
             "reverse_corruption": 0.0,
@@ -1213,6 +1230,15 @@ class ConPOTrainer(GRPOTrainer):
         for _generate_and_score_completions's own phase_seconds["veto_burst"]
         tally (Ethan devbox perf pass, 2026-09-11).
         """
+        # B5 (iii, audit 2026-09-14): _generate_and_score_completions's own
+        # call site for this already flushes any deferred vLLM sleep before
+        # its three triggers (periodic, _save_checkpoint, end of training),
+        # but _push_pending's queue-overflow trigger above can call this
+        # method mid-step, before that call site is reached -- flushing here
+        # too makes every trigger safe regardless of call order, not only
+        # the three that go through _generate_and_score_completions. No-op
+        # when nothing is pending (_flush_deferred_vllm_sleep's own guard).
+        self._flush_deferred_vllm_sleep()
         self._steps_since_flush = 0
         pending_size_before = len(self.pending_queue)
         if pending_size_before == 0:
@@ -2199,6 +2225,12 @@ class ConPOTrainer(GRPOTrainer):
                 # forever after, since delta only grows as training proceeds,
                 # so it wastes a sample() draw and a score_edge_pairs forward
                 # every future step until age_cap retires it. Drop it now.
+                # B5 (ix, audit 2026-09-14): ConPO.pdf's Lemma 7 only states
+                # that w(e) retires to 0 once Delta_theta(e) > kappa*tau;
+                # physically discarding the edge from edge_buffer here
+                # (rather than leaving it at weight 0 until age_cap) is this
+                # implementation's own decision, not something the paper
+                # specifies.
                 saturated_edges = [
                     edge
                     for edge, margin in zip(resp_edges, delta.detach().tolist())

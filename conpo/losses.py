@@ -128,9 +128,12 @@ def resp_loss(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """L_resp (section 2.4) over a minibatch of N admitted edges.
 
-    w(e) = gamma^age(e) * 1[Delta_theta(e) <= kappa * tau]; the saturation
-    indicator reads delta.detach() so a retired edge carries exactly zero
-    gradient rather than a discontinuous one at the kappa*tau boundary.
+    w(e) = gamma^age(e) * 1[Delta_theta(e) <= kappa * tau]; the active-edge
+    indicator (True below the kappa*tau retirement bar; B5 (v, audit
+    2026-09-14): renamed from the misleading `saturated`, which was True for
+    edges that are NOT saturated) reads delta.detach() so a retired edge
+    carries exactly zero gradient rather than a discontinuous one at the
+    kappa*tau boundary.
 
     The mean below normalises by the full minibatch size N (matching the
     paper's E_{e~B}[...] over the buffer), so retired edges (w = 0) shrink
@@ -140,12 +143,12 @@ def resp_loss(
     at the cost of the loss no longer reflecting how much of the batch is
     still active. Not used here.
     """
-    saturated = delta.detach() <= (kappa * tau)
-    weights = (gamma ** ages.to(delta.dtype)) * saturated.to(delta.dtype)
+    active = delta.detach() <= (kappa * tau)
+    weights = (gamma ** ages.to(delta.dtype)) * active.to(delta.dtype)
     loss = -(weights * F.logsigmoid(delta / tau)).mean()
     stats = {
         "mean_margin": delta.mean().item(),
-        "frac_retired": (~saturated).float().mean().item(),
+        "frac_retired": (~active).float().mean().item(),
         "mean_weight": weights.mean().item(),
     }
     return loss, stats

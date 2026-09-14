@@ -162,3 +162,53 @@ def test_vllm_colocate_engine_never_forwards_a_seed_into_generation_kwargs(token
     assert "seed" not in gen.generation_kwargs_seen
     assert gen.generation_kwargs_seen == {"top_k": 20}
     assert gen.generation_kwargs == {"top_k": 20}  # restored to the prior value, untouched
+
+
+def test_vllm_colocate_engine_skips_second_sync_when_trainer_already_synced_this_step(tokenizer) -> None:
+    """B5 (ii, audit 2026-09-14): under RUN_VLLM_PUSH_ONCE_PER_STEP, the
+    trainer's own reload guard already pushes+syncs weights once per step
+    (trainer._vllm_synced_this_step); _sync_if_stale must not sync_weights()
+    again for a same-step generate() call (e.g. forward-repair, which runs
+    after TRL's own rollout in the same step) -- that would push unchanged
+    weights a second time for nothing."""
+    from types import SimpleNamespace
+
+    from conpo.engine import VLLMColocateEngine
+
+    gen = _RecordingGeneration()
+    trainer = SimpleNamespace(
+        processing_class=tokenizer,
+        vllm_generation=gen,
+        state=SimpleNamespace(global_step=3),
+        _vllm_push_once=True,
+        _vllm_synced_this_step=True,
+    )
+    engine = VLLMColocateEngine(trainer)
+
+    engine.generate([[{"role": "user", "content": "hi"}]], n=2, max_tokens=8, temperature=0.1, top_p=1.0, seed=7)
+
+    assert gen.synced == 0
+
+
+def test_vllm_colocate_engine_still_syncs_when_push_once_off_or_trainer_not_yet_synced(tokenizer) -> None:
+    """The skip in _sync_if_stale must be scoped to the push-once-and-already-
+    synced case only: push_once off (per-call reload, old behaviour) and
+    push_once on but not yet synced this step both still sync_weights()."""
+    from types import SimpleNamespace
+
+    from conpo.engine import VLLMColocateEngine
+
+    for push_once, synced_this_step in [(False, True), (True, False), (False, False)]:
+        gen = _RecordingGeneration()
+        trainer = SimpleNamespace(
+            processing_class=tokenizer,
+            vllm_generation=gen,
+            state=SimpleNamespace(global_step=3),
+            _vllm_push_once=push_once,
+            _vllm_synced_this_step=synced_this_step,
+        )
+        engine = VLLMColocateEngine(trainer)
+
+        engine.generate([[{"role": "user", "content": "hi"}]], n=2, max_tokens=8, temperature=0.1, top_p=1.0, seed=7)
+
+        assert gen.synced == 1, (push_once, synced_this_step)

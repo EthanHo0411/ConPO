@@ -344,10 +344,14 @@ def main() -> None:
     stop_at_step = int(stop_at_step_raw) if stop_at_step_raw else None
     # RUN_TAU / RUN_TAU_P: same override pattern as RUN_VETO_PERIOD /
     # RUN_SAVE_STEPS above, but for config.TAU / config.TAU_P directly --
-    # conpo/trainer.py's compute_loss and conpo/losses.py's resp_loss /
-    # prompt_loss defaults both read these two module attributes fresh at
-    # call time (no importer binds them earlier), so assigning here before
-    # ConPOTrainer is constructed is enough to take effect for the whole run.
+    # conpo/trainer.py's compute_loss passes tau=config.TAU/tau_p=config.TAU_P
+    # explicitly on every losses.resp_loss/prompt_loss call, reading the
+    # module attribute fresh at that call site. B5 (iv, audit 2026-09-14):
+    # losses.py's own tau/tau_p default parameter values are irrelevant here
+    # -- Python binds a default argument once, at function-definition
+    # (import) time, not at call time, and every caller always overrides
+    # them explicitly. So assigning here before ConPOTrainer is constructed
+    # is enough to take effect for the whole run.
     tau = float(config.env("RUN_TAU", str(config.TAU)))
     tau_p = float(config.env("RUN_TAU_P", str(config.TAU_P)))
     config.TAU = tau
@@ -728,7 +732,10 @@ def main() -> None:
     )
     run_metadata_path.write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
 
-    print(f"done: {steps} step(s), arm={arm_name}, tokens={meter.total}, out_dir={out_dir}")
+    # B5 (vii, audit 2026-09-14): trainer.state.global_step (steps actually
+    # run), not `steps` (the RUN_STEPS budget) -- RUN_STOP_AT_STEP or a
+    # resumed/token-budget-exhausted run can stop short of `steps`.
+    print(f"done: {trainer.state.global_step} step(s), arm={arm_name}, tokens={meter.total}, out_dir={out_dir}")
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ export env only and never retype a value `scripts/train.py` can read from
 | `RUN_SEED` | integer | `scripts/train.py`, default `0` there (`local/train.sh` defaults it to `42`) |
 | `RUN_STEPS` | integer, optimiser-step budget | `scripts/train.py`, default `1` there (`local/train.sh` defaults it to `500`) |
 | `RUN_TOKEN_BUDGET` | integer, generated-token budget, `0` = no cap | `conpo/data.py:TokenMeter` |
-| `RUN_USE_VLLM` | `1` sample through vLLM, `0` HF generate | `scripts/train.py`, default `0` there (`local/train.sh` defaults it to `1`, overridable) |
+| `RUN_USE_VLLM` | `1` sample through vLLM, `0` HF generate | `scripts/train.py`, default `0` there (`local/train.sh` defaults it to `1`, overridable). B1 (audit 2026-09-14): forward-repair candidates sampled through the colocated vLLM engine (`conpo/engine.py:VLLMColocateEngine`) no longer carry a per-call seed, so they are reproducible only from vLLM's own run-level generator, not from `RUN_SEED` alone; recorded as `run_metadata.json`'s `vllm_repair_sampling` (`"unseeded"` when set, `null` under HF generate). |
 | `RUN_JUDGE_ENDPOINT` | base URL, used verbatim | `conpo/judge.py:resolve_endpoint` (`RUN_JUDGE_MODE=http` only) |
 | `RUN_JUDGE_MODE` | `batched` (default, `config.JUDGE_MODE_DEFAULT`) \| `http` | `scripts/train.py:build_judge`, also written to `run_metadata.json` |
 | `RUN_JUDGE_MODEL` | model name, default `config.JUDGE_MODEL` | `scripts/train.py:build_judge`, also written to `run_metadata.json` |

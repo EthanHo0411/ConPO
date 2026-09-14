@@ -1081,3 +1081,31 @@ def test_main_tiny_run_stop_at_step_halts_training_and_records_metadata(
     assert not (out_dir_stop / "checkpoint-4").exists()
     metadata_stop = json.loads((out_dir_stop / "run_metadata.json").read_text(encoding="utf-8"))
     assert metadata_stop["stop_at_step"] == 2
+
+
+def test_main_tiny_done_message_reports_completed_steps_not_max_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B5 (vii, audit 2026-09-14): the final "done: N step(s)" message must
+    report trainer.state.global_step (steps actually run), not the RUN_STEPS
+    budget -- RUN_STOP_AT_STEP (same fixture as the halt test above) stops
+    the run at step 2 while RUN_STEPS asks for 4, so the old `steps`
+    (max_steps) value in the message overstated how far training got."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "4")
+    monkeypatch.setenv("RUN_STOP_AT_STEP", "2")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    out = capsys.readouterr().out
+    assert "done: 2 step(s)" in out
+    assert "done: 4 step(s)" not in out

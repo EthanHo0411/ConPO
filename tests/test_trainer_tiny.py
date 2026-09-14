@@ -1417,6 +1417,66 @@ def test_flush_deferred_vllm_sleep_runs_before_periodic_veto_flush(
     assert all(item == "flush_pending_veto" for item in call_order[1:])
 
 
+def test_flush_pending_veto_flushes_deferred_sleep_at_its_own_top(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B5 (iii, audit 2026-09-14): flush_pending_veto must flush any deferred
+    vLLM sleep itself, not rely on _generate_and_score_completions's own call
+    site -- the queue-overflow trigger (_push_pending, above) can call
+    flush_pending_veto mid-step, before that call site is reached, and would
+    otherwise run the judge next to a still-awake engine. Calling
+    flush_pending_veto directly (queue empty, no train() needed) isolates
+    the method's own behaviour from its caller."""
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=8,
+        max_steps=1,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    arm, overrides = resolve_arm("solve_only")
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=EdgeBuffer(),
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=tmp_path / "mechanism.jsonl",
+        seed=0,
+        overrides=overrides,
+        peft_config=_lora_config(),
+    )
+    assert len(trainer.pending_queue) == 0  # the no-op early-return path below
+
+    calls: list[str] = []
+    monkeypatch.setattr(trainer, "_flush_deferred_vllm_sleep", lambda: calls.append("flush"))
+
+    trainer.flush_pending_veto()
+
+    assert calls == ["flush"]
+
+
 # ---------------------------------------------------------------------------
 # K4 RUN_KL_CLAMP (devbox 2026-09-13): ConPOTrainer._compute_loss is a full
 # copy of TRL 1.9.2's own GRPOTrainer._compute_loss (no overridable KL hook

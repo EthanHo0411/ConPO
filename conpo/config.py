@@ -156,7 +156,9 @@ KAPPA = 5.0  # DEV_SET
 
 # Multiplier on kappa * tau_p for prompt_loss's margin clamp (conpo/losses.py):
 # bounds m_plus/m_minus to +/- MARGIN_CLAMP_MULT * kappa * tau_p, mirroring
-# L_resp's kappa*tau saturation point one octave out.
+# L_resp's kappa*tau saturation point one octave out. B5 (ix, audit
+# 2026-09-14): this clamp itself is not in ConPO.pdf's section 2.5
+# definition of L_prompt -- an implementation addition, not a paper term.
 MARGIN_CLAMP_MULT = 2.0
 
 # lambda_0 (section 2.5): coefficient on the indifference penalty

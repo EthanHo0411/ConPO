@@ -133,7 +133,10 @@ class VLLMColocateEngine:
 
     `trainer` is duck-typed (a `GRPOTrainer`) so importing trl is not forced
     on every caller of this module; only `trainer.state.global_step`,
-    `trainer.vllm_generation` and `trainer.processing_class` are used.
+    `trainer.vllm_generation` and `trainer.processing_class` are used, plus
+    (B5 ii, audit 2026-09-14, read via `getattr` with a `False` default so a
+    bare fake trainer still works) `trainer._vllm_push_once` and
+    `trainer._vllm_synced_this_step` in `_sync_if_stale` below.
 
     B1 (audit 2026-09-14): `generate()`'s `seed` argument is accepted for
     interface parity with `HFEngine` but never forwarded to vLLM. TRL's
@@ -154,9 +157,22 @@ class VLLMColocateEngine:
 
     def _sync_if_stale(self) -> None:
         step = self.trainer.state.global_step  # type: ignore[attr-defined]
-        if step != self._last_synced_step:
-            self.trainer.vllm_generation.sync_weights()  # type: ignore[attr-defined]
-            self._last_synced_step = step
+        if step == self._last_synced_step:
+            return
+        self._last_synced_step = step
+        # B5 (ii, audit 2026-09-14): under RUN_VLLM_PUSH_ONCE_PER_STEP the
+        # trainer's own reload guard (_install_vllm_reload_guard) already
+        # pushed and synced this step's weights the first time TRL's own
+        # rollout generation ran `collective_rpc("reload_weights", ...)`
+        # (`self.trainer._vllm_synced_this_step`) -- pushing again here for
+        # the forward-repair/reverse-corruption generate() calls that follow
+        # later in the same step would resync unchanged weights a second
+        # time. `getattr` defaults: a bare fake trainer (tests/test_engine.py)
+        # carries neither attribute and still gets the old always-sync
+        # behaviour.
+        if getattr(self.trainer, "_vllm_push_once", False) and getattr(self.trainer, "_vllm_synced_this_step", False):
+            return
+        self.trainer.vllm_generation.sync_weights()  # type: ignore[attr-defined]
 
     def generate(
         self,
