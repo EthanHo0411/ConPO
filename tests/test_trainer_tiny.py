@@ -34,7 +34,7 @@ from conpo.operators import registry
 from conpo.operators.registry import FIXTURES
 from conpo.reverse import ReverseResult
 from conpo.selection import FamilyStats
-from conpo.trainer import ConPOTrainer, score_response
+from conpo.trainer import _SAMPLED_MECHANISM_FIELDS, ConPOTrainer, score_response
 from conpo.verifiers import Constraint, feasible
 
 # ---------------------------------------------------------------------------
@@ -496,6 +496,130 @@ def test_compute_loss_halves_edge_sample_and_runs_probe_once_per_step(
     assert len(records) == 1
     assert records[0]["pair_scoring_forwards"] == 4
     assert records[0]["pair_scoring_seconds"] > 0.0
+    # B2 (audit 2026-09-14): resp_evicted/pair_scoring_seconds/
+    # pair_scoring_forwards are documented as single-micro-batch samples on
+    # every record, this one included.
+    assert set(records[0]["sampled_fields"]) == set(_SAMPLED_MECHANISM_FIELDS)
+
+
+# ---------------------------------------------------------------------------
+# B2 (audit 2026-09-14): pair_scoring_seconds/pair_scoring_forwards/
+# resp_evicted above are single-micro-batch samples, not per-optimiser-step
+# totals -- only the accumulation cycle's first compute_loss call's local
+# value reaches the mechanism record, the other gradient_accumulation_steps
+# - 1 calls' contributions are dropped. Fixed by accumulating all three
+# across the whole cycle and surfacing the PREVIOUS cycle's total on the
+# NEXT cycle's record (previous_step_totals): the current cycle's own total
+# is not yet known when the first compute_loss call writes its record.
+# ---------------------------------------------------------------------------
+
+
+def test_mechanism_record_carries_previous_step_pair_totals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "EDGE_PAIRS_PER_STEP", 4)
+
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A, ROW_B]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=2,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=2,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    # forward/reverse/prompt_loss off, same isolation as
+    # test_compute_loss_halves_edge_sample_and_runs_probe_once_per_step above.
+    arm = ArmSpec(reward="conjunctive", forward=False, reverse=False, prompt_loss=False, resp_loss=True)
+    edge_buffer = EdgeBuffer()
+    mechanism_log_path = tmp_path / "mechanism.jsonl"
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=edge_buffer,
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=mechanism_log_path,
+        seed=0,
+        overrides=Overrides(),
+        peft_config=_lora_config(),
+        probe_enabled=False,
+    )
+
+    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+    with torch.no_grad(), unwrapped.disable_adapter():
+        for edge in _hand_built_edges():
+            logp_plus, len_plus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_plus)
+            logp_minus, len_minus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_minus)
+            edge_buffer.push(
+                dataclasses.replace(
+                    edge,
+                    logp_ref_plus=logp_plus.item(),
+                    logp_ref_minus=logp_minus.item(),
+                    len_plus=len_plus,
+                    len_minus=len_minus,
+                )
+            )
+
+    # Ground truth: every compute_loss call's own resp_evicted, independent
+    # of the fix under test (spies the real discard, does not replace it).
+    evicted_calls: list[int] = []
+    original_discard = EdgeBuffer.discard
+
+    def spy_discard(self: EdgeBuffer, edges: object) -> int:
+        n = original_discard(self, edges)
+        evicted_calls.append(n)
+        return n
+
+    monkeypatch.setattr(EdgeBuffer, "discard", spy_discard)
+
+    trainer.train()
+
+    assert trainer.state.global_step == 2
+    records = _mechanism_records(mechanism_log_path)
+    assert len(records) == 2
+    # gradient_accumulation_steps=2 -> 2 compute_loss calls per optimiser
+    # step -> 2 discard calls per step (edge_buffer stays at 4 edges the
+    # whole test: an untrained model's margins start near 0, well under
+    # KAPPA*TAU=0.5, and one micro lr=1e-3 step cannot cross that).
+    assert len(evicted_calls) == 4
+
+    # Step 0 (records[0]): the run's first cycle, nothing precedes it.
+    assert "previous_step_totals" not in records[0]
+
+    # Step 1 (records[1]): step 0's totals, from BOTH of its compute_loss
+    # calls, not just the first.
+    prev = records[1]["previous_step_totals"]
+    assert prev["step"] == 0
+    assert prev["resp_evicted_step"] == sum(evicted_calls[:2])
+    # ceil(EDGE_PAIRS_PER_STEP=4 / grad_accum=2) == 2 edges/call, 2
+    # forwards/edge (no clamp, no span_local) -> 4 forwards/call, 8/step.
+    assert prev["pair_scoring_forwards_step"] == 8
+    assert prev["pair_scoring_seconds_step"] > 0.0
+
+    for record in records:
+        assert set(record["sampled_fields"]) == set(_SAMPLED_MECHANISM_FIELDS)
 
 
 # ---------------------------------------------------------------------------

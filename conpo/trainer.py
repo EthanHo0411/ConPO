@@ -52,6 +52,26 @@ from conpo.selection import FamilyStats
 from conpo.verifiers import feasible, verifier_vector
 
 
+# B2 (audit 2026-09-14): mechanism.jsonl fields compute_loss populates from
+# one micro-batch's own `stats` (resp_evicted, plus every "prompt_"-prefixed
+# key -- prompt_loss, prompt_gamma_theta, prompt_mean_m_plus,
+# prompt_mean_m_minus, prompt_clamp_frac -- and pair_scoring_seconds/
+# pair_scoring_forwards) rather than from the whole accumulation cycle: a
+# reader averaging these over several records is averaging single samples,
+# not per-step means. Listed on every record as "sampled_fields" so a
+# downstream analysis script does not have to know this by convention.
+_SAMPLED_MECHANISM_FIELDS = (
+    "resp_evicted",
+    "pair_scoring_seconds",
+    "pair_scoring_forwards",
+    "prompt_loss",
+    "prompt_gamma_theta",
+    "prompt_mean_m_plus",
+    "prompt_mean_m_minus",
+    "prompt_clamp_frac",
+)
+
+
 def _pair_edit_distance(pair: PendingPair) -> float:
     """token_distance(y_plus, y_minus) for one pending pair, at flush time
     (design 2026-09-04, item 4): forward.py and reverse.py always stamp
@@ -320,6 +340,20 @@ class ConPOTrainer(GRPOTrainer):
         # last_loss_stats from the PREVIOUS step; stashing it and writing after
         # compute_loss lets the record carry this step's own prompt_gamma_theta.
         self._pending_mechanism_record: dict[str, object] | None = None
+        # B2 (audit 2026-09-14): resp_evicted/pair_scoring_seconds/
+        # pair_scoring_forwards are single-micro-batch samples in the
+        # mechanism record (unchanged, see sampled_fields below), but the
+        # true per-optimiser-step totals need every micro-batch's
+        # contribution, not just the first. Accumulated here across
+        # compute_loss's calls for one cycle, reset at the top of
+        # _generate_and_score_completions (the one call per cycle) once its
+        # value has been captured into that new cycle's record as the
+        # PREVIOUS cycle's totals -- the current cycle's own total is not
+        # known yet when the first compute_loss call writes the record.
+        self._resp_evicted_step_accum = 0
+        self._pair_scoring_seconds_step_accum = 0.0
+        self._pair_scoring_forwards_step_accum = 0
+        self._step_totals_initialized = False
         # Guards the T_c probe to once per optimiser step: self.state.global_step
         # is constant across every micro-batch of one accumulation cycle, so a
         # value change (including the first call, None != 0) marks a new step.
@@ -582,6 +616,24 @@ class ConPOTrainer(GRPOTrainer):
     # -----------------------------------------------------------------
 
     def _generate_and_score_completions(self, inputs: list[dict[str, object]]) -> dict[str, object]:
+        # B2: this method's own top is exactly the accumulation-cycle
+        # boundary (see its B1 docstring note below), so by the time it
+        # runs, every compute_loss call of the PREVIOUS cycle has already
+        # added its contribution to the three accumulators below -- capture
+        # that finished total before resetting for the new cycle. Absent on
+        # the very first call of the run (nothing preceded it).
+        previous_step_totals: dict[str, object] | None = None
+        if self._step_totals_initialized:
+            previous_step_totals = {
+                "step": self.state.global_step - 1,
+                "resp_evicted_step": self._resp_evicted_step_accum,
+                "pair_scoring_seconds_step": self._pair_scoring_seconds_step_accum,
+                "pair_scoring_forwards_step": self._pair_scoring_forwards_step_accum,
+            }
+        self._resp_evicted_step_accum = 0
+        self._pair_scoring_seconds_step_accum = 0.0
+        self._pair_scoring_forwards_step_accum = 0
+        self._step_totals_initialized = True
         # Reset before super()'s own call, not after (unlike _phase_seconds
         # below): TRL's rollout generation happens inside that call, through
         # the same wrapped vllm_generation.generate/llm.wake_up/sleep the
@@ -876,7 +928,14 @@ class ConPOTrainer(GRPOTrainer):
             "forward_distinct_candidate_frac": (
                 (forward_distinct_candidate_calls / forward_candidate_calls) if forward_candidate_calls else 1.0
             ),
+            # B2: fixed list, not step-specific -- see _SAMPLED_MECHANISM_FIELDS.
+            "sampled_fields": list(_SAMPLED_MECHANISM_FIELDS),
         }
+        # B2: the PREVIOUS cycle's step totals, captured at this method's
+        # top before this cycle's accumulators were reset; absent on the
+        # run's first cycle (previous_step_totals is None, see the top).
+        if previous_step_totals is not None:
+            record["previous_step_totals"] = previous_step_totals
         # Not a copy, same reasoning as "phase_seconds" above: a same-step
         # flush_pending_veto's _wake_engine() call may still touch the
         # wrapped llm.wake_up after this dict is built.
@@ -2061,10 +2120,14 @@ class ConPOTrainer(GRPOTrainer):
         # forward-pass count for this micro-batch's own pair-loss scoring
         # below (_score_edge_pairs, _prompt_margins), one model(...) forward
         # per score_response call at batch size 1 each (conpo/losses.py's
-        # sequence_logprobs). Local, not accumulated across the accumulation
-        # cycle's other micro-batches: matches how "stats" above already
-        # only reaches the mechanism record from the one micro-batch that
-        # finds _pending_mechanism_record set (see the write below).
+        # sequence_logprobs). Local to this micro-batch: "stats" below still
+        # only reaches the mechanism record's own resp_evicted/
+        # pair_scoring_seconds/pair_scoring_forwards keys (sampled_fields)
+        # from the one micro-batch that finds _pending_mechanism_record set
+        # (see the write below) -- B2 (audit 2026-09-14) adds the real
+        # per-optimiser-step totals alongside them via the
+        # self._*_step_accum accumulators below, surfaced a cycle later as
+        # previous_step_totals (_generate_and_score_completions).
         pair_scoring_seconds = 0.0
         pair_scoring_forwards = 0
 
@@ -2099,6 +2162,7 @@ class ConPOTrainer(GRPOTrainer):
                     if margin > config.KAPPA * config.TAU
                 ]
                 stats["resp_evicted"] = self.edge_buffer.discard(saturated_edges)
+                self._resp_evicted_step_accum += stats["resp_evicted"]
                 pair_scoring_seconds += time.perf_counter() - _t_score
                 # score_response(y_plus), score_response(y_minus); doubled by
                 # RUN_TOKEN_LOGRATIO_CLAMP's fresh per-edge reference forward
@@ -2184,6 +2248,13 @@ class ConPOTrainer(GRPOTrainer):
                     total = total + pair_scale_factor * config.PAIR_LOSS_WEIGHT * self.overrides.lambda_p * loss_prompt
                 stats["prompt_loss"] = loss_prompt.item()
                 stats.update({f"prompt_{k}": v for k, v in prompt_stats.items()})
+
+        # B2: this micro-batch's full local totals (both blocks above have
+        # already added everything they will), folded into the running
+        # per-optimiser-step totals _generate_and_score_completions surfaces
+        # as previous_step_totals one cycle later.
+        self._pair_scoring_seconds_step_accum += pair_scoring_seconds
+        self._pair_scoring_forwards_step_accum += pair_scoring_forwards
 
         if self.probe_enabled and len(self.edge_buffer) > 0 and current_update != self._last_probe_step:
             self._run_probe(model, inputs, clean, current_update)
