@@ -340,15 +340,18 @@ def env(name: str, default: str) -> str:
 REVERSE_DRAWS_PER_STEP = 8  # DEV_SET
 
 # Edges sampled from the buffer for L_resp per OPTIMISER step, not per
-# compute_loss call: conpo/trainer.py's compute_loss divides this by
-# self.args.gradient_accumulation_steps (rounding up) so every micro-batch
-# draws its share and the per-optimiser-step total stays at
+# compute_loss call: conpo/trainer.py's compute_loss splits this exactly
+# across self.args.gradient_accumulation_steps micro-batches
+# (_pairs_this_microbatch's floor((i+1)*T/A)-floor(i*T/A) split, B3 audit
+# 2026-09-14 -- fixes the earlier ceil-per-micro-batch, which overdrew
+# whenever accumulation did not divide the total evenly) so every
+# micro-batch draws its share and the per-optimiser-step total stays at
 # EDGE_PAIRS_PER_STEP regardless of accumulation
 # (conpo/edges.py:EdgeBuffer.sample). DEV_SET.
 EDGE_PAIRS_PER_STEP = 48  # DEV_SET
 
 # Single-family edges sampled from the buffer for L_prompt per OPTIMISER
-# step, divided across compute_loss calls the same way as
+# step, split across compute_loss calls exactly the same way as
 # EDGE_PAIRS_PER_STEP above (conpo/trainer.py's compute_loss). DEV_SET.
 PROMPT_PAIRS_PER_STEP = 8  # DEV_SET
 

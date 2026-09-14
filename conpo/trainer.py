@@ -25,7 +25,6 @@ import contextlib
 import dataclasses
 import gc
 import json
-import math
 import random
 import time
 import warnings
@@ -82,6 +81,22 @@ def _pair_edit_distance(pair: PendingPair) -> float:
     if isinstance(stored, (int, float)):
         return float(stored)
     return token_distance(pair.request.y_plus, pair.request.y_minus)
+
+
+def _pairs_this_microbatch(total: int, micro_batch_index: int, accumulation: int) -> int:
+    """Exact share of a per-optimiser-step budget `total` to draw on
+    micro-batch `micro_batch_index` (0-based) of an `accumulation`-step
+    cycle, so the cycle's sum over every index in range(accumulation)
+    equals `total` for any total/accumulation pair (B3, audit 2026-09-14;
+    replaces the old math.ceil(total / accumulation) drawn on EVERY
+    micro-batch, which overdrew whenever accumulation did not divide total
+    evenly -- e.g. ceil(8 / 16) == 1 times 16 micro-batches == 16, double
+    the configured 8). floor((i+1)*total/accumulation) -
+    floor(i*total/accumulation) is the standard exact-remainder split: each
+    index gets total // accumulation or that plus one, with the +1
+    micro-batches spread evenly across the cycle instead of piled onto the
+    first ceil(total/accumulation) of them."""
+    return (total * (micro_batch_index + 1)) // accumulation - (total * micro_batch_index) // accumulation
 
 
 class _QueueingVetoCollector:
@@ -353,7 +368,18 @@ class ConPOTrainer(GRPOTrainer):
         self._resp_evicted_step_accum = 0
         self._pair_scoring_seconds_step_accum = 0.0
         self._pair_scoring_forwards_step_accum = 0
+        # B3 (audit 2026-09-14): realised edge/prompt pairs actually drawn
+        # this cycle (post edge_buffer.sample/sample_where, so a buffer
+        # running dry still counts truthfully), accumulated and surfaced
+        # the same way as the three counters above.
+        self._edge_pairs_step_accum = 0
+        self._prompt_pairs_step_accum = 0
         self._step_totals_initialized = False
+        # B3: 0-based index of the next compute_loss call within its
+        # accumulation cycle, feeding _pairs_this_microbatch's exact P/A
+        # split; reset at the top of _generate_and_score_completions (the
+        # one call per cycle), same convention as the accumulators above.
+        self._microbatch_in_cycle = 0
         # Guards the T_c probe to once per optimiser step: self.state.global_step
         # is constant across every micro-batch of one accumulation cycle, so a
         # value change (including the first call, None != 0) marks a new step.
@@ -629,10 +655,16 @@ class ConPOTrainer(GRPOTrainer):
                 "resp_evicted_step": self._resp_evicted_step_accum,
                 "pair_scoring_seconds_step": self._pair_scoring_seconds_step_accum,
                 "pair_scoring_forwards_step": self._pair_scoring_forwards_step_accum,
+                # B3: realised draws across the previous cycle's micro-batches.
+                "edge_pairs_step": self._edge_pairs_step_accum,
+                "prompt_pairs_step": self._prompt_pairs_step_accum,
             }
         self._resp_evicted_step_accum = 0
         self._pair_scoring_seconds_step_accum = 0.0
         self._pair_scoring_forwards_step_accum = 0
+        self._edge_pairs_step_accum = 0
+        self._prompt_pairs_step_accum = 0
+        self._microbatch_in_cycle = 0
         self._step_totals_initialized = True
         # Reset before super()'s own call, not after (unlike _phase_seconds
         # below): TRL's rollout generation happens inside that call, through
@@ -2136,9 +2168,19 @@ class ConPOTrainer(GRPOTrainer):
         # gradient accumulation; split the budget so the per-optimiser-step total
         # sampled from edge_buffer stays at the configured value regardless of
         # accumulation, rather than being drawn in full on every micro-batch.
+        # B3 (audit 2026-09-14): the old math.ceil(total / grad_accum) drawn on
+        # EVERY micro-batch overdrew whenever grad_accum did not divide total
+        # evenly -- PROMPT_PAIRS_PER_STEP=8 over grad_accum=16 drew
+        # ceil(8/16)=1 per micro-batch, 16 per step, double the configured 8
+        # (EDGE_PAIRS_PER_STEP=48/16=3 stayed exact only because 16 divides
+        # 48). _pairs_this_microbatch's floor((i+1)*T/A)-floor(i*T/A) split
+        # sums to exactly T over one A-micro-batch cycle for any T/A.
         grad_accum = self.args.gradient_accumulation_steps
-        edge_n = math.ceil(config.EDGE_PAIRS_PER_STEP / grad_accum)
-        prompt_n = math.ceil(config.PROMPT_PAIRS_PER_STEP / grad_accum)
+        edge_n = _pairs_this_microbatch(config.EDGE_PAIRS_PER_STEP, self._microbatch_in_cycle, grad_accum)
+        prompt_n = _pairs_this_microbatch(config.PROMPT_PAIRS_PER_STEP, self._microbatch_in_cycle, grad_accum)
+        self._microbatch_in_cycle += 1
+        edge_pairs_drawn = 0
+        prompt_pairs_drawn = 0
 
         # Design choice (orchestrator, 2026-09-04): L_resp stays UNGATED on
         # Overrides.multi. Forward multi-family repair edges are part of
@@ -2148,6 +2190,7 @@ class ConPOTrainer(GRPOTrainer):
         # overrides.multi).
         if self.arm.resp_loss and len(self.edge_buffer) > 0:
             resp_edges = self.edge_buffer.sample(edge_n, current_update, self.rng, balanced=True)
+            edge_pairs_drawn = len(resp_edges)
             if resp_edges:
                 _t_score = time.perf_counter()
                 delta, ages, token_clamp_stats = self._score_edge_pairs(model, resp_edges)
@@ -2211,6 +2254,7 @@ class ConPOTrainer(GRPOTrainer):
             # multi-family edge into edge_buffer.
             family_predicate = (lambda e: len(e.families) >= 1) if self.overrides.multi else (lambda e: len(e.families) == 1)
             prompt_edges = self.edge_buffer.sample_where(family_predicate, prompt_n, current_update, self.rng)
+            prompt_pairs_drawn = len(prompt_edges)
             if prompt_edges:
                 # The margins and prompt_gamma_theta diagnostic are computed
                 # (and logged) whenever the arm carries L_prompt at all,
@@ -2255,6 +2299,10 @@ class ConPOTrainer(GRPOTrainer):
         # as previous_step_totals one cycle later.
         self._pair_scoring_seconds_step_accum += pair_scoring_seconds
         self._pair_scoring_forwards_step_accum += pair_scoring_forwards
+        # B3: realised (post-sample) edge/prompt draws this micro-batch,
+        # same accumulate-then-surface-next-cycle convention as above.
+        self._edge_pairs_step_accum += edge_pairs_drawn
+        self._prompt_pairs_step_accum += prompt_pairs_drawn
 
         if self.probe_enabled and len(self.edge_buffer) > 0 and current_update != self._last_probe_step:
             self._run_probe(model, inputs, clean, current_update)

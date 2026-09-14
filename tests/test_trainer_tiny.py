@@ -34,7 +34,7 @@ from conpo.operators import registry
 from conpo.operators.registry import FIXTURES
 from conpo.reverse import ReverseResult
 from conpo.selection import FamilyStats
-from conpo.trainer import _SAMPLED_MECHANISM_FIELDS, ConPOTrainer, score_response
+from conpo.trainer import _SAMPLED_MECHANISM_FIELDS, ConPOTrainer, _pairs_this_microbatch, score_response
 from conpo.verifiers import Constraint, feasible
 
 # ---------------------------------------------------------------------------
@@ -620,6 +620,160 @@ def test_mechanism_record_carries_previous_step_pair_totals(tmp_path: Path, monk
 
     for record in records:
         assert set(record["sampled_fields"]) == set(_SAMPLED_MECHANISM_FIELDS)
+
+
+# ---------------------------------------------------------------------------
+# B3 (audit 2026-09-14): conpo/trainer.py's compute_loss used to draw
+# math.ceil(config.EDGE_PAIRS_PER_STEP / grad_accum) / ...PROMPT_PAIRS_PER_STEP
+# pairs on EVERY micro-batch of the accumulation cycle, so a per-step budget
+# that did not divide evenly by grad_accum was overdrawn (e.g.
+# PROMPT_PAIRS_PER_STEP=8 over grad_accum=16 drew ceil(8/16)=1 * 16 == 16,
+# double the configured 8; EDGE_PAIRS_PER_STEP=48/16=3 stayed exact only
+# because 16 divides 48). _pairs_this_microbatch replaces the per-micro-batch
+# ceil with an exact floor((i+1)*T/A)-floor(i*T/A) split.
+# ---------------------------------------------------------------------------
+
+
+def test_pairs_this_microbatch_schedule_sums_exact_for_any_ratio() -> None:
+    for total, accumulation in ((8, 16), (48, 16), (5, 2)):
+        counts = [_pairs_this_microbatch(total, i, accumulation) for i in range(accumulation)]
+        assert sum(counts) == total
+        assert all(c >= 0 for c in counts)
+
+    # P=8, A=16: budget below accumulation, at most one pair per micro-batch
+    # (the old ceil(8/16)=1 drawn on all 16 micro-batches summed to 16).
+    assert set(_pairs_this_microbatch(8, i, 16) for i in range(16)) <= {0, 1}
+
+    # P=48, A=16: divides evenly, exact 3 on every micro-batch -- unchanged
+    # from the old ceil(48/16)=3, the one case it already got right.
+    assert [_pairs_this_microbatch(48, i, 16) for i in range(16)] == [3] * 16
+
+    # P=5, A=2: does not divide evenly; old ceil(5/2)=2 on both micro-batches
+    # would have summed to 4, undercounting (a case the ceil formula could
+    # also get wrong in the other direction).
+    assert [_pairs_this_microbatch(5, i, 2) for i in range(2)] == [2, 3]
+
+
+def test_edge_and_prompt_pairs_step_totals_exact_for_uneven_accumulation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # grad_accum=2 (the same value the B2 tests above already exercise
+    # end-to-end with this dataset/config shape) divides neither
+    # EDGE_PAIRS_PER_STEP=3 nor PROMPT_PAIRS_PER_STEP=5 (both monkeypatched).
+    monkeypatch.setattr(config, "EDGE_PAIRS_PER_STEP", 3)
+    monkeypatch.setattr(config, "PROMPT_PAIRS_PER_STEP", 5)
+
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A, ROW_B]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=2,
+        use_vllm=False,
+        beta=config.KL_BETA,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=2,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    # forward/reverse off, same isolation as the B2 test above; prompt_loss
+    # on this time so both edge_n and prompt_n are exercised.
+    arm = ArmSpec(reward="conjunctive", forward=False, reverse=False, prompt_loss=True, resp_loss=True)
+    edge_buffer = EdgeBuffer()
+    mechanism_log_path = tmp_path / "mechanism.jsonl"
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=edge_buffer,
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=TokenMeter(budget=0),
+        mechanism_log_path=mechanism_log_path,
+        seed=0,
+        overrides=Overrides(),
+        peft_config=_lora_config(),
+        probe_enabled=False,
+    )
+
+    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+    with torch.no_grad(), unwrapped.disable_adapter():
+        for edge in _hand_built_edges():
+            logp_plus, len_plus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_plus)
+            logp_minus, len_minus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_minus)
+            edge_buffer.push(
+                dataclasses.replace(
+                    edge,
+                    logp_ref_plus=logp_plus.item(),
+                    logp_ref_minus=logp_minus.item(),
+                    len_plus=len_plus,
+                    len_minus=len_minus,
+                )
+            )
+
+    # 2 forward + 2 reverse, all single-family -- both EdgeBuffer.sample
+    # (balanced, requested <= 2) and .sample_where (requested <= 3, pool of
+    # 4 single-family edges) always have enough edges to return exactly
+    # what they are asked for, so the requested and realised counts below
+    # coincide.
+    edge_n_calls: list[int] = []
+    original_sample = EdgeBuffer.sample
+
+    def spy_sample(self: EdgeBuffer, n: int, current_update: int, rng: random.Random, balanced: bool = True):
+        edge_n_calls.append(n)
+        return original_sample(self, n, current_update, rng, balanced=balanced)
+
+    monkeypatch.setattr(EdgeBuffer, "sample", spy_sample)
+
+    prompt_n_calls: list[int] = []
+    original_sample_where = EdgeBuffer.sample_where
+
+    def spy_sample_where(self: EdgeBuffer, predicate, n: int, current_update: int, rng: random.Random):
+        prompt_n_calls.append(n)
+        return original_sample_where(self, predicate, n, current_update, rng)
+
+    monkeypatch.setattr(EdgeBuffer, "sample_where", spy_sample_where)
+
+    trainer.train()
+
+    assert trainer.state.global_step == 2
+    # gradient_accumulation_steps=2 -> 2 compute_loss calls per optimiser
+    # step -> 2 sample()/sample_where() calls per step, 4 total over 2 steps.
+    assert len(edge_n_calls) == 4
+    assert len(prompt_n_calls) == 4
+    # Each optimiser step's own 2 calls sum to exactly the configured
+    # budget -- the old per-call ceil(3/2)=2 * 2 == 4 and ceil(5/2)=3 * 2 ==
+    # 6 would both have overdrawn.
+    assert sum(edge_n_calls[:2]) == sum(edge_n_calls[2:]) == config.EDGE_PAIRS_PER_STEP == 3
+    assert sum(prompt_n_calls[:2]) == sum(prompt_n_calls[2:]) == config.PROMPT_PAIRS_PER_STEP == 5
+
+    records = _mechanism_records(mechanism_log_path)
+    assert len(records) == 2
+    assert "previous_step_totals" not in records[0]
+
+    # Step 1's record carries step 0's realised (post-sample) totals, which
+    # match the requested totals above since the buffer never runs dry.
+    prev = records[1]["previous_step_totals"]
+    assert prev["step"] == 0
+    assert prev["edge_pairs_step"] == 3
+    assert prev["prompt_pairs_step"] == 5
 
 
 # ---------------------------------------------------------------------------
