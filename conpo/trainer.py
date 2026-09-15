@@ -495,6 +495,32 @@ class ConPOTrainer(GRPOTrainer):
         # self._pending_mechanism_record's existing across-call handoff.
         self._pending_span_anchor: torch.Tensor | None = None
 
+        # RUN_SKIP_STEP_ON_GAP (K2, devbox 2026-09-15): a float bar in nats
+        # on TRL's own sampling/sampling_logp_difference/max metric (the
+        # trainer's per-token log-prob vs vLLM's, gated on self.use_vllm and
+        # self.vllm_importance_sampling_correction -- trl/trainer/
+        # grpo_trainer.py:2782-2789). When this step's max gap exceeds the
+        # bar, compute_loss below zeroes the returned loss for every
+        # micro-batch of the step (graph kept, so accelerate's backward and
+        # grad clipping still run) instead of skipping the micro-batch
+        # outright. Unset (default "") disables the whole mechanism -- same
+        # convention as _token_logratio_clamp above.
+        raw_skip_step_on_gap = config.env("RUN_SKIP_STEP_ON_GAP", "")
+        self._skip_step_on_gap_bar: float | None = (
+            float(raw_skip_step_on_gap) if raw_skip_step_on_gap else None
+        )
+        # ponytail: resets to 0 across a RUN_RESUME restart (not written to
+        # conpo_state.json, unlike cumulative_admitted_edges etc. below) --
+        # add it there with a state.get(...) fallback if a resumed run's
+        # total needs to span process restarts.
+        self._skipped_steps_on_gap = 0
+        # Set once per optimiser step by _update_skip_step_on_gap (called
+        # from _generate_and_score_completions, below), before compute_loss
+        # runs for any of that step's micro-batches; every one of them reads
+        # the same value since nothing changes it again until the next step.
+        self._step_skip_on_gap = False
+        self._step_sampling_gap_max: float | None = None
+
         # Wall-clock accumulation across RUN_RESUME processes (scripts/train.py):
         # the node-local disk is wiped roughly every 48 hours, so one logical
         # run can span several process restarts. wall_seconds_before_resume is
@@ -647,6 +673,43 @@ class ConPOTrainer(GRPOTrainer):
             scores.append(sum(verdicts) / len(verdicts))
         return scores
 
+    def _update_skip_step_on_gap(self) -> None:
+        """RUN_SKIP_STEP_ON_GAP (K2, devbox 2026-09-15): decide this
+        optimiser step's outcome from TRL's own sampling log-prob gap
+        metric.
+
+        TRL 1.9.2 appends this step's max gap to
+        self._metrics["train"]["sampling/sampling_logp_difference/max"]
+        inside _generate_and_score_completions itself (trl/trainer/
+        grpo_trainer.py:2782-2789: `self._metrics[mode][
+        "sampling/sampling_logp_difference/max"].append(...)`, gated on
+        `self.use_vllm and self.vllm_importance_sampling_correction`, both
+        true for every real ConPO run) -- there is no other hook for this
+        value, so _metrics is the only source. Called once per optimiser
+        step, right after super()._generate_and_score_completions(inputs)
+        (this method runs exactly once per cycle, see its own B1 note), so
+        the list's last entry is always this step's own value and is
+        already in place before compute_loss runs for any of this step's
+        micro-batches -- every one of them reads self._step_skip_on_gap and
+        sees the same decision, since nothing changes it again until the
+        next call here.
+
+        Eval never buffers (TRL's own _prepare_inputs calls this method
+        directly per eval batch, unrelated to an optimiser step), so the
+        decision is train-only; an eval call always leaves it False/None.
+        """
+        self._step_skip_on_gap = False
+        self._step_sampling_gap_max = None
+        if self._skip_step_on_gap_bar is None or not self.model.training:
+            return
+        gap_history = self._metrics["train"].get("sampling/sampling_logp_difference/max")
+        if not gap_history:
+            return
+        self._step_sampling_gap_max = gap_history[-1]
+        self._step_skip_on_gap = self._step_sampling_gap_max > self._skip_step_on_gap_bar
+        if self._step_skip_on_gap:
+            self._skipped_steps_on_gap += 1
+
     # -----------------------------------------------------------------
     # Counterfactual construction
     # -----------------------------------------------------------------
@@ -697,6 +760,11 @@ class ConPOTrainer(GRPOTrainer):
             self._vllm_sleep_pending = False
         t0 = time.perf_counter()
         output = super()._generate_and_score_completions(inputs)
+        # RUN_SKIP_STEP_ON_GAP (K2): decide this step's outcome right after
+        # TRL's own super() call above, which is where TRL appends this
+        # step's sampling gap to self._metrics -- see
+        # _update_skip_step_on_gap's own docstring.
+        self._update_skip_step_on_gap()
         # n moved up here (was computed further down, just above the
         # per-group loop): RUN_RESAMPLE_ZERO_STD needs the group size before
         # that loop runs, to find and replace degenerate groups in `inputs`/
@@ -996,6 +1064,13 @@ class ConPOTrainer(GRPOTrainer):
         if self._resample_zero_std:
             record["resample_groups_replaced"] = resample_groups_replaced
             record["resample_rounds"] = resample_rounds
+        # RUN_SKIP_STEP_ON_GAP (K2): only present when the flag is on, same
+        # "absent, not zero" convention as RUN_RESAMPLE_ZERO_STD above --
+        # _update_skip_step_on_gap (called earlier in this method) already
+        # decided this step's outcome.
+        if self._skip_step_on_gap_bar is not None:
+            record["skipped_on_gap"] = self._step_skip_on_gap
+            record["sampling_gap_max"] = self._step_sampling_gap_max
         if self.pair_stats is not None and current_update % config.PROBE_PERIOD_S == 0:
             record["pair_stats_top_pairs"] = [list(row) for row in self.pair_stats.top_pairs(5)]
         # Stashed, not written here -- see the __init__ comment on
@@ -1009,6 +1084,10 @@ class ConPOTrainer(GRPOTrainer):
         # mean the way compute_loss's own stats loop would.
         mode = "train" if self.model.training else "eval"
         self._metrics[mode]["forward_distinct_candidate_frac"].append(record["forward_distinct_candidate_frac"])
+        # RUN_SKIP_STEP_ON_GAP (K2): cumulative count, same on/off gate and
+        # once-per-step placement as forward_distinct_candidate_frac above.
+        if self._skip_step_on_gap_bar is not None:
+            self._metrics[mode]["skipped_steps_on_gap"].append(self._skipped_steps_on_gap)
 
         # RUN_VLLM_PUSH_ONCE_PER_STEP (L1): run this step's deferred
         # llm.sleep() for real, if one is pending, before any of the three
@@ -2354,6 +2433,16 @@ class ConPOTrainer(GRPOTrainer):
         mode = "train" if model.training else "eval"
         for name, value in stats.items():
             self._metrics[mode][name].append(value)
+
+        # RUN_SKIP_STEP_ON_GAP (K2): _update_skip_step_on_gap
+        # (_generate_and_score_completions) already decided this step's
+        # outcome, before compute_loss ran for any of this step's
+        # micro-batches. Scale to zero rather than return early: `total`
+        # stays a tensor in the graph (not a detached/python 0.0), so
+        # accelerate's backward and grad clipping still run for every
+        # micro-batch of the step, contributing exactly zero gradient.
+        if self._step_skip_on_gap:
+            total = total * 0.0
 
         return total
 

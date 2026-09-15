@@ -1728,6 +1728,147 @@ def test_full_arm_beta_zero_disables_kl_but_keeps_pair_losses_working(tmp_path: 
 
 
 # ---------------------------------------------------------------------------
+# K2 RUN_SKIP_STEP_ON_GAP (devbox 2026-09-15): TRL 1.9.2 appends this step's
+# max sampling log-prob gap to self._metrics["train"]["sampling/sampling_
+# logp_difference/max"] inside _generate_and_score_completions itself
+# (trl/trainer/grpo_trainer.py:2782-2789, gated on self.use_vllm and
+# self.vllm_importance_sampling_correction) -- no other hook exists for
+# this value. conpo/trainer.py's _update_skip_step_on_gap reads the list's
+# last entry (this method runs exactly once per optimiser step, so that
+# entry is always fresh) and decides whether this step's compute_loss calls
+# should zero their returned loss. The first two tests below call
+# _update_skip_step_on_gap directly against a hand-seeded metrics list
+# (isolating the decision from TRL's own vLLM-only population of it); the
+# third exercises compute_loss's own zeroing; the last two exercise the
+# real reuse of _kl_clamp_trainer's fixture through trainer.train() (no
+# vLLM in this CPU test, so the metric is never populated for real --
+# _update_skip_step_on_gap must still report an honest "not measured"
+# rather than guess).
+# ---------------------------------------------------------------------------
+
+
+def test_skip_step_on_gap_unset_leaves_decision_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """RUN_SKIP_STEP_ON_GAP unset (default "") -> self._skip_step_on_gap_bar
+    is None, and _update_skip_step_on_gap must return without even reading
+    self._metrics -- true regardless of what that list holds, which is the
+    unset-path byte-identical guarantee (same convention as RUN_KL_BETA/
+    RUN_TOKEN_LOGRATIO_CLAMP above)."""
+    monkeypatch.delenv("RUN_SKIP_STEP_ON_GAP", raising=False)
+    trainer = _kl_clamp_trainer(tmp_path)
+    assert trainer._skip_step_on_gap_bar is None
+    trainer.model.train()
+    trainer._metrics["train"]["sampling/sampling_logp_difference/max"] = [1e6]
+
+    trainer._update_skip_step_on_gap()
+
+    assert trainer._step_skip_on_gap is False
+    assert trainer._step_sampling_gap_max is None
+    assert trainer._skipped_steps_on_gap == 0
+
+
+def test_skip_step_on_gap_reads_last_entry_and_counts_cumulatively(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_SKIP_STEP_ON_GAP=5.0: a step whose gap list's LAST entry exceeds
+    the bar is marked to skip and counted; the next step's call (fresh last
+    entry, below the bar) does not skip and does not add to the cumulative
+    count -- proving "current step" means the list's last entry, not its
+    first or its max over the run."""
+    monkeypatch.setenv("RUN_SKIP_STEP_ON_GAP", "5.0")
+    trainer = _kl_clamp_trainer(tmp_path)
+    assert trainer._skip_step_on_gap_bar == pytest.approx(5.0)
+    trainer.model.train()
+
+    trainer._metrics["train"]["sampling/sampling_logp_difference/max"] = [3.0, 12.5]
+    trainer._update_skip_step_on_gap()
+    assert trainer._step_skip_on_gap is True
+    assert trainer._step_sampling_gap_max == pytest.approx(12.5)
+    assert trainer._skipped_steps_on_gap == 1
+
+    trainer._metrics["train"]["sampling/sampling_logp_difference/max"].append(1.0)
+    trainer._update_skip_step_on_gap()
+    assert trainer._step_skip_on_gap is False
+    assert trainer._step_sampling_gap_max == pytest.approx(1.0)
+    assert trainer._skipped_steps_on_gap == 1
+
+
+def test_compute_loss_skip_step_on_gap_zeroes_loss_but_keeps_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """compute_loss must return exactly 0.0 for a step marked
+    _step_skip_on_gap, as a tensor still attached to the autograd graph
+    (total * 0.0, not a detached/python 0.0) so backward() and grad
+    clipping still run -- "scale the loss by 0" rather than skip the
+    micro-batch outright."""
+    monkeypatch.setenv("RUN_SKIP_STEP_ON_GAP", "5.0")
+    trainer = _kl_clamp_trainer(tmp_path)
+    inputs = _kl_clamp_inputs()
+
+    trainer._step_skip_on_gap = False
+    loss_unskipped = trainer.compute_loss(trainer.model, inputs)
+    assert loss_unskipped.item() != 0.0
+
+    trainer._step_skip_on_gap = True
+    loss_skipped = trainer.compute_loss(trainer.model, inputs)
+
+    assert loss_skipped.item() == 0.0
+    assert loss_skipped.requires_grad
+    assert loss_skipped.grad_fn is not None
+    loss_skipped.backward()  # must not raise: the graph is real, not detached
+
+
+def test_skip_step_on_gap_unset_omits_mechanism_and_metric_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end (trainer.train(), 1 step): RUN_SKIP_STEP_ON_GAP unset ->
+    conpo/trainer.py's `if self._skip_step_on_gap_bar is not None:` gates
+    never fire, so mechanism.jsonl's record carries neither "skipped_on_gap"
+    nor "sampling_gap_max", and the logged metrics never gain a
+    "skipped_steps_on_gap" key at all -- absent, not zero, is how a
+    flag-off run reports "not attempted" (same convention as
+    RUN_RESAMPLE_ZERO_STD's engine_seconds/resample_* fields)."""
+    monkeypatch.delenv("RUN_SKIP_STEP_ON_GAP", raising=False)
+    trainer = _kl_clamp_trainer(tmp_path)
+    assert trainer._skip_step_on_gap_bar is None
+
+    trainer.train()
+
+    records = _mechanism_records(trainer.mechanism_log_path)
+    assert len(records) == 1
+    record = records[0]
+    assert "skipped_on_gap" not in record
+    assert "sampling_gap_max" not in record
+    # TRL's log() clears self._metrics["train"] after each logging step
+    # (grpo_trainer.py:3294), so the logged history is where the metric's
+    # presence or absence is observable after train().
+    assert "skipped_steps_on_gap" not in trainer.state.log_history[0]
+
+
+def test_skip_step_on_gap_set_records_not_measured_without_vllm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end (trainer.train(), 1 step): RUN_SKIP_STEP_ON_GAP set, but
+    this CPU test never runs vLLM (use_vllm=False in _kl_clamp_trainer), so
+    TRL's own sampling/sampling_logp_difference/max metric is never
+    populated (trl/trainer/grpo_trainer.py:2782, gated on self.use_vllm) --
+    _update_skip_step_on_gap must find an empty history and record an
+    honest "not measured" (False/None), not guess, and the step must not be
+    skipped."""
+    monkeypatch.setenv("RUN_SKIP_STEP_ON_GAP", "5.0")
+    trainer = _kl_clamp_trainer(tmp_path)
+    assert trainer._skip_step_on_gap_bar == pytest.approx(5.0)
+
+    trainer.train()
+
+    records = _mechanism_records(trainer.mechanism_log_path)
+    assert len(records) == 1
+    record = records[0]
+    assert record["skipped_on_gap"] is False
+    assert record["sampling_gap_max"] is None
+    assert trainer.state.log_history[0]["skipped_steps_on_gap"] == 0
+
+
+# ---------------------------------------------------------------------------
 # K7 RUN_PAIR_LOSS_WEIGHT (devbox 2026-09-13): config.PAIR_LOSS_WEIGHT
 # multiplies loss_resp and lambda_p * loss_prompt individually before they
 # join `total` in compute_loss, so it must scale the pair contribution

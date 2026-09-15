@@ -405,6 +405,58 @@ def test_main_tiny_run_kl_beta_zero_reaches_config_and_metadata(
     assert metadata["kl_beta"] == 0.0
 
 
+def test_main_tiny_run_skip_step_on_gap_unset_reaches_metadata_as_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K2 (devbox 2026-09-15): RUN_SKIP_STEP_ON_GAP has no config.py
+    counterpart (unlike RUN_KL_BETA above) -- scripts/train.py reads the
+    effective value back off the constructed trainer instance
+    (trainer._skip_step_on_gap_bar), same convention as RUN_KL_CLAMP/
+    RUN_TOKEN_LOGRATIO_CLAMP. Unset -> None, recorded as such."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.delenv("RUN_SKIP_STEP_ON_GAP", raising=False)
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["skip_step_on_gap"] is None
+
+
+def test_main_tiny_run_skip_step_on_gap_set_reaches_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K2: RUN_SKIP_STEP_ON_GAP=7.5 reaches trainer._skip_step_on_gap_bar
+    and, through it, run_metadata.json -- same "override reaches the
+    trainer, which reaches metadata" pattern as RUN_KL_CLAMP."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setenv("RUN_SKIP_STEP_ON_GAP", "7.5")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["skip_step_on_gap"] == pytest.approx(7.5)
+
+
 def test_main_tiny_run_vllm_is_mode_default_and_override_reach_grpo_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
