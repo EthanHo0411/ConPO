@@ -10,8 +10,6 @@ channels:
 dependencies:
   - python=3.12.11
   - pip
-  - git
-  - rsync
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu130
       - -r requirements-cluster.txt
