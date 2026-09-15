@@ -90,7 +90,9 @@ EPSILON = 0.2  # DEV_SET
 # frozen initial policy, is the sole mechanism regularising absolute
 # likelihoods, and beta is ablated accordingly." No numeric default is given
 # in the main text (beta is one of the values "selected once on the internal
-# development set", section 4.1). DEV_SET.
+# development set", section 4.1). DEV_SET. RUN_KL_BETA (K1, devbox
+# 2026-09-15) overrides this constant; 0 switches the explicit KL term off
+# the way TRL does for beta=0.0 (scripts/train.py, conpo/trainer.py).
 KL_BETA = 0.001  # DEV_SET
 
 # KL-estimator clamp (decision 2026-09-14, alongside the dapo loss-type

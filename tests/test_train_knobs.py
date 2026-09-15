@@ -344,6 +344,67 @@ def test_main_tiny_run_pair_loss_weight_reaches_config_and_metadata(
     assert metadata["pair_loss_weight"] == pytest.approx(2.5)
 
 
+def test_main_tiny_run_kl_beta_unset_keeps_config_default_and_reaches_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K1 (devbox 2026-09-15): RUN_KL_BETA unset leaves config.KL_BETA at its
+    own default (same "unset path byte-identical" convention as
+    RUN_LOSS_TYPE/RUN_PAIR_LOSS_WEIGHT above), and run_metadata.json must
+    still record the effective value used."""
+    monkeypatch.setattr(config, "KL_BETA", config.KL_BETA)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.delenv("RUN_KL_BETA", raising=False)
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    assert config.KL_BETA == pytest.approx(0.001)
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["kl_beta"] == pytest.approx(0.001)
+
+
+def test_main_tiny_run_kl_beta_zero_reaches_config_and_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K1: RUN_KL_BETA=0 overrides config.KL_BETA before the trainer is
+    built, the GRPOConfig(...) call reads config.KL_BETA at that point
+    (beta=config.KL_BETA), and run_metadata.json must record the effective
+    value -- same "override reaches config, which reaches TRL" pattern as
+    RUN_LOSS_TYPE above."""
+    monkeypatch.setattr(config, "KL_BETA", config.KL_BETA)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setenv("RUN_KL_BETA", "0")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    assert config.KL_BETA == 0.0
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["kl_beta"] == 0.0
+
+
 def test_main_tiny_run_vllm_is_mode_default_and_override_reach_grpo_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1608,6 +1608,126 @@ def test_kl_clamp_and_loss_type_defaults(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# K1 RUN_KL_BETA (devbox 2026-09-15): beta=0.0 must switch the explicit KL
+# term off exactly the way TRL 1.9.2 does (self.ref_model = None, every
+# KL-reading line in _compute_loss gated on `self.beta != 0.0`), while the
+# pair path (L_resp/L_prompt, score_response under `_reference_model`)
+# keeps working unchanged for a LoRA policy -- it never reads self.beta or
+# self.ref_model, scoring the frozen initial policy by disabling the
+# adapter instead. This end-to-end test builds on test_full_arm_two_
+# optimizer_steps's real (non-stubbed) "full" arm + hand-built-edges
+# fixture, only with beta=0.0 and one optimizer step (beta itself does not
+# touch edge construction/admission, so one step is enough to exercise
+# compute_loss's pair-path branches).
+# ---------------------------------------------------------------------------
+
+
+def test_full_arm_beta_zero_disables_kl_but_keeps_pair_losses_working(tmp_path: Path) -> None:
+    model, tokenizer = _tiny_model_and_tokenizer()
+    rows = [ROW_A, ROW_B]
+    rows_by_key = {r.key: r for r in rows}
+    dataset = Dataset.from_list([{"prompt": [{"role": "user", "content": r.prompt}], "key": r.key} for r in rows])
+
+    grpo_config = GRPOConfig(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=2,
+        num_generations=2,
+        max_completion_length=16,
+        max_steps=1,
+        use_vllm=False,
+        beta=0.0,
+        loss_type="grpo",
+        learning_rate=1e-3,
+        report_to=[],
+        logging_steps=1,
+        gradient_accumulation_steps=1,
+        chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
+        seed=0,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+    )
+    arm, overrides = resolve_arm("full")  # resp_loss=True, prompt_loss=True
+    edge_buffer = EdgeBuffer()
+    meter = TokenMeter(budget=0)
+    mechanism_log_path = tmp_path / "mechanism.jsonl"
+    capture = _CaptureCallback()
+
+    trainer = ConPOTrainer(
+        model=model,
+        args=grpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        arm=arm,
+        rows_by_key=rows_by_key,
+        edge_buffer=edge_buffer,
+        feasible_buffer=FeasibleBuffer(),
+        stats=FamilyStats(),
+        judge=StaticJudge(keep=True),
+        engine_factory=_engine_factory,
+        meter=meter,
+        mechanism_log_path=mechanism_log_path,
+        seed=0,
+        overrides=overrides,
+        peft_config=_lora_config(),
+        callbacks=[capture],
+    )
+    capture.trainer = trainer
+
+    # TRL 1.9.2 (trainer/grpo_trainer.py): beta == 0.0 -> no reference model
+    # is built at all, regardless of PEFT.
+    assert trainer.beta == 0.0
+    assert trainer.ref_model is None
+
+    # The pair path scores against the frozen initial policy via
+    # `_reference_model` (disable_adapter for a LoRA policy), independent of
+    # self.beta/self.ref_model -- fill edges the same way
+    # test_full_arm_two_optimizer_steps does.
+    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+    filled_edges = []
+    with torch.no_grad(), unwrapped.disable_adapter():
+        for edge in _hand_built_edges():
+            logp_plus, len_plus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_plus)
+            logp_minus, len_minus = score_response(unwrapped, tokenizer, edge.prompt, edge.y_minus)
+            filled_edges.append(
+                dataclasses.replace(
+                    edge,
+                    logp_ref_plus=logp_plus.item(),
+                    logp_ref_minus=logp_minus.item(),
+                    len_plus=len_plus,
+                    len_minus=len_minus,
+                )
+            )
+    for edge in filled_edges:
+        edge_buffer.push(edge)
+
+    lora_before = {name: p.detach().clone() for name, p in trainer.model.named_parameters() if "lora_" in name}
+    assert lora_before  # sanity: the adapter actually has parameters
+
+    trainer.train()
+
+    assert trainer.state.global_step == 1
+    assert len(capture.per_step) == 1
+    step1 = capture.per_step[0]
+
+    # beta=0.0 -> no KL term or metric at all (ConPOTrainer._compute_loss's
+    # `if self.beta != 0.0:` gates, mirroring TRL's own).
+    assert "kl" not in step1
+
+    # The pair losses (L_resp/L_prompt) still ran and produced finite
+    # numbers -- unaffected by beta.
+    assert math.isfinite(step1["resp_loss"])
+    assert math.isfinite(step1["prompt_loss"])
+    # theta = theta_ref at step 1 (zero-initialised LoRA): Delta_theta(e) = 0
+    # for every edge, so L_resp = -logsigmoid(0) = log(2) exactly (same
+    # invariant as test_full_arm_two_optimizer_steps, unaffected by beta).
+    assert abs(step1["resp_loss"] - math.log(2)) < 0.05
+
+    lora_after = {name: p.detach() for name, p in trainer.model.named_parameters() if "lora_" in name}
+    assert any(not torch.equal(lora_before[name], lora_after[name]) for name in lora_before)
+
+
+# ---------------------------------------------------------------------------
 # K7 RUN_PAIR_LOSS_WEIGHT (devbox 2026-09-13): config.PAIR_LOSS_WEIGHT
 # multiplies loss_resp and lambda_p * loss_prompt individually before they
 # join `total` in compute_loss, so it must scale the pair contribution

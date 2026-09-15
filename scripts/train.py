@@ -370,6 +370,22 @@ def main() -> None:
     # fresh at call time by conpo/trainer.py's compute_loss.
     pair_loss_weight = float(config.env("RUN_PAIR_LOSS_WEIGHT", str(config.PAIR_LOSS_WEIGHT)))
     config.PAIR_LOSS_WEIGHT = pair_loss_weight
+    # RUN_KL_BETA (K1, devbox 2026-09-15): same pattern for config.KL_BETA,
+    # read fresh by the GRPOConfig(...) call below (beta=config.KL_BETA).
+    # RUN_KL_BETA=0 switches the explicit KL term off exactly the way TRL
+    # 1.9.2 does for beta=0.0 (trainer/grpo_trainer.py: self.ref_model =
+    # None, and every KL-reading line in _compute_loss is gated on
+    # `self.beta != 0.0`). ConPOTrainer._compute_loss is a full copy of
+    # that method (see its own docstring) and already carries the same
+    # `self.beta != 0.0` gates verbatim, so ref_per_token_logps being absent
+    # from `inputs` at beta=0 is never read. The pair path (L_resp/L_prompt,
+    # conpo/trainer.py's score_response under `_reference_model`) does not
+    # depend on self.beta or self.ref_model for a LoRA policy -- it scores
+    # against the frozen initial policy by disabling the adapter -- so it
+    # keeps working unchanged at beta=0 (verified end to end by
+    # tests/test_trainer_tiny.py::test_full_arm_beta_zero_disables_kl_but_keeps_pair_losses_working).
+    kl_beta = float(config.env("RUN_KL_BETA", str(config.KL_BETA)))
+    config.KL_BETA = kl_beta
     # RUN_VLLM_IS_MODE (devbox 2026-09-13): pure passthrough to TRL's own
     # GRPOConfig.vllm_importance_sampling_mode (default "sequence_mask") --
     # unlike RUN_LOSS_TYPE this has no ConPO-internal config.py counterpart,
@@ -621,6 +637,7 @@ def main() -> None:
         "kappa": kappa,
         "loss_type": loss_type,
         "pair_loss_weight": pair_loss_weight,
+        "kl_beta": kl_beta,
         # RUN_VLLM_IS_MODE / RUN_KL_CLAMP / RUN_RESAMPLE_ZERO_STD /
         # RUN_RESAMPLE_MAX_ROUNDS / RUN_TOKEN_LOGRATIO_CLAMP (K2/K4/K5/K6,
         # fixer review 2026-09-13): these four knobs reached the trainer but
