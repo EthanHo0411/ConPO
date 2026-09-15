@@ -635,7 +635,7 @@ def main() -> None:
         top_p=config.TOP_P,
         max_completion_length=max_completion_length,
         chat_template_kwargs=config.POLICY_CHAT_TEMPLATE_KWARGS,
-        learning_rate=config.LR,
+        learning_rate=float(config.env("RUN_LR", str(config.LR))),  # RUN_LR: recipe variants on the remote cluster (2026-09-15); default byte-identical
         warmup_ratio=config.WARMUP_RATIO,
         lr_scheduler_type=config.LR_SCHEDULER,
         max_grad_norm=config.MAX_GRAD_NORM,
