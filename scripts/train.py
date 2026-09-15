@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import functools
 import json
 import math
 import random
@@ -18,13 +19,14 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from accelerate import PartialState
 from datasets import Dataset
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3Config, Qwen3ForCausalLM, TrainerCallback
-from trl import GRPOConfig
+from trl import GRPOConfig, GRPOTrainer
 
 import conpo.operators  # noqa: F401  registers all corruption operators
 from conpo import config
@@ -39,6 +41,24 @@ from conpo.trainer import ConPOTrainer
 from conpo.verifiers import Constraint
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+# RUN_TRAINER=trl (K3, devbox 2026-09-15): env knobs only ConPOTrainer reads,
+# so they have no effect on the stock trl.GRPOTrainer path. Listed once for
+# the startup notice; run_metadata.json records their fields as null.
+_TRL_INACTIVE_KNOBS = (
+    "RUN_KL_CLAMP",
+    "RUN_VLLM_PUSH_ONCE_PER_STEP",
+    "RUN_CACHE_REF_LOGPROBS",
+    "RUN_REPAIR_BATCH_GENERATION",
+    "RUN_SKIP_STEP_ON_GAP",
+    "RUN_TOKEN_LOGRATIO_CLAMP",
+    "RUN_PAIR_LOSS_WEIGHT",
+    "RUN_PAIR_OBJECTIVE",
+    "RUN_PAIR_SCALE_AUTO",
+    "RUN_POS_ANCHOR_WEIGHT",
+    "RUN_RESAMPLE_ZERO_STD",
+    "RUN_RESAMPLE_MAX_ROUNDS",
+)
 
 
 def _row_from_json(data: dict) -> PoolRow:
@@ -392,6 +412,16 @@ def main() -> None:
     # so it is applied directly to grpo_config below only when set, after
     # the GRPOConfig(...) call closes.
     vllm_is_mode = config.env("RUN_VLLM_IS_MODE", "")
+    # RUN_TRAINER (K3, devbox 2026-09-15): "conpo" (default) trains through
+    # ConPOTrainer, byte-identical to before; "trl" constructs the stock
+    # trl.GRPOTrainer with the same model, tokenizer, dataset, reward
+    # function, GRPOConfig, PEFT config and plain callbacks, bypassing every
+    # ConPOTrainer override -- the control that separates "TRL itself" from
+    # "our subclass" in the BBH collapse. Only pair-free arms (ifrlvr,
+    # solve_only) are valid with it; checked right after resolve_arm below.
+    trainer_kind = config.env("RUN_TRAINER", "conpo")
+    if trainer_kind not in ("conpo", "trl"):
+        raise SystemExit(f"unknown RUN_TRAINER: {trainer_kind!r}, expected 'conpo' or 'trl'")
     out_dir = Path(config.env("RUN_OUT_DIR", "runs/tmp"))
     run_resume = config.env("RUN_RESUME", "0") == "1"
     resume_checkpoint_dir, resumed_from_step = _resolve_resume(out_dir, run_resume)
@@ -401,6 +431,14 @@ def main() -> None:
     torch.manual_seed(seed)
 
     arm, overrides = resolve_arm(arm_name)
+    if trainer_kind == "trl":
+        if arm.forward or arm.reverse or arm.prompt_loss or arm.resp_loss:
+            raise SystemExit(
+                f"RUN_TRAINER=trl runs the stock trl.GRPOTrainer, which has no pair losses and no "
+                f"repair operator, but RUN_ARM={arm_name!r} needs them. Use RUN_ARM=ifrlvr or "
+                "RUN_ARM=solve_only with RUN_TRAINER=trl."
+            )
+        print(f"RUN_TRAINER=trl: stock trl.GRPOTrainer; inactive knobs: {', '.join(_TRL_INACTIVE_KNOBS)}")
 
     subset_path = config.env("RUN_SUBSET", "")
     rows = _load_training_rows(DATA_DIR / "train.jsonl", subset_path, args.tiny)
@@ -550,10 +588,13 @@ def main() -> None:
     # trainer exists, so there is no engine handle to hand it yet.
     # ConPOTrainer.flush_pending_veto sleeps/wakes the colocated vLLM engine
     # around the burst itself instead (_sleep_engine_if_enabled/_wake_engine).
-    judge = build_judge(
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        dtype=torch.bfloat16 if torch.cuda.is_available() else None,
-    )
+    # RUN_TRAINER=trl: no trainer takes a judge, so none is built.
+    judge = None
+    if trainer_kind == "conpo":
+        judge = build_judge(
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            dtype=torch.bfloat16 if torch.cuda.is_available() else None,
+        )
 
     def engine_factory(trainer: ConPOTrainer) -> Engine:
         if use_vllm:
@@ -570,34 +611,60 @@ def main() -> None:
     stats = FamilyStats()
     meter = TokenMeter()
     mechanism_log_path = out_dir / "mechanism.jsonl"
-    pass1_callback = Pass1CheckpointCallback(dataset_size=len(rows), prompts_per_update=prompts_per_update)
-    callbacks: list[TrainerCallback] = [pass1_callback, SaveCadenceCallback()]
+    # Pass1CheckpointCallback reads trainer.meter (a ConPOTrainer attribute),
+    # so the stock path drops it; SaveCadenceCallback and StopAtStepCallback
+    # read only args/state/control and stay on both paths.
+    pass1_callback: Pass1CheckpointCallback | None = None
+    callbacks: list[TrainerCallback] = [SaveCadenceCallback()]
+    if trainer_kind == "conpo":
+        pass1_callback = Pass1CheckpointCallback(dataset_size=len(rows), prompts_per_update=prompts_per_update)
+        callbacks.insert(0, pass1_callback)
     if stop_at_step is not None:
         callbacks.append(StopAtStepCallback(stop_at_step))
 
-    trainer = ConPOTrainer(
-        model=model,
-        args=grpo_config,
-        train_dataset=dataset,
-        processing_class=tokenizer,
-        arm=arm,
-        rows_by_key=rows_by_key,
-        edge_buffer=edge_buffer,
-        feasible_buffer=feasible_buffer,
-        stats=stats,
-        judge=judge,
-        engine_factory=engine_factory,
-        meter=meter,
-        mechanism_log_path=mechanism_log_path,
-        seed=seed,
-        overrides=overrides,
-        veto_period_k=veto_period_k,
-        out_dir=out_dir,
-        peft_config=lora_config,
-        callbacks=callbacks,
-        resume_from=resume_checkpoint_dir,
-    )
-    pass1_callback.trainer = trainer
+    wall_start = time.monotonic()
+    trainer: GRPOTrainer
+    if trainer_kind == "trl":
+        # The same reward code ConPOTrainer.__init__ binds (its
+        # reward_conjunctive/reward_additive methods read nothing off the
+        # trainer but rows_by_key), bound to a rows_by_key holder instead of
+        # a trainer; TRL unwraps functools.partial for the reward's log name.
+        reward_method = ConPOTrainer.reward_conjunctive if arm.reward == "conjunctive" else ConPOTrainer.reward_additive
+        trainer = GRPOTrainer(
+            model=model,
+            reward_funcs=functools.partial(reward_method, SimpleNamespace(rows_by_key=rows_by_key)),
+            args=grpo_config,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            peft_config=lora_config,
+            callbacks=callbacks,
+        )
+    else:
+        trainer = ConPOTrainer(
+            model=model,
+            args=grpo_config,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            arm=arm,
+            rows_by_key=rows_by_key,
+            edge_buffer=edge_buffer,
+            feasible_buffer=feasible_buffer,
+            stats=stats,
+            judge=judge,
+            engine_factory=engine_factory,
+            meter=meter,
+            mechanism_log_path=mechanism_log_path,
+            seed=seed,
+            overrides=overrides,
+            veto_period_k=veto_period_k,
+            out_dir=out_dir,
+            peft_config=lora_config,
+            callbacks=callbacks,
+            resume_from=resume_checkpoint_dir,
+        )
+        assert pass1_callback is not None
+        pass1_callback.trainer = trainer
+    conpo = trainer_kind == "conpo"
 
     # B4 (audit 2026-09-14): run_metadata.json is now written twice -- once
     # here, before trainer.train(), with every configured knob and a
@@ -611,6 +678,7 @@ def main() -> None:
     started_at = datetime.now().isoformat()
     run_metadata: dict[str, object] = {
         "arm": arm_name,
+        "trainer": trainer_kind,
         "seed": seed,
         "model": model_name,
         "dataset_size": len(rows),
@@ -636,7 +704,7 @@ def main() -> None:
         "tau_p": tau_p,
         "kappa": kappa,
         "loss_type": loss_type,
-        "pair_loss_weight": pair_loss_weight,
+        "pair_loss_weight": pair_loss_weight if conpo else None,
         "kl_beta": kl_beta,
         # RUN_VLLM_IS_MODE / RUN_KL_CLAMP / RUN_RESAMPLE_ZERO_STD /
         # RUN_RESAMPLE_MAX_ROUNDS / RUN_TOKEN_LOGRATIO_CLAMP (K2/K4/K5/K6,
@@ -649,19 +717,19 @@ def main() -> None:
         # re-parsed here, since main() never binds their raw env values to a
         # local variable the way it does for loss_type/pair_loss_weight.
         "vllm_is_mode": vllm_is_mode or None,
-        "kl_clamp": trainer._kl_clamp,
-        "resample_zero_std": trainer._resample_zero_std,
-        "resample_max_rounds": trainer._resample_max_rounds,
-        "token_logratio_clamp": trainer._token_logratio_clamp,
+        "kl_clamp": trainer._kl_clamp if conpo else None,
+        "resample_zero_std": trainer._resample_zero_std if conpo else None,
+        "resample_max_rounds": trainer._resample_max_rounds if conpo else None,
+        "token_logratio_clamp": trainer._token_logratio_clamp if conpo else None,
         # RUN_SKIP_STEP_ON_GAP (K2, devbox 2026-09-15): same "read back off
         # the trainer instance" pattern as kl_clamp/token_logratio_clamp
         # above -- no config.py counterpart, no GRPOConfig field.
-        "skip_step_on_gap": trainer._skip_step_on_gap_bar,
+        "skip_step_on_gap": trainer._skip_step_on_gap_bar if conpo else None,
         # RUN_PAIR_OBJECTIVE / RUN_POS_ANCHOR_WEIGHT (K8, devbox 2026-09-14):
         # same "read back off the trainer instance" pattern as the four
         # knobs above.
-        "pair_objective": trainer._pair_objective,
-        "pos_anchor_weight": trainer._pos_anchor_weight,
+        "pair_objective": trainer._pair_objective if conpo else None,
+        "pos_anchor_weight": trainer._pos_anchor_weight if conpo else None,
         # RUN_PAIR_SCALE_AUTO (fix devbox 2026-09-14): pair_scale_auto is
         # read back off the trainer instance (same pattern as above);
         # pair_scale_factor is the steady-state divisor conpo/trainer.py's
@@ -669,8 +737,10 @@ def main() -> None:
         # when off) -- the per-micro-batch exact value is also on record via
         # last_loss_stats/the trainer's own metrics logging (stats's
         # "resp_pair_scale").
-        "pair_scale_auto": trainer._pair_scale_auto,
-        "pair_scale_factor": (1.0 / gradient_accumulation_steps) if trainer._pair_scale_auto else 1.0,
+        "pair_scale_auto": trainer._pair_scale_auto if conpo else None,
+        "pair_scale_factor": (
+            ((1.0 / gradient_accumulation_steps) if trainer._pair_scale_auto else 1.0) if conpo else None
+        ),
         "row_limit": row_limit or None,
         # RUN_RESUME (devbox 2026-09-11): the checkpoint step this run
         # resumed from, or None for a fresh run.
@@ -693,17 +763,17 @@ def main() -> None:
         # RUN_VLLM_PUSH_ONCE_PER_STEP (L1, devbox perf pass): whether this
         # run pushed the policy into vLLM once per step (default) instead of
         # before every generate() call.
-        "vllm_push_once_per_step": vllm_push_once_per_step,
+        "vllm_push_once_per_step": vllm_push_once_per_step if conpo else None,
         # RUN_REPAIR_BATCH_GENERATION (L2, devbox perf pass): whether this
         # run merged every failing group's forward-repair engine.generate
         # calls into one call per repair round for the whole step (default)
         # instead of one repair_failed_group call per group.
-        "repair_batch_generation": repair_batch_generation,
+        "repair_batch_generation": repair_batch_generation if conpo else None,
         # RUN_CACHE_REF_LOGPROBS (L3, devbox perf pass): whether this run
         # cached an edge's x^-A reference log-probs on first draw (default)
         # instead of recomputing them from the reference model on every
         # replay (conpo/trainer.py's _prompt_margins).
-        "cache_ref_logprobs": cache_ref_logprobs,
+        "cache_ref_logprobs": cache_ref_logprobs if conpo else None,
         # B1 (audit 2026-09-14): VLLMColocateEngine.generate no longer
         # forwards a per-call seed into vLLM's generation_kwargs (see
         # conpo/engine.py) -- repair candidates come from vLLM's own
@@ -724,25 +794,33 @@ def main() -> None:
     # training, so nothing sits unscored in trainer.pending_queue when the
     # run finishes normally (the other three -- period, queue size, and
     # before a checkpoint save -- run inside ConPOTrainer itself).
-    trainer.flush_pending_veto()
-    # H6 part B: persists RUN_OUT_DIR/pair_stats.json at train end too (a
-    # no-op when RUN_MULTI is off, save_pair_stats's own contract).
-    trainer.save_pair_stats()
+    if conpo:
+        trainer.flush_pending_veto()
+        # H6 part B: persists RUN_OUT_DIR/pair_stats.json at train end too (a
+        # no-op when RUN_MULTI is off, save_pair_stats's own contract).
+        trainer.save_pair_stats()
 
     trainer.save_model(str(out_dir / "adapter"))
     edge_buffer.save(out_dir / "edges.jsonl")
     (out_dir / "family_stats.json").write_text(json.dumps(stats.snapshot(), indent=2), encoding="utf-8")
 
-    pass1_info: dict[str, object] = {"pass1_step": pass1_callback.pass1_step, "fired": pass1_callback.fired}
-    if not pass1_callback.fired:
-        # Token budget stopped the run before the first full pass: record
-        # how much of it completed instead of the (never-written) pass1.json.
-        pass1_info["fraction_completed"] = min(1.0, trainer.state.global_step / pass1_callback.pass1_step)
+    # RUN_TRAINER=trl: no Pass1CheckpointCallback (see its construction
+    # above), so pass1 is recorded as None; tokens_generated stays 0 since
+    # only ConPOTrainer feeds the TokenMeter.
+    pass1_info: dict[str, object] | None = None
+    if pass1_callback is not None:
+        pass1_info = {"pass1_step": pass1_callback.pass1_step, "fired": pass1_callback.fired}
+        if not pass1_callback.fired:
+            # Token budget stopped the run before the first full pass: record
+            # how much of it completed instead of the (never-written) pass1.json.
+            pass1_info["fraction_completed"] = min(1.0, trainer.state.global_step / pass1_callback.pass1_step)
     # RUN_RESUME: cumulative_wall_seconds() adds this process's own elapsed
     # time (since trainer construction) on top of whatever a prior process's
     # conpo_state.json recorded, so actual_h100h reflects the whole run
-    # across every resumed process, not only this one.
-    wall_hours = trainer.cumulative_wall_seconds() / 3600
+    # across every resumed process, not only this one. The stock trainer
+    # keeps no such state, so its figure covers this process alone.
+    wall_seconds = trainer.cumulative_wall_seconds() if conpo else time.monotonic() - wall_start
+    wall_hours = wall_seconds / 3600
     run_metadata.update(
         {
             "pass1": pass1_info,

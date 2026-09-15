@@ -1222,3 +1222,240 @@ def test_main_tiny_done_message_reports_completed_steps_not_max_steps(
     out = capsys.readouterr().out
     assert "done: 2 step(s)" in out
     assert "done: 4 step(s)" not in out
+
+
+# ---------------------------------------------------------------------------
+# scripts/train.py: RUN_TRAINER (K3, devbox 2026-09-15): "conpo" (default)
+# trains through ConPOTrainer, "trl" through the stock trl.GRPOTrainer with
+# the same model, dataset, reward function, GRPOConfig, PEFT config and
+# plain callbacks -- the control that separates "TRL itself" from "our
+# subclass" in the BBH tracking_shuffled_objects collapse.
+# ---------------------------------------------------------------------------
+
+
+def _write_two_constraint_rows(path: Path, n: int) -> None:
+    """Rows with two constraints, so the additive reward can take 0.5."""
+    sentences = ["Do not use any commas.", "Finish your response with the exact phrase Done."]
+    constraints = [
+        {"iid": "punctuation:no_comma", "kwargs": {}},
+        {"iid": "startend:end_checker", "kwargs": {"end_phrase": "Done."}},
+    ]
+    with path.open("w", encoding="utf-8") as f:
+        for i in range(n):
+            base = f"Explain topic number {i}."
+            row = {
+                "key": f"row-{i}",
+                "base_prompt": base,
+                "prompt": f"{base} {' '.join(sentences)}",
+                "sentences": sentences,
+                "constraints": constraints,
+                "english": True,
+                "num_constraints": 2,
+            }
+            f.write(json.dumps(row) + "\n")
+
+
+def _set_tiny_env(monkeypatch: pytest.MonkeyPatch, out_dir: Path, arm: str, steps: int) -> None:
+    monkeypatch.setenv("RUN_ARM", arm)
+    monkeypatch.setenv("RUN_STEPS", str(steps))
+    monkeypatch.setenv("RUN_SAVE_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.delenv("RUN_RESUME", raising=False)
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+
+_TRL_INACTIVE_METADATA_FIELDS = (
+    "kl_clamp",
+    "vllm_push_once_per_step",
+    "cache_ref_logprobs",
+    "repair_batch_generation",
+    "skip_step_on_gap",
+    "token_logratio_clamp",
+    "pair_loss_weight",
+    "pair_objective",
+    "pair_scale_auto",
+    "pair_scale_factor",
+    "pos_anchor_weight",
+    "resample_zero_std",
+    "resample_max_rounds",
+)
+
+
+@pytest.mark.parametrize("run_trainer", [None, "conpo"])
+def test_main_tiny_run_trainer_unset_or_conpo_builds_conpo_trainer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_trainer: str | None
+) -> None:
+    """RUN_TRAINER unset and "conpo" take the byte-identical ConPOTrainer path:
+    the stock GRPOTrainer is never constructed, mechanism.jsonl (a
+    ConPOTrainer-only artefact) is written, and run_metadata.json records
+    trainer "conpo" with every ConPOTrainer knob still populated."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    def _forbid_stock(*args: object, **kwargs: object) -> None:
+        raise AssertionError("stock GRPOTrainer constructed on the conpo path")
+
+    monkeypatch.setattr(train_script, "GRPOTrainer", _forbid_stock)
+
+    out_dir = tmp_path / "out"
+    _set_tiny_env(monkeypatch, out_dir, arm="ifrlvr", steps=1)
+    if run_trainer is None:
+        monkeypatch.delenv("RUN_TRAINER", raising=False)
+    else:
+        monkeypatch.setenv("RUN_TRAINER", run_trainer)
+
+    train_script.main()
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["trainer"] == "conpo"
+    assert metadata["kl_clamp"] == pytest.approx(config.KL_CLAMP)
+    assert metadata["pair_objective"] == "sequence"
+    assert metadata["pass1"]["pass1_step"] == 4
+    assert (out_dir / "mechanism.jsonl").exists()
+    assert (out_dir / "checkpoint-1" / "conpo_state.json").exists()
+
+
+def test_main_tiny_run_trainer_trl_runs_stock_grpo_saves_adapter_checkpoint_and_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """RUN_TRAINER=trl with RUN_ARM=ifrlvr: main() --tiny runs the stock
+    trl.GRPOTrainer to completion on CPU, saves checkpoint-1 in the same
+    PEFT adapter layout ConPOTrainer's checkpoints use (adapter_config.json,
+    read by local/harvest.sh, local/eval.sh, local/retention.sh) plus the
+    final adapter/ dir, writes no ConPOTrainer artefact (mechanism.jsonl,
+    conpo_state.json), records trainer "trl" with the inactive knobs null in
+    run_metadata.json, prints the inactive-knob line, and resumes through
+    RUN_RESUME=1 from checkpoint-1 to step 2."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    class _ForbiddenConPOTrainer(ConPOTrainer):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("ConPOTrainer constructed under RUN_TRAINER=trl")
+
+    monkeypatch.setattr(train_script, "ConPOTrainer", _ForbiddenConPOTrainer)
+
+    out_dir = tmp_path / "out"
+    _set_tiny_env(monkeypatch, out_dir, arm="ifrlvr", steps=1)
+    monkeypatch.setenv("RUN_TRAINER", "trl")
+    monkeypatch.setenv("RUN_KL_CLAMP", "40")
+    monkeypatch.setenv("RUN_PAIR_OBJECTIVE", "span_local")
+
+    train_script.main()
+
+    out = capsys.readouterr().out
+    assert "RUN_TRAINER=trl" in out
+    assert "RUN_KL_CLAMP" in out
+    assert "done: 1 step(s)" in out
+    checkpoint_1 = out_dir / "checkpoint-1"
+    assert (checkpoint_1 / "adapter_config.json").exists()
+    assert (checkpoint_1 / "trainer_state.json").exists()
+    assert not (checkpoint_1 / "conpo_state.json").exists()
+    assert (out_dir / "adapter" / "adapter_config.json").exists()
+    assert not (out_dir / "mechanism.jsonl").exists()
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["trainer"] == "trl"
+    assert metadata["arm"] == "ifrlvr"
+    assert metadata["status"] == "finished"
+    assert metadata["pass1"] is None
+    assert metadata["resumed_from_step"] is None
+    for field_name in _TRL_INACTIVE_METADATA_FIELDS:
+        assert metadata[field_name] is None, field_name
+    # GRPOConfig-reaching knobs keep working.
+    assert metadata["loss_type"] == config.LOSS_TYPE
+    assert metadata["kl_beta"] == pytest.approx(config.KL_BETA)
+    assert metadata["seed"] == 0
+
+    monkeypatch.setenv("RUN_STEPS", "2")
+    monkeypatch.setenv("RUN_RESUME", "1")
+    train_script.main()
+
+    assert "done: 2 step(s)" in capsys.readouterr().out
+    assert (out_dir / "checkpoint-2" / "adapter_config.json").exists()
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["trainer"] == "trl"
+    assert metadata["resumed_from_step"] == 1
+
+
+@pytest.mark.parametrize("arm", ["full", "forward_only", "reverse_only"])
+def test_main_run_trainer_trl_refuses_pair_arms_before_loading_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str
+) -> None:
+    def _fail_loader(*args: object, **kwargs: object) -> tuple[object, object]:
+        raise AssertionError("model loaded before the RUN_TRAINER arm guard")
+
+    monkeypatch.setattr(train_script, "_real_model_and_tokenizer", _fail_loader)
+    monkeypatch.setattr(train_script, "_tiny_model_and_tokenizer", _fail_loader)
+
+    _set_tiny_env(monkeypatch, tmp_path / "out", arm=arm, steps=1)
+    monkeypatch.setenv("RUN_TRAINER", "trl")
+
+    with pytest.raises(SystemExit) as exc_info:
+        train_script.main()
+    message = str(exc_info.value)
+    assert "RUN_TRAINER=trl" in message
+    assert arm in message
+    assert "ifrlvr" in message
+
+
+def test_main_run_trainer_rejects_unknown_value(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_tiny_env(monkeypatch, tmp_path / "out", arm="ifrlvr", steps=1)
+    monkeypatch.setenv("RUN_TRAINER", "vanilla")
+    with pytest.raises(SystemExit) as exc_info:
+        train_script.main()
+    assert "RUN_TRAINER" in str(exc_info.value)
+
+
+def test_reward_function_identical_under_both_trainers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reward callable each trainer receives is the same underlying
+    function (ConPOTrainer.reward_additive, bound to a rows_by_key holder on
+    the stock path) and scores the same completions to the same numbers:
+    1.0, 0.5 (one of two constraints) and 0.0 (empty) under the additive
+    IF-RLVR reward."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_two_constraint_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    captured: dict[str, object] = {}
+
+    class _CapturingConPO(ConPOTrainer):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            captured["conpo"] = self.reward_funcs[0]
+
+    class _CapturingStock(train_script.GRPOTrainer):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            captured["trl"] = self.reward_funcs[0]
+
+    monkeypatch.setattr(train_script, "ConPOTrainer", _CapturingConPO)
+    monkeypatch.setattr(train_script, "GRPOTrainer", _CapturingStock)
+
+    _set_tiny_env(monkeypatch, tmp_path / "out_conpo", arm="ifrlvr", steps=1)
+    monkeypatch.setenv("RUN_TRAINER", "conpo")
+    train_script.main()
+    monkeypatch.setenv("RUN_OUT_DIR", str(tmp_path / "out_trl"))
+    monkeypatch.setenv("RUN_TRAINER", "trl")
+    train_script.main()
+
+    conpo_reward = captured["conpo"]
+    trl_reward = captured["trl"]
+    assert conpo_reward.__func__ is ConPOTrainer.reward_additive  # type: ignore[attr-defined]
+    assert trl_reward.func is ConPOTrainer.reward_additive  # type: ignore[attr-defined]
+    completions = [
+        [{"role": "assistant", "content": "No commas anywhere here Done."}],
+        [{"role": "assistant", "content": "Has, a comma Done."}],
+        [{"role": "assistant", "content": ""}],
+    ]
+    keys = ["row-0", "row-1", "row-2"]
+    expected = [1.0, 0.5, 0.0]
+    assert conpo_reward(completions=completions, key=keys) == expected  # type: ignore[operator]
+    assert trl_reward(completions=completions, key=keys) == expected  # type: ignore[operator]
