@@ -20,6 +20,7 @@ def sequence_logprobs_with_tokens(
     attention_mask: torch.LongTensor,
     completion_mask: torch.LongTensor,
     chunk_size: int = 512,
+    temperature: float = 1.0,
 ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
     """sequence_logprobs, plus the per-token values it sums and discards.
 
@@ -32,6 +33,13 @@ def sequence_logprobs_with_tokens(
     (shape (B, L - 1)) -- RUN_TOKEN_LOGRATIO_CLAMP (K6, conpo/trainer.py)
     needs it to clamp a policy-minus-reference log-ratio token by token
     before summing, which the scalar sum below cannot support.
+
+    `temperature` (RUN_PAIR_TEMPERATURE, audit F4, conpo/trainer.py's
+    score_response) divides the logits before the log-softmax, the same
+    place TRL divides by config.TEMPERATURE for the GRPO/KL terms
+    (trl grpo_trainer.py's `logits.div_(self.temperature)`) -- this pair
+    path computed q_theta from raw (temperature 1.0) logits otherwise.
+    Default 1.0 is a no-op, byte-identical to before this parameter existed.
     """
     logits = model(input_ids=input_ids, attention_mask=attention_mask).logits  # (B, L, V)
 
@@ -43,7 +51,10 @@ def sequence_logprobs_with_tokens(
     chunks = []
     for start in range(0, seq_len, chunk_size):
         end = min(start + chunk_size, seq_len)
-        chunk_logp = F.log_softmax(shift_logits[:, start:end, :], dim=-1)
+        chunk_logits = shift_logits[:, start:end, :]
+        if temperature != 1.0:
+            chunk_logits = chunk_logits / temperature
+        chunk_logp = F.log_softmax(chunk_logits, dim=-1)
         token_logp = chunk_logp.gather(-1, shift_labels[:, start:end].unsqueeze(-1)).squeeze(-1)
         chunks.append(token_logp * shift_mask[:, start:end])
     token_logp = torch.cat(chunks, dim=1)
@@ -56,6 +67,7 @@ def sequence_logprobs(
     attention_mask: torch.LongTensor,
     completion_mask: torch.LongTensor,
     chunk_size: int = 512,
+    temperature: float = 1.0,
 ) -> torch.FloatTensor:
     """Sum log pi_theta(y_t | x, y_<t) over tokens where completion_mask is 1.
 
@@ -63,9 +75,11 @@ def sequence_logprobs(
     the sequence axis so no (B, L, vocab) fp32 tensor beyond one chunk is
     ever materialised. Standard causal shift: logits at position t predict
     the token at position t + 1, so completion_mask[:, 1:] gates which
-    predicted tokens count.
+    predicted tokens count. `temperature`: see sequence_logprobs_with_tokens.
     """
-    return sequence_logprobs_with_tokens(model, input_ids, attention_mask, completion_mask, chunk_size)[0]
+    return sequence_logprobs_with_tokens(model, input_ids, attention_mask, completion_mask, chunk_size, temperature)[
+        0
+    ]
 
 
 def completion_lengths(completion_mask: torch.LongTensor) -> torch.LongTensor:

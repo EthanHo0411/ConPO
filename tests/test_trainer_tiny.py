@@ -85,6 +85,22 @@ def _make_row(key: str, base: str) -> PoolRow:
 ROW_A = _make_row("edge-row-a", "Explain how gravity works.")
 ROW_B = _make_row("edge-row-b", "Describe how photosynthesis works.")
 ROW_C = _make_row("edge-row-c", "Summarize the water cycle.")
+
+# No constraints at all: feasible((), response) is all(()) == True for ANY
+# response, "" included -- the literal case RUN_EMPTY_REWARD_GUARD guards
+# (review M5's "14% of prompts whose constraints are all satisfied by an
+# empty string"). ROW_A/ROW_B's real NO_COMMA/LOWERCASE constraints do NOT
+# vacuously pass "" (LOWERCASE's islower() is False on an empty string), so
+# they cannot stand in for that case.
+ROW_NO_CONSTRAINTS = PoolRow(
+    key="edge-row-no-constraints",
+    base_prompt="Say hello.",
+    prompt="Say hello.",
+    sentences=(),
+    constraints=(),
+    english=True,
+    num_constraints=0,
+)
 ROW_D = _make_row("edge-row-d", "Outline the rock cycle.")
 
 
@@ -379,6 +395,105 @@ def test_ifrlvr_arm_one_step_and_reward_additive(tmp_path: Path) -> None:
     # (NO_COMMA fails) -> 1 of 2 constraints satisfied -> 0.5.
     scores = trainer.reward_additive(completions=["hello, world"], key=[ROW_A.key])
     assert scores == [0.5]
+
+
+# ---------------------------------------------------------------------------
+# RUN_REWARD (devbox 2026-09-15): overrides which RL reward function trains
+# the policy, independent of arm.reward. Reuses _token_logratio_clamp_trainer
+# (defined further below), whose arm is ArmSpec(reward="conjunctive", ...).
+# ---------------------------------------------------------------------------
+
+
+def test_reward_name_unset_defaults_to_arm_reward_and_binds_that_function(tmp_path: Path) -> None:
+    trainer = _token_logratio_clamp_trainer(tmp_path)
+    assert trainer.reward_name == "conjunctive"
+    assert trainer.reward_funcs[0].__func__ is ConPOTrainer.reward_conjunctive
+
+
+def test_reward_name_env_override_reaches_trainer_and_picks_other_function(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_REWARD=additive on an arm whose own default is "conjunctive"
+    overrides self.reward_name and the bound reward_funcs entry."""
+    monkeypatch.setenv("RUN_REWARD", "additive")
+    trainer = _token_logratio_clamp_trainer(tmp_path)
+    assert trainer.reward_name == "additive"
+    assert trainer.reward_funcs[0].__func__ is ConPOTrainer.reward_additive
+
+
+# ---------------------------------------------------------------------------
+# RUN_EMPTY_REWARD_GUARD (review M5): reward_conjunctive scores an empty or
+# whitespace-only completion 0.0 instead of running it through feasible(),
+# mirroring reward_additive's own guard. ROW_NO_CONSTRAINTS's empty
+# constraints tuple is vacuously satisfied by "" (feasible((), r) ==
+# all(()) == True for any r), so the unset case proves the pre-existing
+# defect (empty scores 1.0) stays byte-identical. ROW_A's real
+# NO_COMMA/LOWERCASE constraints double as the "non-empty response is
+# unaffected by the guard" check ("hello, world" fails NO_COMMA regardless).
+# ---------------------------------------------------------------------------
+
+
+def test_reward_conjunctive_empty_guard_unset_is_byte_identical(tmp_path: Path) -> None:
+    trainer = _token_logratio_clamp_trainer(tmp_path)
+    trainer.rows_by_key[ROW_NO_CONSTRAINTS.key] = ROW_NO_CONSTRAINTS
+    assert trainer._empty_reward_guard is False
+
+    scores = trainer.reward_conjunctive(
+        completions=["", "  \n", "hello, world"],
+        key=[ROW_NO_CONSTRAINTS.key, ROW_NO_CONSTRAINTS.key, ROW_A.key],
+    )
+    # "": no constraints to fail -> 1.0 (the pre-existing defect).
+    # "  \n": whitespace-only, same as "".
+    # "hello, world" against ROW_A: has a comma -> fails NO_COMMA -> 0.0.
+    assert scores == [1.0, 1.0, 0.0]
+
+
+def test_reward_conjunctive_empty_guard_set_zeroes_empty_completions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUN_EMPTY_REWARD_GUARD", "1")
+    trainer = _token_logratio_clamp_trainer(tmp_path)
+    trainer.rows_by_key[ROW_NO_CONSTRAINTS.key] = ROW_NO_CONSTRAINTS
+    assert trainer._empty_reward_guard is True
+
+    scores = trainer.reward_conjunctive(
+        completions=["", "  \n", "hello world"],
+        key=[ROW_NO_CONSTRAINTS.key, ROW_NO_CONSTRAINTS.key, ROW_A.key],
+    )
+    # "hello world" against ROW_A: no comma, all lowercase -> both
+    # constraints pass -> 1.0, proving the guard leaves a non-empty
+    # response's scoring unchanged.
+    assert scores == [0.0, 0.0, 1.0]
+
+
+# ---------------------------------------------------------------------------
+# RUN_PAIR_TEMPERATURE (audit F4): score_response divides its logits by this
+# value before the log-softmax, for both the policy and the reference
+# scoring. Tested directly against conpo/losses.py's own temperature
+# parameter, independent of the env-reading plumbing (covered separately in
+# tests/test_train_knobs.py).
+# ---------------------------------------------------------------------------
+
+
+def test_score_response_pair_temperature_matches_manual_scaling_and_changes_logp() -> None:
+    model, tokenizer = _tiny_model_and_tokenizer()
+    model.eval()
+    prompt_text, response = ROW_A.prompt, "hello world"
+
+    with torch.no_grad():
+        logp_default, length_default = score_response(model, tokenizer, prompt_text, response)
+        logp_temp, length_temp = score_response(model, tokenizer, prompt_text, response, temperature=0.8)
+
+        input_ids, attention_mask, completion_mask = conpo_trainer_module._tokenize_prompt_response(
+            tokenizer, prompt_text, response
+        )
+        from conpo import losses
+
+        expected = losses.sequence_logprobs(model, input_ids, attention_mask, completion_mask, temperature=0.8)[0]
+
+    assert length_default == length_temp
+    assert not math.isclose(logp_default.item(), logp_temp.item(), rel_tol=1e-4)
+    assert torch.allclose(logp_temp, expected, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

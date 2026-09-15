@@ -97,6 +97,62 @@ def test_age_cap_retirement() -> None:
     assert len(buf) == 2
 
 
+# ---------------------------------------------------------------------------
+# RUN_EDGE_DEDUPE (audit F6, devbox 2026-09-15): push() refuses an exact
+# (prompt, y_plus, y_minus, direction) duplicate of an already-admitted edge.
+# _make_edge's default prompt/y_plus/y_minus text is identical across every
+# call (only prompt_id/created_update/families vary), so two _make_edge(...)
+# calls that share `direction` always share the dedupe key too.
+# ---------------------------------------------------------------------------
+
+
+def test_push_returns_true_and_dedupe_off_by_default() -> None:
+    buf = EdgeBuffer(capacity=1000, age_cap=1000)
+    assert buf.dedupe is False
+    assert buf.push(_make_edge(direction="forward", created_update=0, prompt_id="a")) is True
+
+
+def test_push_dedupe_off_allows_exact_duplicate_key() -> None:
+    """Byte-identical to before RUN_EDGE_DEDUPE existed: two edges sharing
+    (prompt, y_plus, y_minus, direction) both get admitted when dedupe is off."""
+    buf = EdgeBuffer(capacity=1000, age_cap=1000)
+    assert buf.push(_make_edge(direction="forward", created_update=0, prompt_id="a")) is True
+    assert buf.push(_make_edge(direction="forward", created_update=1, prompt_id="b")) is True
+    assert len(buf) == 2
+
+
+def test_push_dedupe_on_refuses_exact_duplicate_key() -> None:
+    buf = EdgeBuffer(capacity=1000, age_cap=1000, dedupe=True)
+    assert buf.push(_make_edge(direction="forward", created_update=0, prompt_id="a")) is True
+    assert buf.push(_make_edge(direction="forward", created_update=1, prompt_id="b")) is False
+    assert len(buf) == 1
+
+
+def test_push_dedupe_on_allows_different_direction() -> None:
+    """The dedupe key includes direction, so a forward and a reverse edge
+    over the identical (prompt, y_plus, y_minus) text are not duplicates."""
+    buf = EdgeBuffer(capacity=1000, age_cap=1000, dedupe=True)
+    assert buf.push(_make_edge(direction="forward", created_update=0)) is True
+    assert buf.push(_make_edge(direction="reverse", created_update=0)) is True
+    assert len(buf) == 2
+
+
+def test_push_dedupe_key_survives_fifo_eviction() -> None:
+    """"Already admitted" is a run-lifetime fact, not "still in the buffer":
+    a key stays refused even after the original edge that admitted it has
+    aged out of `_edges`."""
+    buf = EdgeBuffer(capacity=1000, age_cap=1, dedupe=True)
+    assert buf.push(_make_edge(direction="forward", created_update=0, prompt_id="a")) is True
+
+    # A later, distinct-key edge ages the first one out (age_cap=1, age 5 > 1).
+    assert buf.push(_make_edge(direction="reverse", created_update=5, prompt_id="filler")) is True
+    assert len(buf) == 1  # the forward edge retired; only "filler" remains
+
+    duplicate = _make_edge(direction="forward", created_update=5, prompt_id="b")
+    assert buf.push(duplicate) is False  # same key still refused though the original is gone
+    assert len(buf) == 1
+
+
 def test_balanced_sampling_counts() -> None:
     buf = EdgeBuffer(capacity=1000, age_cap=1000)
     for i in range(30):

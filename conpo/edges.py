@@ -124,11 +124,27 @@ class EdgeBuffer:
     is ever checked.
     """
 
-    def __init__(self, capacity: int = config.BUFFER_SIZE, age_cap: int = config.BUFFER_AGE_CAP) -> None:
+    def __init__(
+        self,
+        capacity: int = config.BUFFER_SIZE,
+        age_cap: int = config.BUFFER_AGE_CAP,
+        dedupe: bool = False,
+    ) -> None:
         self.capacity = capacity
         self.age_cap = age_cap
+        self.dedupe = dedupe
         self._edges: deque[Edge] = deque()
         self._current_update = 0
+        # RUN_EDGE_DEDUPE (audit F6, devbox 2026-09-15): keys of every edge
+        # ever admitted this run (not only those still in `_edges` -- FIFO/
+        # age-cap eviction must not let a duplicate back in), so
+        # deterministic corruption operators that re-admit the same pair
+        # from the same buffered response are refused after the first.
+        # Empty and unused when dedupe is off.
+        # ponytail: unbounded across a run; fine at BUFFER_SIZE-scale
+        # multiplicities (measured up to 12), revisit if a very long run
+        # ever makes this set itself a memory concern.
+        self._admitted_keys: set[tuple[str, str, str, str]] = set()
 
     def __len__(self) -> int:
         return len(self._edges)
@@ -141,11 +157,29 @@ class EdgeBuffer:
         while self._edges and self.age(self._edges[0], self._current_update) > self.age_cap:
             self._edges.popleft()
 
-    def push(self, edge: Edge) -> None:
+    @staticmethod
+    def _dedupe_key(edge: Edge) -> tuple[str, str, str, str]:
+        return (edge.prompt, edge.y_plus, edge.y_minus, edge.direction)
+
+    def push(self, edge: Edge) -> bool:
+        """Admit `edge`, evicting stale ones first.
+
+        Returns True if admitted, False if RUN_EDGE_DEDUPE (self.dedupe) is
+        on and `edge`'s (prompt, y_plus, y_minus, direction) key was already
+        admitted this run -- the edge is then not appended at all. Always
+        True when dedupe is off (default), byte-identical to before this
+        parameter existed.
+        """
+        if self.dedupe:
+            key = self._dedupe_key(edge)
+            if key in self._admitted_keys:
+                return False
+            self._admitted_keys.add(key)
         self._retire(edge.created_update)
         self._edges.append(edge)
         while len(self._edges) > self.capacity:
             self._edges.popleft()
+        return True
 
     def sample(self, n: int, current_update: int, rng: random.Random, balanced: bool = True) -> list[Edge]:
         """Draw at most `n` edges, retiring stale ones first.
