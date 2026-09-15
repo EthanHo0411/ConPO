@@ -31,23 +31,25 @@ else
 fi
 
 echo "== conda"
-if ! command -v conda > /dev/null; then
-  if [ -x "$HOME/miniconda3/bin/conda" ]; then
-    export PATH="$HOME/miniconda3/bin:$PATH"
-  else
-    echo "conda not found; installing Miniconda into $HOME/miniconda3"
-    curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o "$HOME/miniconda-installer.sh"
-    bash "$HOME/miniconda-installer.sh" -b -p "$HOME/miniconda3"
-    rm -f "$HOME/miniconda-installer.sh"
-    export PATH="$HOME/miniconda3/bin:$PATH"
-  fi
-fi
+install_miniforge() {
+  echo "installing Miniforge (conda-forge only, no Anaconda Terms of Service) into $HOME/miniforge3"
+  curl -fsSL https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -o "$HOME/miniforge-installer.sh"
+  bash "$HOME/miniforge-installer.sh" -b -p "$HOME/miniforge3"
+  rm -f "$HOME/miniforge-installer.sh"
+  export PATH="$HOME/miniforge3/bin:$PATH"
+}
+if [ -x "$HOME/miniforge3/bin/conda" ]; then export PATH="$HOME/miniforge3/bin:$PATH"; fi
+if ! command -v conda > /dev/null; then install_miniforge; fi
 conda --version
 echo "== conda env $ENV_NAME"
 if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
   echo "env $ENV_NAME exists, skipping create"
-else
-  conda env create -f environment.yml -n "$ENV_NAME"
+elif ! conda env create -f environment.yml -n "$ENV_NAME" --override-channels -c conda-forge; then
+  # An existing Anaconda/Miniconda install fails the Terms-of-Service check on its default channels (CondaToSNonInteractiveError);
+  # fall back to a private Miniforge, which never consults those channels.
+  echo "conda env create failed with the installed conda; retrying with a private Miniforge"
+  install_miniforge
+  conda env create -f environment.yml -n "$ENV_NAME" --override-channels -c conda-forge
 fi
 conda run -n "$ENV_NAME" python -c "import torch, vllm, trl, transformers, peft; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'available', torch.cuda.is_available(), '| vllm', vllm.__version__, '| trl', trl.__version__, '| transformers', transformers.__version__, '| peft', peft.__version__)"
 if [ "${1:-}" = "--env-only" ]; then exit 0; fi

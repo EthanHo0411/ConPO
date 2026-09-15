@@ -1,7 +1,7 @@
 # Conda equivalent of the devbox uv environment (uv.lock, extras cu130 + cluster + dev), 2026-09-15.
 # Python 3.12.11, torch 2.11.0+cu130, vllm 0.26.0, trl 1.9.2, transformers 5.14.1, peft 0.20.0.
 # Requires an NVIDIA driver >= 580 (CUDA 13 wheels); check `nvidia-smi` on the target first.
-# Create:  conda env create -f environment.yml -n conpo   (or -p <prefix>)
+# Create:  conda env create -f environment.yml -n conpo --override-channels -c conda-forge   (Miniforge or any conda; Anaconda defaults need no ToS this way)
 # Verify:  conda run -n conpo python -c "import torch, vllm, trl; print(torch.__version__, torch.cuda.is_available(), vllm.__version__)"
 name: conpo
 channels:
