@@ -24,7 +24,11 @@ Env knobs (config.env style; a CLI flag passed explicitly still wins):
                         model load. Unset = all tasks.
   RETENTION_BENCHMARKS  the --benchmarks default (comma-separated subset of
                         gsm8k,mmlu,bbh).
-"retention_settings" in the JSON records the four resolved values, so a
+  RETENTION_LENIENT     "1" turns on conpo.retention.score_bbh's lenient
+                        fallback (see its docstring); unset/"" = strict,
+                        byte-identical. Any other value exits before any
+                        model load.
+"retention_settings" in the JSON records the five resolved values, so a
 rerun under these knobs is distinguishable from a default run.
 """
 
@@ -43,7 +47,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 import eval_external  # noqa: E402 -- generate_greedy / _load_hf_engine / _generate_vllm live here
 
 from conpo import config
-from conpo.retention import RetentionRow, apply_bbh_suffix, bbh_suffix, extract_prediction, score
+from conpo.retention import RetentionRow, apply_bbh_suffix, bbh_suffix, extract_prediction, retention_lenient, score
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 BENCHMARKS = ("gsm8k", "mmlu", "bbh")
@@ -193,6 +197,7 @@ def main() -> None:
 
     benchmarks = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
     bbh_tasks = retention_bbh_tasks()
+    lenient = retention_lenient()  # resolved once, up front: SystemExit before any model load
     data_dir = Path(args.data_dir)
     rows_by_benchmark = {
         b: load_retention_rows(data_dir, b, args.limit, bbh_tasks if b == "bbh" else None) for b in benchmarks
@@ -231,6 +236,7 @@ def main() -> None:
         "max_tokens": args.max_tokens,
         "bbh_tasks": bbh_tasks,
         "benchmarks": benchmarks,
+        "lenient": lenient,
     }
     Path(args.out).write_text(json.dumps(out, indent=2), encoding="utf-8")
     print(f"wrote {args.out}")

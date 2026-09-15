@@ -71,6 +71,20 @@ def bbh_suffix() -> str:
     return config.env("RETENTION_SUFFIX", "") or BBH_SUFFIX
 
 
+def retention_lenient() -> bool:
+    """RETENTION_LENIENT env knob: unset or "" -> False (score_bbh stays
+    byte-identical to the strict scorer); "1" -> True (the lenient BBH
+    fallback in `score_bbh`). Any other value raises SystemExit, mirroring
+    scripts/eval_retention.py's RETENTION_MAX_TOKENS / RETENTION_BBH_TASKS
+    validation."""
+    raw = config.env("RETENTION_LENIENT", "")
+    if raw == "":
+        return False
+    if raw == "1":
+        return True
+    raise SystemExit(f"RETENTION_LENIENT must be '1' or unset, got {raw!r}")
+
+
 def apply_bbh_suffix(prompt: str) -> str:
     """`prompt` with a trailing BBH_SUFFIX swapped for `bbh_suffix()`; the
     "\\n\\n" separator and everything before it stay. Unchanged when the
@@ -249,6 +263,45 @@ def extract_bbh_prediction(response: str, group: str | None = None) -> str | Non
     return _normalise_bbh_line(last)
 
 
+_PAREN_OPTION_RE = re.compile(r"\(([A-Z])\)")
+
+
+def _lenient_paren_letter(response: str) -> str | None:
+    """RETENTION_LENIENT paren-target fallback: the letter inside the LAST
+    "(X)"-shaped option anywhere in `response` (not just its last line, as
+    `extract_bbh_prediction`'s last-line heuristic would see), None if none
+    is present. Covers chain-of-thought that commits to an option mid-
+    response and then keeps talking without repeating it verbatim on the
+    final line (e.g. "...so the ball is with (C)")."""
+    matches = list(_PAREN_OPTION_RE.finditer(response))
+    return matches[-1].group(1) if matches else None
+
+
+# ponytail: fixed phrase lists, not an NLI model -- add a phrase or swap in a
+# classifier if a new BBH task's phrasing slips past these.
+_BBH_NEGATIVE_RE = re.compile(
+    r"\b(?:does not tell the truth|doesn't tell the truth|is not telling the truth|is lying|lies|no)\b",
+    re.IGNORECASE,
+)
+_BBH_POSITIVE_RE = re.compile(
+    r"\b(?:tells the truth|is telling the truth|is truthful|yes)\b", re.IGNORECASE
+)
+
+
+def _lenient_yes_no(response: str) -> str | None:
+    """RETENTION_LENIENT yes/no-target fallback: "no" or "yes" by whichever
+    of `_BBH_NEGATIVE_RE` / `_BBH_POSITIVE_RE`'s last match starts later in
+    `response`'s last 300 characters, None if neither phrase occurs there."""
+    tail = response[-300:]
+    neg = list(_BBH_NEGATIVE_RE.finditer(tail))
+    pos = list(_BBH_POSITIVE_RE.finditer(tail))
+    neg_start = neg[-1].start() if neg else -1
+    pos_start = pos[-1].start() if pos else -1
+    if neg_start == -1 and pos_start == -1:
+        return None
+    return "no" if neg_start > pos_start else "yes"
+
+
 def _bracket_suffix_match(prediction: str, target: str) -> bool:
     """Labelled leniency -- Task F point 5, dyck_languages only (`target`
     made up solely of bracket/space characters). Qwen3-4B typically
@@ -278,24 +331,41 @@ def score_bbh(response: str, target: str, group: str | None = None) -> bool:
       is never accepted -- the model must have committed via a marker.
     - `target` made only of bracket/space characters: see
       `_bracket_suffix_match` (dyck_languages leniency).
+
+    RETENTION_LENIENT=1 (see `retention_lenient`) adds one more fallback,
+    tried only when `response` carries no `_extract_bbh_marker_prediction`
+    commitment (a marker still wins over the lenient fallback, same as it
+    wins over the plain last-line heuristic above): for a "(X)"-shaped
+    target, `_lenient_paren_letter`; for a yes/no target, `_lenient_yes_no`.
+    Unset or "", this function is byte-identical to the RETENTION_LENIENT-
+    unaware version.
     """
     prediction = extract_bbh_prediction(response, group) or ""
     norm_target = _normalise_bbh_line(target)
     if prediction == norm_target:
         return True
+    has_marker = _extract_bbh_marker_prediction(response) is not None
     if _PAREN_LETTER_RE.match(target.strip()):
         letter = norm_target.strip("()")
         if norm_target in prediction:
             return True
         if prediction == letter:
             return True
-        if _extract_bbh_marker_prediction(response) is not None:
+        if has_marker:
             tokens = prediction.split()
             if tokens and tokens[0] in (letter, f"({letter})"):
+                return True
+        elif retention_lenient():
+            lenient_letter = _lenient_paren_letter(response)
+            if lenient_letter is not None and lenient_letter.lower() == letter:
                 return True
         return False
     if target and all(ch in "()[]{}<> \t" for ch in target):
         return _bracket_suffix_match(prediction, target)
+    if retention_lenient() and not has_marker and norm_target in ("yes", "no"):
+        decision = _lenient_yes_no(response)
+        if decision is not None:
+            return decision == norm_target
     return False
 
 

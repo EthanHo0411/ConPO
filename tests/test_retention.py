@@ -17,6 +17,7 @@ from conpo.retention import (
     extract_gsm8k_prediction,
     extract_mmlu_prediction,
     extract_prediction,
+    retention_lenient,
     rows_from_bbh,
     rows_from_gsm8k,
     rows_from_mmlu,
@@ -31,7 +32,13 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import eval_retention  # noqa: E402
 
-RETENTION_ENV = ("RETENTION_SUFFIX", "RETENTION_MAX_TOKENS", "RETENTION_BBH_TASKS", "RETENTION_BENCHMARKS")
+RETENTION_ENV = (
+    "RETENTION_SUFFIX",
+    "RETENTION_MAX_TOKENS",
+    "RETENTION_BBH_TASKS",
+    "RETENTION_BENCHMARKS",
+    "RETENTION_LENIENT",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -720,4 +727,103 @@ def test_eval_retention_default_summary_is_unchanged_plus_retention_settings(
         "max_tokens": 512,
         "bbh_tasks": None,
         "benchmarks": ["gsm8k", "mmlu", "bbh"],
+        "lenient": False,
     }
+
+
+# --- RETENTION_LENIENT ---------------------------------------------------------
+
+
+def test_retention_lenient_unset_is_false() -> None:
+    assert retention_lenient() is False
+
+
+def test_retention_lenient_env_one_is_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RETENTION_LENIENT", "1")
+    assert retention_lenient() is True
+
+
+def test_retention_lenient_env_invalid_raises_systemexit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RETENTION_LENIENT", "yes")
+    with pytest.raises(SystemExit, match="RETENTION_LENIENT"):
+        retention_lenient()
+
+
+def test_eval_retention_lenient_env_invalid_exits_before_model_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = _fixture_rows(tmp_path)
+
+    def _no_load(model: str, adapter: str | None) -> object:
+        raise AssertionError("model load reached")
+
+    monkeypatch.setattr(eval_retention.eval_external, "_load_hf_engine", _no_load)
+    monkeypatch.setenv("RETENTION_LENIENT", "yes")
+    monkeypatch.setattr(
+        sys, "argv", ["eval_retention.py", "--data-dir", str(data_dir), "--out", str(tmp_path / "o.json")]
+    )
+    with pytest.raises(SystemExit, match="RETENTION_LENIENT"):
+        eval_retention.main()
+
+
+# score_bbh: strict unchanged with the knob unset (already covered by every score_bbh
+# assertion above, run under the autouse _clear_retention_env fixture) -- these three
+# cases are the lenient fallback's own behaviour, knob on.
+
+
+def test_score_bbh_lenient_paren_letter_anywhere_in_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The committed "(C)" sits mid-response, not on the last line, so strict's
+    # last-line containment check misses it.
+    response = "Tracking the throws: the ball is with (C).\n\nWait, let me double check my count once more."
+    assert score_bbh(response, "(C)") is False  # strict: last line has no "(c)"
+    monkeypatch.setenv("RETENTION_LENIENT", "1")
+    assert score_bbh(response, "(C)") is True
+
+
+def test_score_bbh_lenient_yes_no_negative_phrase(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = "Given the chain of claims, Elanor does not tell the truth in this scenario."
+    assert score_bbh(response, "No") is False  # strict: no marker, last line is not "no"
+    monkeypatch.setenv("RETENTION_LENIENT", "1")
+    assert score_bbh(response, "No") is True
+
+
+def test_score_bbh_lenient_yes_no_positive_phrase(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = "Given the chain of claims, Elanor tells the truth in this scenario."
+    assert score_bbh(response, "Yes") is False  # strict: no marker, last line is not "yes"
+    monkeypatch.setenv("RETENTION_LENIENT", "1")
+    assert score_bbh(response, "Yes") is True
+
+
+def test_score_bbh_lenient_yes_no_picks_later_phrase(monkeypatch: pytest.MonkeyPatch) -> None:
+    # "lies" (negative) precedes "is telling the truth" (positive) -- the later one wins.
+    response = "Crista says Jim lies, and Crista is telling the truth."
+    monkeypatch.setenv("RETENTION_LENIENT", "1")
+    assert score_bbh(response, "Yes") is True
+    assert score_bbh(response, "No") is False
+
+
+def test_score_bbh_lenient_marker_still_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    # "(A)" is mentioned early, but a "Final Answer:" marker commits to
+    # something else entirely -- a marker's presence must block the lenient
+    # paren-anywhere fallback, not let it fall through to the "(A)" mention,
+    # even though target "(A)" would otherwise match under RETENTION_LENIENT.
+    response = "(A) is one possibility.\n\nAfter more thought:\n### Final Answer: unclear, leaning elsewhere"
+    monkeypatch.setenv("RETENTION_LENIENT", "1")
+    assert score_bbh(response, "(A)") is False
+
+
+def test_eval_retention_lenient_env_recorded_in_retention_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = _fixture_rows(tmp_path)
+    canned_path = _fixture_canned(tmp_path)
+    out_path = tmp_path / "out.json"
+    monkeypatch.setenv("RETENTION_LENIENT", "1")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["eval_retention.py", "--data-dir", str(data_dir), "--score-only", str(canned_path), "--out", str(out_path)],
+    )
+    eval_retention.main()
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert result["retention_settings"]["lenient"] is True

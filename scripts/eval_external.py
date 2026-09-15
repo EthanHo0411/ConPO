@@ -245,7 +245,8 @@ def record_verdicts(records: Sequence[dict[str, Any]], benchmark: str) -> list[d
             prompt=str(record["prompt"]),
             kwargs=[dict(kw) for kw in record["kwargs"]],
         )
-        prompt_to_response = {str(record["prompt"]): str(record["response"])}
+        scored_response = str(record["response"])
+        prompt_to_response = {str(record["prompt"]): scored_response}
         strict_out = lib.test_instruction_following_strict(inp, prompt_to_response)
         loose_out = lib.test_instruction_following_loose(inp, prompt_to_response)
         out.append(
@@ -257,6 +258,7 @@ def record_verdicts(records: Sequence[dict[str, Any]], benchmark: str) -> list[d
                 "instruction_id_list": list(inp.instruction_id_list),
                 "instruction_strict": [bool(x) for x in strict_out.follow_instruction_list],
                 "instruction_loose": [bool(x) for x in loose_out.follow_instruction_list],
+                "response": scored_response,
             }
         )
     return out

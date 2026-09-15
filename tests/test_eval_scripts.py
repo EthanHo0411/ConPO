@@ -362,6 +362,32 @@ def test_eval_external_record_verdicts_hand_written_records() -> None:
     assert v["instruction_strict"][1] is False
 
 
+def test_eval_external_verdicts_jsonl_response_matches_scored_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every verdicts.jsonl line carries the exact response text that was
+    passed to the vendored evaluation_lib for scoring."""
+    test_rows = scoring.load_ifbench_test()
+    sample_rows = scoring.load_sample_output()
+    response_by_prompt = {row["prompt"]: row["response"] for row in sample_rows}
+    response_by_key = {row["key"]: response_by_prompt[row["prompt"]] for row in test_rows}
+
+    canned_path = tmp_path / "canned_ifbench.jsonl"
+    with canned_path.open("w", encoding="utf-8") as f:
+        for row in test_rows:
+            f.write(json.dumps({"key": row["key"], "response": response_by_key[row["key"]]}) + "\n")
+
+    out_path = tmp_path / "out.json"
+    monkeypatch.setattr(sys, "argv", ["eval_external.py", "--score-only", str(canned_path), "--out", str(out_path)])
+    eval_external.main()
+
+    verdicts_path = tmp_path / "out.json.verdicts.jsonl"
+    lines = [json.loads(line) for line in verdicts_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == len(test_rows)
+    for v in lines:
+        assert v["response"] == response_by_key[v["key"]]
+
+
 def test_eval_internal_writes_verdicts_jsonl_matching_pacc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     rows = eval_internal.load_split("dev", limit=5)
     responses = [f"canned response number {i}" for i in range(5)]
@@ -406,6 +432,29 @@ def test_eval_internal_record_verdicts_matches_verifier_vector() -> None:
     expected = [bool(x) for x in verifier_vector(rows[0].constraints, responses[0])]
     assert v["instruction_strict"] == expected
     assert v["prompt_strict"] == all(expected)
+
+
+def test_eval_internal_verdicts_jsonl_response_matches_scored_text() -> None:
+    """record_verdicts (called by main() before write_verdicts) carries the
+    exact response text that was passed to verifier_vector for scoring.
+    Uses a hand-built PoolRow (see test_metrics.py's pattern) rather than
+    load_split, since data/dev.jsonl does not exist in this worktree."""
+    from conpo.data import PoolRow
+    from conpo.verifiers import Constraint
+
+    row = PoolRow(
+        key="k1",
+        base_prompt="do the task",
+        prompt="do the task with constraints",
+        sentences=("c0",),
+        constraints=(Constraint("punctuation:no_comma", {}),),
+        english=True,
+        num_constraints=1,
+    )
+    response = "no commas here"
+    verdicts = eval_internal.record_verdicts([row], [response], "dev")
+    assert len(verdicts) == 1
+    assert verdicts[0]["response"] == response
 
 
 def test_eval_internal_score_only_missing_key_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

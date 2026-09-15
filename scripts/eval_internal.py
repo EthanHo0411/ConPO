@@ -177,6 +177,7 @@ def record_verdicts(rows: Sequence[PoolRow], responses: Sequence[str], split_nam
                 "instruction_id_list": [c.iid for c in row.constraints],
                 "instruction_strict": vector,
                 "instruction_loose": vector,
+                "response": response,
             }
         )
     return out
