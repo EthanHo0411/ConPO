@@ -1351,6 +1351,8 @@ def test_main_tiny_run_trainer_trl_runs_stock_grpo_saves_adapter_checkpoint_and_
     out = capsys.readouterr().out
     assert "RUN_TRAINER=trl" in out
     assert "RUN_KL_CLAMP" in out
+    assert "RUN_TOKEN_BUDGET" in out
+    assert "vllm_enable_sleep_mode off" in out
     assert "done: 1 step(s)" in out
     checkpoint_1 = out_dir / "checkpoint-1"
     assert (checkpoint_1 / "adapter_config.json").exists()
@@ -1366,6 +1368,8 @@ def test_main_tiny_run_trainer_trl_runs_stock_grpo_saves_adapter_checkpoint_and_
     assert metadata["resumed_from_step"] is None
     for field_name in _TRL_INACTIVE_METADATA_FIELDS:
         assert metadata[field_name] is None, field_name
+    assert metadata["token_budget"] is None
+    assert metadata["vllm_enable_sleep_mode"] is False
     # GRPOConfig-reaching knobs keep working.
     assert metadata["loss_type"] == config.LOSS_TYPE
     assert metadata["kl_beta"] == pytest.approx(config.KL_BETA)
@@ -1401,6 +1405,74 @@ def test_main_run_trainer_trl_refuses_pair_arms_before_loading_anything(
     assert "RUN_TRAINER=trl" in message
     assert arm in message
     assert "ifrlvr" in message
+
+
+def test_main_run_trainer_trl_refuses_positive_token_budget_before_loading_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fixer 2026-09-15 (major): the token-budget stop lives in
+    ConPOTrainer._generate_and_score_completions and only ConPOTrainer feeds
+    the TokenMeter, so a token-matched launch (local/train.sh exports
+    RUN_TOKEN_BUDGET) under RUN_TRAINER=trl would silently train to
+    RUN_STEPS. A positive budget is refused at startup; 0 (train.sh's
+    default) and unset pass."""
+
+    def _fail_loader(*args: object, **kwargs: object) -> tuple[object, object]:
+        raise AssertionError("model loaded before the RUN_TOKEN_BUDGET guard")
+
+    monkeypatch.setattr(train_script, "_real_model_and_tokenizer", _fail_loader)
+    monkeypatch.setattr(train_script, "_tiny_model_and_tokenizer", _fail_loader)
+
+    _set_tiny_env(monkeypatch, tmp_path / "out", arm="ifrlvr", steps=1)
+    monkeypatch.setenv("RUN_TRAINER", "trl")
+    monkeypatch.setenv("RUN_TOKEN_BUDGET", "1000")
+
+    with pytest.raises(SystemExit) as exc_info:
+        train_script.main()
+    message = str(exc_info.value)
+    assert "RUN_TRAINER=trl" in message
+    assert "RUN_TOKEN_BUDGET" in message
+    assert "RUN_STEPS" in message
+
+
+def test_main_run_trainer_trl_turns_vllm_sleep_mode_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fixer 2026-09-15 (blocker): under RUN_USE_VLLM=1 and RUN_JUDGE_MODE=
+    batched the ConPO path turns vllm_enable_sleep_mode on (and its
+    _install_vllm_reload_guard neutralises TRL 1.9.2's per-generate
+    reload_weights). The stock trainer has no guard, so with sleep mode on
+    every rollout would come from the base checkpoint; RUN_TRAINER=trl must
+    hand GRPOTrainer a config with sleep mode off. The GRPOConfig is
+    captured through a monkeypatched GRPOTrainer that stops before vLLM
+    would be built (no GPU here)."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    class _Captured(Exception):
+        pass
+
+    captured: dict[str, GRPOConfig] = {}
+
+    class _CapturingGRPOTrainer(train_script.GRPOTrainer):
+        def __init__(self, *a: object, **kw: object) -> None:
+            captured["args"] = kw["args"]  # type: ignore[assignment]
+            raise _Captured
+
+    monkeypatch.setattr(train_script, "GRPOTrainer", _CapturingGRPOTrainer)
+
+    _set_tiny_env(monkeypatch, tmp_path / "out", arm="ifrlvr", steps=1)
+    monkeypatch.setenv("RUN_TRAINER", "trl")
+    monkeypatch.setenv("RUN_USE_VLLM", "1")
+    monkeypatch.setenv("RUN_JUDGE_MODE", "batched")
+
+    with pytest.raises(_Captured):
+        train_script.main()
+    grpo_config = captured["args"]
+    assert grpo_config.use_vllm is True
+    assert grpo_config.vllm_enable_sleep_mode is False
+    # The ConPO path keeps its own resolution for the same env.
+    assert train_script._vllm_sleep_mode(use_vllm=True, judge_mode="batched") is True
 
 
 def test_main_run_trainer_rejects_unknown_value(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

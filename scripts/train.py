@@ -58,6 +58,10 @@ _TRL_INACTIVE_KNOBS = (
     "RUN_POS_ANCHOR_WEIGHT",
     "RUN_RESAMPLE_ZERO_STD",
     "RUN_RESAMPLE_MAX_ROUNDS",
+    # The token-budget stop lives in ConPOTrainer._generate_and_score_completions
+    # and only ConPOTrainer feeds the TokenMeter; a positive value under trl
+    # is refused at startup (see main) rather than silently ignored.
+    "RUN_TOKEN_BUDGET",
 )
 
 
@@ -438,7 +442,16 @@ def main() -> None:
                 f"repair operator, but RUN_ARM={arm_name!r} needs them. Use RUN_ARM=ifrlvr or "
                 "RUN_ARM=solve_only with RUN_TRAINER=trl."
             )
-        print(f"RUN_TRAINER=trl: stock trl.GRPOTrainer; inactive knobs: {', '.join(_TRL_INACTIVE_KNOBS)}")
+        if int(config.env("RUN_TOKEN_BUDGET", "0")) > 0:
+            raise SystemExit(
+                "RUN_TRAINER=trl runs the stock trl.GRPOTrainer, which never feeds the TokenMeter, so "
+                "RUN_TOKEN_BUDGET cannot stop it. Bound a trl run with RUN_STEPS or RUN_STOP_AT_STEP "
+                "and unset RUN_TOKEN_BUDGET (or set it to 0)."
+            )
+        print(
+            f"RUN_TRAINER=trl: stock trl.GRPOTrainer; vllm_enable_sleep_mode off; "
+            f"inactive knobs: {', '.join(_TRL_INACTIVE_KNOBS)}"
+        )
 
     subset_path = config.env("RUN_SUBSET", "")
     rows = _load_training_rows(DATA_DIR / "train.jsonl", subset_path, args.tiny)
@@ -559,7 +572,13 @@ def main() -> None:
         # "batched"): under "http" the judge runs on a separate GPU/process
         # over HTTP, so the sleep/wake round trip would be pure overhead
         # (see _vllm_sleep_mode). UNTESTED: no GPU in this environment.
-        vllm_enable_sleep_mode=_vllm_sleep_mode(use_vllm, judge_mode),
+        # RUN_TRAINER=trl (fixer 2026-09-15): off. With sleep mode on, TRL
+        # 1.9.2's VLLMGeneration.generate calls reload_weights on every
+        # generate() call after the once-per-step sync_weights, so every
+        # rollout would come from the base checkpoint; ConPOTrainer's
+        # _install_vllm_reload_guard covers that, the stock trainer has no
+        # guard and no local judge to free memory for.
+        vllm_enable_sleep_mode=_vllm_sleep_mode(use_vllm, judge_mode) and trainer_kind == "conpo",
         max_steps=steps,
         # Checkpoint every SAVE_STEPS optimiser steps (equal to the veto
         # period, so each save follows a veto flush) and keep the last two:
@@ -688,7 +707,8 @@ def main() -> None:
         # TASK G: how many of this run's rows had their prompt left-truncated
         # to config.MAX_PROMPT_TOKENS at load time (cap_pool_rows above).
         "prompt_truncated_rows": prompt_truncated_count,
-        "token_budget": meter.budget,
+        "token_budget": meter.budget if conpo else None,
+        "vllm_enable_sleep_mode": grpo_config.vllm_enable_sleep_mode,
         # Judge placement/model, veto period, and row cap: without these a
         # finished run's artefacts alone cannot say which judge placement it
         # used, what veto period it ran with, whether RUN_JUDGE_MODEL
