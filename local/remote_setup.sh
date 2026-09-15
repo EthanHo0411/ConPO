@@ -44,12 +44,12 @@ conda --version
 echo "== conda env $ENV_NAME"
 if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
   echo "env $ENV_NAME exists, skipping create"
-elif ! conda env create -f environment.yml -n "$ENV_NAME" --override-channels -c conda-forge; then
+elif ! conda env create -f environment.yml -n "$ENV_NAME"; then
   # An existing Anaconda/Miniconda install fails the Terms-of-Service check on its default channels (CondaToSNonInteractiveError);
   # fall back to a private Miniforge, which never consults those channels.
   echo "conda env create failed with the installed conda; retrying with a private Miniforge"
   install_miniforge
-  conda env create -f environment.yml -n "$ENV_NAME" --override-channels -c conda-forge
+  conda env create -f environment.yml -n "$ENV_NAME"
 fi
 conda run -n "$ENV_NAME" python -c "import torch, vllm, trl, transformers, peft; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'available', torch.cuda.is_available(), '| vllm', vllm.__version__, '| trl', trl.__version__, '| transformers', transformers.__version__, '| peft', peft.__version__)"
 if [ "${1:-}" = "--env-only" ]; then exit 0; fi
