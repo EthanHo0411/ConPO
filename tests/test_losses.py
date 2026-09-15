@@ -93,6 +93,52 @@ def test_sequence_logprobs_matches_naive_and_is_chunk_size_invariant() -> None:
     assert lengths.tolist() == completion_mask.sum(dim=1).tolist()
 
 
+# --- (a2) RUN_PAIR_TEMPERATURE (audit F4): temperature divides logits before log_softmax ---
+
+
+def test_sequence_logprobs_temperature_unset_is_byte_identical_to_default() -> None:
+    """Default temperature=1.0 must match calling with no temperature
+    argument at all (this is what keeps every existing pair-path caller
+    byte-identical when RUN_PAIR_TEMPERATURE is unset)."""
+    model = _tiny_model()
+    batch, seq_len = 2, 16
+    torch.manual_seed(5)
+    input_ids = torch.randint(0, 512, (batch, seq_len))
+    attention_mask = torch.ones(batch, seq_len, dtype=torch.long)
+    completion_mask = _ragged_completion_mask(batch, seq_len)
+
+    with torch.no_grad():
+        no_arg = sequence_logprobs(model, input_ids, attention_mask, completion_mask)
+        explicit_default = sequence_logprobs(model, input_ids, attention_mask, completion_mask, temperature=1.0)
+
+    assert torch.equal(no_arg, explicit_default)
+
+
+def test_sequence_logprobs_temperature_divides_logits_before_log_softmax() -> None:
+    model = _tiny_model()
+    batch, seq_len = 2, 16
+    torch.manual_seed(6)
+    input_ids = torch.randint(0, 512, (batch, seq_len))
+    attention_mask = torch.ones(batch, seq_len, dtype=torch.long)
+    completion_mask = _ragged_completion_mask(batch, seq_len)
+    temperature = 0.8
+
+    with torch.no_grad():
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        shift_logits = logits[:, :-1, :] / temperature
+        shift_labels = input_ids[:, 1:]
+        shift_mask = completion_mask[:, 1:].to(shift_logits.dtype)
+        logp = F.log_softmax(shift_logits, dim=-1)
+        token_logp = logp.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
+        expected = (token_logp * shift_mask).sum(dim=1)
+
+        actual = sequence_logprobs(model, input_ids, attention_mask, completion_mask, temperature=temperature)
+        default = sequence_logprobs(model, input_ids, attention_mask, completion_mask)
+
+    assert torch.allclose(actual, expected, atol=1e-5)
+    assert not torch.allclose(actual, default, atol=1e-3)
+
+
 # --- (b) margins and loss are exactly zero-delta values at theta = theta_ref ---
 
 

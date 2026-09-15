@@ -224,7 +224,7 @@ def _tokenize_prompt_response(
 
 
 def score_response(
-    model: torch.nn.Module, tokenizer: object, prompt_text: str, response: str
+    model: torch.nn.Module, tokenizer: object, prompt_text: str, response: str, temperature: float = 1.0
 ) -> tuple[torch.Tensor, int]:
     """log pi(response | prompt_text) and its completion-token length.
 
@@ -233,6 +233,11 @@ def score_response(
     (wrap the call in `torch.no_grad()` / `model.disable_adapter()` for a
     reference score; call plainly for a policy score that needs a gradient).
     Used identically for y_plus and y_minus.
+
+    `temperature` (RUN_PAIR_TEMPERATURE): see
+    losses.sequence_logprobs_with_tokens. Callers pass the trainer's
+    self._pair_temperature so the policy score and any reference score of
+    the same edge use the same temperature.
     """
     input_ids, attention_mask, completion_mask = _tokenize_prompt_response(tokenizer, prompt_text, response)
     device = next(model.parameters()).device
@@ -241,7 +246,7 @@ def score_response(
         attention_mask.to(device),
         completion_mask.to(device),
     )
-    logp = losses.sequence_logprobs(model, input_ids, attention_mask, completion_mask)[0]
+    logp = losses.sequence_logprobs(model, input_ids, attention_mask, completion_mask, temperature=temperature)[0]
     length = int(losses.completion_lengths(completion_mask)[0].item())
     return logp, length
 
@@ -397,6 +402,11 @@ class ConPOTrainer(GRPOTrainer):
         # Lifetime count of edges admitted into edge_buffer, independent of the
         # buffer's own FIFO/age-cap eviction, for the cumulative mechanism-log rate.
         self.cumulative_admitted_edges = 0
+        # RUN_EDGE_DEDUPE (audit F6): lifetime count of edges edge_buffer.push
+        # refused as exact (prompt, y_plus, y_minus, direction) duplicates of
+        # an edge already admitted this run. Always 0 when edge_buffer.dedupe
+        # is off (default).
+        self._cumulative_edges_deduped = 0
         # RUN_REPAIR_BATCH_GENERATION (L2, default on): merge every failing
         # group's forward-repair calls for a step into one
         # forward.repair_all_groups call instead of one forward.
@@ -545,6 +555,37 @@ class ConPOTrainer(GRPOTrainer):
         self._gap_dump_rescore_step = -1
         self._gap_dump_rescore_left = 0
 
+        # RUN_REWARD (devbox 2026-09-15): overrides which RL reward function
+        # trains the policy -- "additive" or "conjunctive" -- independent of
+        # every other arm mechanism switch (forward/reverse/prompt_loss/
+        # resp_loss, the repair operator, and the pair path's own
+        # feasibility checks all keep reading arm/overrides unchanged).
+        # Unset or empty: arm.reward. Validated in scripts/train.py before
+        # the model loads; read again here, same convention as
+        # _kl_clamp/_token_logratio_clamp above.
+        raw_reward = config.env("RUN_REWARD", "")
+        self.reward_name: str = raw_reward if raw_reward else arm.reward
+
+        # RUN_PAIR_TEMPERATURE (audit F4): score_response divides its logits
+        # by this value before the log-softmax, for both the policy and the
+        # reference scoring, so the pair path's q_theta log-probs use the
+        # same sampling temperature TRL divides logits by for the GRPO/KL
+        # terms (config.TEMPERATURE) instead of raw (temperature 1.0)
+        # logits. 1.0 (unset) is a no-op, byte-identical to before this
+        # knob existed. Validated in scripts/train.py before the model
+        # loads; read again here, same convention as above.
+        raw_pair_temperature = config.env("RUN_PAIR_TEMPERATURE", "")
+        self._pair_temperature: float = float(raw_pair_temperature) if raw_pair_temperature.strip() else 1.0
+
+        # RUN_EMPTY_REWARD_GUARD (review M5): "1" makes reward_conjunctive
+        # score an empty or whitespace-only completion 0.0 instead of
+        # running it through feasible() -- mirrors reward_additive's own
+        # guard, for the 14% of prompts every constraint is vacuously
+        # satisfied by "". Unset, empty, or "0": byte-identical. Validated
+        # in scripts/train.py before the model loads; read again here, same
+        # convention as above.
+        self._empty_reward_guard = config.env("RUN_EMPTY_REWARD_GUARD", "0") == "1"
+
         # Wall-clock accumulation across RUN_RESUME processes (scripts/train.py):
         # the node-local disk is wiped roughly every 48 hours, so one logical
         # run can span several process restarts. wall_seconds_before_resume is
@@ -615,7 +656,7 @@ class ConPOTrainer(GRPOTrainer):
         # (HFEngine/FakeEngine runs included, where it just stays False).
         self._vllm_sleep_pending: bool = False
 
-        reward_func = self.reward_conjunctive if arm.reward == "conjunctive" else self.reward_additive
+        reward_func = self.reward_conjunctive if self.reward_name == "conjunctive" else self.reward_additive
         callbacks = list(kwargs.pop("callbacks", None) or [])
         callbacks.append(_StepTimingCallback(self))
         super().__init__(
@@ -676,11 +717,21 @@ class ConPOTrainer(GRPOTrainer):
     # -----------------------------------------------------------------
 
     def reward_conjunctive(self, completions: Sequence[object], key: Sequence[str], **_: object) -> list[float]:
-        """F(x, y) (ConPO.pdf's conjunctive reward): 1.0 iff every constraint on the row passes, else 0.0."""
+        """F(x, y) (ConPO.pdf's conjunctive reward): 1.0 iff every constraint on the row passes, else 0.0.
+
+        RUN_EMPTY_REWARD_GUARD=1 (review M5): an empty or whitespace-only
+        completion scores 0.0 without reaching feasible(), mirroring
+        reward_additive's own guard above -- unset/"0" leaves the
+        pre-existing behaviour, where an empty response can score 1.0
+        whenever every constraint on the row is vacuously satisfied by "".
+        """
         scores = []
         for completion, k in zip(completions, key):
             row = self.rows_by_key[k]
             text = _completion_text(completion)
+            if self._empty_reward_guard and not text.strip():
+                scores.append(0.0)
+                continue
             scores.append(1.0 if feasible(row.constraints, text) else 0.0)
         return scores
 
@@ -975,10 +1026,15 @@ class ConPOTrainer(GRPOTrainer):
         distances: list[float] = []
         admitted_by_direction: Counter[str] = Counter()
         multi_admitted = 0
+        edges_deduped_this_step = 0
         with self._reference_model(self.model) as ref_model:
             for edge in new_edges:
-                logp_plus, len_plus = score_response(ref_model, self.processing_class, edge.prompt, edge.y_plus)
-                logp_minus, len_minus = score_response(ref_model, self.processing_class, edge.prompt, edge.y_minus)
+                logp_plus, len_plus = score_response(
+                    ref_model, self.processing_class, edge.prompt, edge.y_plus, temperature=self._pair_temperature
+                )
+                logp_minus, len_minus = score_response(
+                    ref_model, self.processing_class, edge.prompt, edge.y_minus, temperature=self._pair_temperature
+                )
                 scored_edge = dataclasses.replace(
                     edge,
                     logp_ref_plus=logp_plus.item(),
@@ -986,7 +1042,13 @@ class ConPOTrainer(GRPOTrainer):
                     len_plus=len_plus,
                     len_minus=len_minus,
                 )
-                self.edge_buffer.push(scored_edge)
+                # RUN_EDGE_DEDUPE (audit F6): every OTHER counter below keeps
+                # counting this edge as admitted, unchanged -- edges_deduped
+                # is the only new counter, so a dedupe-off run reads
+                # identically to before this knob existed.
+                if not self.edge_buffer.push(scored_edge):
+                    edges_deduped_this_step += 1
+                    self._cumulative_edges_deduped += 1
                 admitted_by_direction[scored_edge.direction] += 1
                 distances.append(float(scored_edge.meta.get("distance", 0.0)))
                 if scored_edge.direction == "reverse":
@@ -1018,6 +1080,14 @@ class ConPOTrainer(GRPOTrainer):
                 (self.cumulative_admitted_edges / self.meter.total * 1e6) if self.meter.total else 0.0
             ),
             "edge_buffer_size": len(self.edge_buffer),
+            # RUN_EDGE_DEDUPE (audit F6): this step's / this run's edges
+            # refused as exact (prompt, y_plus, y_minus, direction)
+            # duplicates of an edge already admitted -- only ever nonzero
+            # under the no-veto ablation (same reasoning as
+            # admitted_by_direction above; the batched-veto path's dedupe
+            # count is flush_pending_veto's own "veto_flush" record).
+            "edges_deduped": edges_deduped_this_step,
+            "cumulative_edges_deduped": self._cumulative_edges_deduped,
             "feasible_buffer_size": len(self.feasible_buffer),
             "family_stats": self.stats.snapshot(),
             # Perf-pass instrumentation (Ethan devbox, 2026-09-11): phase_seconds
@@ -1380,6 +1450,7 @@ class ConPOTrainer(GRPOTrainer):
         # them were "the judge's reply never parsed" instead of "the judge
         # said this pair is degenerate".
         parse_failures: Counter[str] = Counter()
+        burst_edges_deduped = 0
         with self._reference_model(self.model) as ref_model:
             for pair, verdict in zip(pairs, verdicts):
                 # Round2 finding 1: check this edge off its feasible-endpoint
@@ -1393,8 +1464,12 @@ class ConPOTrainer(GRPOTrainer):
                     continue
                 kept[pair.direction] += 1
                 edge = pair.edge
-                logp_plus, len_plus = score_response(ref_model, self.processing_class, edge.prompt, edge.y_plus)
-                logp_minus, len_minus = score_response(ref_model, self.processing_class, edge.prompt, edge.y_minus)
+                logp_plus, len_plus = score_response(
+                    ref_model, self.processing_class, edge.prompt, edge.y_plus, temperature=self._pair_temperature
+                )
+                logp_minus, len_minus = score_response(
+                    ref_model, self.processing_class, edge.prompt, edge.y_minus, temperature=self._pair_temperature
+                )
                 scored_edge = dataclasses.replace(
                     edge,
                     logp_ref_plus=logp_plus.item(),
@@ -1402,7 +1477,9 @@ class ConPOTrainer(GRPOTrainer):
                     len_plus=len_plus,
                     len_minus=len_minus,
                 )
-                self.edge_buffer.push(scored_edge)
+                if not self.edge_buffer.push(scored_edge):
+                    burst_edges_deduped += 1
+                    self._cumulative_edges_deduped += 1
                 self.cumulative_admitted_edges += 1
                 if scored_edge.direction == "reverse":
                     self._cumulative_reverse_admitted += 1
@@ -1430,6 +1507,11 @@ class ConPOTrainer(GRPOTrainer):
             "burst_parse_failures_reverse": parse_failures["reverse"],
             "veto_rate_forward": veto_rate("forward"),
             "veto_rate_reverse": veto_rate("reverse"),
+            # RUN_EDGE_DEDUPE (audit F6): this burst's / this run's edges
+            # refused as exact duplicates -- batched-path counterpart of the
+            # per-step record's "edges_deduped"/"cumulative_edges_deduped".
+            "burst_edges_deduped": burst_edges_deduped,
+            "cumulative_edges_deduped": self._cumulative_edges_deduped,
             # Round2 finding 2: the per-step record's mean_edit_distance is
             # only ever real under the no-veto ablation (see the comment in
             # _generate_and_score_completions); this is its batched-path
@@ -1913,8 +1995,12 @@ class ConPOTrainer(GRPOTrainer):
 
         logp_plus, logp_minus, ref_plus, ref_minus, len_plus, len_minus, ages = [], [], [], [], [], [], []
         for edge in edges:
-            lp_plus, _ = score_response(model, self.processing_class, edge.prompt, edge.y_plus)
-            lp_minus, _ = score_response(model, self.processing_class, edge.prompt, edge.y_minus)
+            lp_plus, _ = score_response(
+                model, self.processing_class, edge.prompt, edge.y_plus, temperature=self._pair_temperature
+            )
+            lp_minus, _ = score_response(
+                model, self.processing_class, edge.prompt, edge.y_minus, temperature=self._pair_temperature
+            )
             logp_plus.append(lp_plus)
             logp_minus.append(lp_minus)
             ref_plus.append(edge.logp_ref_plus)
@@ -1984,9 +2070,13 @@ class ConPOTrainer(GRPOTrainer):
             attention_mask.to(device),
             completion_mask.to(device),
         )
-        _, policy_tok = losses.sequence_logprobs_with_tokens(model, input_ids, attention_mask, completion_mask)
+        _, policy_tok = losses.sequence_logprobs_with_tokens(
+            model, input_ids, attention_mask, completion_mask, temperature=self._pair_temperature
+        )
         with self._reference_model(model) as ref_model:
-            _, ref_tok = losses.sequence_logprobs_with_tokens(ref_model, input_ids, attention_mask, completion_mask)
+            _, ref_tok = losses.sequence_logprobs_with_tokens(
+                ref_model, input_ids, attention_mask, completion_mask, temperature=self._pair_temperature
+            )
         mask = completion_mask[:, 1:].bool()
         diff = (policy_tok - ref_tok)[mask]
         clamped_sum, hits = losses.clamp_token_logratio(diff, clamp)
@@ -2023,9 +2113,13 @@ class ConPOTrainer(GRPOTrainer):
             attention_mask.to(device),
             completion_mask.to(device),
         )
-        _, policy_tok = losses.sequence_logprobs_with_tokens(model, input_ids, attention_mask, completion_mask)
+        _, policy_tok = losses.sequence_logprobs_with_tokens(
+            model, input_ids, attention_mask, completion_mask, temperature=self._pair_temperature
+        )
         with self._reference_model(model) as ref_model:
-            _, ref_tok = losses.sequence_logprobs_with_tokens(ref_model, input_ids, attention_mask, completion_mask)
+            _, ref_tok = losses.sequence_logprobs_with_tokens(
+                ref_model, input_ids, attention_mask, completion_mask, temperature=self._pair_temperature
+            )
         mask = completion_mask[:, 1:].bool()
         diff = (policy_tok - ref_tok)[mask]
         response_ids = input_ids[0][completion_mask[0].bool()].tolist()
@@ -2111,8 +2205,12 @@ class ConPOTrainer(GRPOTrainer):
             target_indices = [next(i for i, c in enumerate(row.constraints) if c.iid == family) for family in edge.families]
             x_plus, x_minus = prompts.counterfactual_prompts_set(row, target_indices)
 
-            lp_plus_xplus, _ = score_response(model, self.processing_class, x_plus, edge.y_plus)
-            lp_minus_xplus, _ = score_response(model, self.processing_class, x_plus, edge.y_minus)
+            lp_plus_xplus, _ = score_response(
+                model, self.processing_class, x_plus, edge.y_plus, temperature=self._pair_temperature
+            )
+            lp_minus_xplus, _ = score_response(
+                model, self.processing_class, x_plus, edge.y_minus, temperature=self._pair_temperature
+            )
             ref_plus_xplus = torch.tensor(edge.logp_ref_plus, dtype=lp_plus_xplus.dtype, device=lp_plus_xplus.device)
             ref_minus_xplus = torch.tensor(
                 edge.logp_ref_minus, dtype=lp_minus_xplus.dtype, device=lp_minus_xplus.device
@@ -2125,8 +2223,12 @@ class ConPOTrainer(GRPOTrainer):
             )
             m_plus_terms.append(q_plus_xplus - q_minus_xplus)
 
-            lp_plus_xminus, len_p_xminus = score_response(model, self.processing_class, x_minus, edge.y_plus)
-            lp_minus_xminus, len_m_xminus = score_response(model, self.processing_class, x_minus, edge.y_minus)
+            lp_plus_xminus, len_p_xminus = score_response(
+                model, self.processing_class, x_minus, edge.y_plus, temperature=self._pair_temperature
+            )
+            lp_minus_xminus, len_m_xminus = score_response(
+                model, self.processing_class, x_minus, edge.y_minus, temperature=self._pair_temperature
+            )
             if self._cache_ref_logprobs and edge.logp_ref_plus_xminus is not None:
                 ref_plus_xminus = torch.tensor(
                     edge.logp_ref_plus_xminus, dtype=lp_plus_xminus.dtype, device=lp_plus_xminus.device
@@ -2136,8 +2238,12 @@ class ConPOTrainer(GRPOTrainer):
                 )
             else:
                 with self._reference_model(model) as ref_model:
-                    ref_plus_xminus, _ = score_response(ref_model, self.processing_class, x_minus, edge.y_plus)
-                    ref_minus_xminus, _ = score_response(ref_model, self.processing_class, x_minus, edge.y_minus)
+                    ref_plus_xminus, _ = score_response(
+                        ref_model, self.processing_class, x_minus, edge.y_plus, temperature=self._pair_temperature
+                    )
+                    ref_minus_xminus, _ = score_response(
+                        ref_model, self.processing_class, x_minus, edge.y_minus, temperature=self._pair_temperature
+                    )
                 if self._cache_ref_logprobs:
                     object.__setattr__(edge, "logp_ref_plus_xminus", ref_plus_xminus.item())
                     object.__setattr__(edge, "logp_ref_minus_xminus", ref_minus_xminus.item())

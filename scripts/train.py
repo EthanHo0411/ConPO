@@ -59,6 +59,13 @@ _TRL_INACTIVE_KNOBS = (
     "RUN_POS_ANCHOR_WEIGHT",
     "RUN_RESAMPLE_ZERO_STD",
     "RUN_RESAMPLE_MAX_ROUNDS",
+    # RUN_PAIR_TEMPERATURE/RUN_EDGE_DEDUPE (devbox 2026-09-15): both act only
+    # on the pair path (score_response) and edge_buffer, neither of which
+    # the stock trl.GRPOTrainer path touches. RUN_REWARD and
+    # RUN_EMPTY_REWARD_GUARD are NOT here: both reach the trl path's own
+    # reward_conjunctive/reward_additive binding below.
+    "RUN_PAIR_TEMPERATURE",
+    "RUN_EDGE_DEDUPE",
     # The token-budget stop lives in ConPOTrainer._generate_and_score_completions
     # and only ConPOTrainer feeds the TokenMeter; a positive value under trl
     # is refused at startup (see main) rather than silently ignored.
@@ -470,6 +477,63 @@ def main() -> None:
             f"inactive knobs: {', '.join(_TRL_INACTIVE_KNOBS)}"
         )
 
+    # RUN_REWARD (devbox 2026-09-15): overrides which RL reward function
+    # trains the policy -- "additive" (open-instruct's IFEvalVerifier
+    # mean-per-constraint reward, ifrlvr's own default) or "conjunctive"
+    # (verifiers.feasible, the paper's F(x, y), every other arm's default) --
+    # independent of arm.forward/reverse/prompt_loss/resp_loss: the repair
+    # operator and the pair path keep reading their own feasibility checks
+    # unchanged, only the reward GRPOTrainer optimises changes. Unset or
+    # empty: arm.reward. Validated here, before the model loads (same
+    # placement as the RUN_TRAINER checks above).
+    raw_reward = config.env("RUN_REWARD", "")
+    if raw_reward and raw_reward not in ("additive", "conjunctive"):
+        raise SystemExit(f"unknown RUN_REWARD: {raw_reward!r}, expected 'additive', 'conjunctive', or unset")
+    reward_name = raw_reward or arm.reward
+
+    # RUN_PAIR_TEMPERATURE (audit F4, devbox 2026-09-15): the pair path
+    # (conpo/losses.py's sequence_logprobs_with_tokens, via
+    # conpo/trainer.py's score_response) computes q_theta log-probs from raw
+    # (temperature 1.0) logits while TRL divides logits by config.TEMPERATURE
+    # (0.8) for the GRPO/KL terms -- this closes that gap for the pair path
+    # only. Unset or empty: 1.0, byte-identical. Validated here, before the
+    # model loads.
+    raw_pair_temperature = config.env("RUN_PAIR_TEMPERATURE", "")
+    if raw_pair_temperature.strip():
+        try:
+            pair_temperature = float(raw_pair_temperature)
+        except ValueError:
+            pair_temperature = math.nan
+        if not math.isfinite(pair_temperature) or pair_temperature <= 0:
+            raise SystemExit(
+                f"RUN_PAIR_TEMPERATURE must be a positive float (or unset), got {raw_pair_temperature!r}"
+            )
+    else:
+        pair_temperature = 1.0
+
+    # RUN_EDGE_DEDUPE (audit F6, devbox 2026-09-15): "1" refuses to admit an
+    # edge whose (prompt, y_plus, y_minus, direction) key was already
+    # admitted this run (conpo/edges.py:EdgeBuffer.push) -- deterministic
+    # corruption operators were re-admitting the same pair from the same
+    # buffered response (10% of admitted edges were exact duplicates,
+    # reverse multiplicity up to 12). Unset, empty, or "0": byte-identical.
+    # Validated here, before the model loads.
+    raw_edge_dedupe = config.env("RUN_EDGE_DEDUPE", "")
+    if raw_edge_dedupe not in ("", "0", "1"):
+        raise SystemExit(f"RUN_EDGE_DEDUPE must be '0', '1', or unset, got {raw_edge_dedupe!r}")
+    edge_dedupe = raw_edge_dedupe == "1"
+
+    # RUN_EMPTY_REWARD_GUARD (review M5, devbox 2026-09-15): "1" scores an
+    # empty or whitespace-only completion 0.0 under
+    # ConPOTrainer.reward_conjunctive, mirroring reward_additive's existing
+    # guard -- 14% of prompts have every constraint vacuously satisfied by
+    # "". Unset, empty, or "0": byte-identical. Validated here, before the
+    # model loads.
+    raw_empty_reward_guard = config.env("RUN_EMPTY_REWARD_GUARD", "")
+    if raw_empty_reward_guard not in ("", "0", "1"):
+        raise SystemExit(f"RUN_EMPTY_REWARD_GUARD must be '0', '1', or unset, got {raw_empty_reward_guard!r}")
+    empty_reward_guard = raw_empty_reward_guard == "1"
+
     subset_path = config.env("RUN_SUBSET", "")
     rows = _load_training_rows(DATA_DIR / "train.jsonl", subset_path, args.tiny)
     # RUN_LIMIT: applied after RUN_SUBSET/--tiny, for a smoke run on a small
@@ -642,7 +706,7 @@ def main() -> None:
             device=str(trainer.accelerator.device),
         )
 
-    edge_buffer = EdgeBuffer()
+    edge_buffer = EdgeBuffer(dedupe=edge_dedupe)
     feasible_buffer = FeasibleBuffer()
     stats = FamilyStats()
     meter = TokenMeter()
@@ -663,12 +727,18 @@ def main() -> None:
     if trainer_kind == "trl":
         # The same reward code ConPOTrainer.__init__ binds (its
         # reward_conjunctive/reward_additive methods read nothing off the
-        # trainer but rows_by_key), bound to a rows_by_key holder instead of
-        # a trainer; TRL unwraps functools.partial for the reward's log name.
-        reward_method = ConPOTrainer.reward_conjunctive if arm.reward == "conjunctive" else ConPOTrainer.reward_additive
+        # trainer but rows_by_key and, for reward_conjunctive,
+        # _empty_reward_guard), bound to a rows_by_key holder instead of a
+        # trainer; TRL unwraps functools.partial for the reward's log name.
+        # RUN_REWARD (devbox 2026-09-15): reward_name, not arm.reward.
+        reward_method = (
+            ConPOTrainer.reward_conjunctive if reward_name == "conjunctive" else ConPOTrainer.reward_additive
+        )
         trainer = GRPOTrainer(
             model=model,
-            reward_funcs=functools.partial(reward_method, SimpleNamespace(rows_by_key=rows_by_key)),
+            reward_funcs=functools.partial(
+                reward_method, SimpleNamespace(rows_by_key=rows_by_key, _empty_reward_guard=empty_reward_guard)
+            ),
             args=grpo_config,
             train_dataset=dataset,
             processing_class=tokenizer,
@@ -715,6 +785,15 @@ def main() -> None:
     run_metadata: dict[str, object] = {
         "arm": arm_name,
         "trainer": trainer_kind,
+        # RUN_REWARD (devbox 2026-09-15): the resolved reward function name
+        # ("additive" or "conjunctive") this run trained with, arm.reward's
+        # default when RUN_REWARD was unset -- recorded for every arm/
+        # trainer, since RUN_REWARD reaches both the trl and conpo paths'
+        # reward_conjunctive/reward_additive binding above.
+        "reward": reward_name,
+        # RUN_EMPTY_REWARD_GUARD (review M5): same "reaches both trainer
+        # paths" reasoning as reward above.
+        "empty_reward_guard": empty_reward_guard,
         "seed": seed,
         "model": model_name,
         "dataset_size": len(rows),
@@ -758,6 +837,13 @@ def main() -> None:
         "resample_zero_std": trainer._resample_zero_std if conpo else None,
         "resample_max_rounds": trainer._resample_max_rounds if conpo else None,
         "token_logratio_clamp": trainer._token_logratio_clamp if conpo else None,
+        # RUN_PAIR_TEMPERATURE (audit F4) / RUN_EDGE_DEDUPE (audit F6):
+        # same "read back off the trainer instance" pattern as kl_clamp/
+        # token_logratio_clamp above; both are meaningless for the stock
+        # trl.GRPOTrainer path (no pair path, no edge_buffer admission), so
+        # None there, same as pair_loss_weight above.
+        "pair_temperature": trainer._pair_temperature if conpo else None,
+        "edge_dedupe": edge_buffer.dedupe if conpo else None,
         # RUN_SKIP_STEP_ON_GAP (K2, devbox 2026-09-15): same "read back off
         # the trainer instance" pattern as kl_clamp/token_logratio_clamp
         # above -- no config.py counterpart, no GRPOConfig field.
