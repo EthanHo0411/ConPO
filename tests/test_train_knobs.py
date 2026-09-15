@@ -457,6 +457,85 @@ def test_main_tiny_run_skip_step_on_gap_set_reaches_metadata(
     assert metadata["skip_step_on_gap"] == pytest.approx(7.5)
 
 
+def test_main_tiny_run_gap_dump_unset_reaches_metadata_as_none_and_writes_no_dump(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K9 (devbox 2026-09-15): RUN_GAP_DUMP unset -> trainer._gap_dump_bar
+    is None, recorded as gap_dump null, and the run writes no
+    gap_dump.jsonl -- same "read back off the trainer instance" convention
+    as RUN_SKIP_STEP_ON_GAP above."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.delenv("RUN_GAP_DUMP", raising=False)
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["gap_dump"] is None
+    assert not (out_dir / "gap_dump.jsonl").exists()
+
+
+def test_main_tiny_run_gap_dump_set_reaches_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """K9: RUN_GAP_DUMP=2.5 reaches trainer._gap_dump_bar and, through it,
+    run_metadata.json's gap_dump."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_synthetic_pool_rows(data_dir / "train.jsonl", n=4)
+    monkeypatch.setattr(train_script, "DATA_DIR", data_dir)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setenv("RUN_GAP_DUMP", "2.5")
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    train_script.main()
+
+    metadata = json.loads((out_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["gap_dump"] == pytest.approx(2.5)
+
+
+@pytest.mark.parametrize("raw", ["abc", "-1", "nan", "inf"])
+def test_main_run_gap_dump_invalid_refuses_before_loading_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """K9: a RUN_GAP_DUMP value that is not a finite, non-negative float is
+    refused at startup, before any model loads (same guard placement as the
+    RUN_TRAINER=trl checks)."""
+
+    def _fail_loader(*args: object, **kwargs: object) -> tuple[object, object]:
+        raise AssertionError("model loaded before the RUN_GAP_DUMP guard")
+
+    monkeypatch.setattr(train_script, "_real_model_and_tokenizer", _fail_loader)
+    monkeypatch.setattr(train_script, "_tiny_model_and_tokenizer", _fail_loader)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("RUN_ARM", "solve_only")
+    monkeypatch.setenv("RUN_STEPS", "1")
+    monkeypatch.setenv("RUN_OUT_DIR", str(out_dir))
+    monkeypatch.setenv("RUN_NO_VETO", "1")
+    monkeypatch.setenv("RUN_GAP_DUMP", raw)
+    monkeypatch.setattr(sys, "argv", ["train.py", "--tiny"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        train_script.main()
+    message = str(exc_info.value)
+    assert "RUN_GAP_DUMP" in message
+    assert raw in message
+    assert not (out_dir / "run_metadata.json").exists()
+
+
 def test_main_tiny_run_vllm_is_mode_default_and_override_reach_grpo_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1271,6 +1350,7 @@ _TRL_INACTIVE_METADATA_FIELDS = (
     "cache_ref_logprobs",
     "repair_batch_generation",
     "skip_step_on_gap",
+    "gap_dump",
     "token_logratio_clamp",
     "pair_loss_weight",
     "pair_objective",

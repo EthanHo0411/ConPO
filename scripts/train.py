@@ -51,6 +51,7 @@ _TRL_INACTIVE_KNOBS = (
     "RUN_CACHE_REF_LOGPROBS",
     "RUN_REPAIR_BATCH_GENERATION",
     "RUN_SKIP_STEP_ON_GAP",
+    "RUN_GAP_DUMP",
     "RUN_TOKEN_LOGRATIO_CLAMP",
     "RUN_PAIR_LOSS_WEIGHT",
     "RUN_PAIR_OBJECTIVE",
@@ -426,6 +427,22 @@ def main() -> None:
     trainer_kind = config.env("RUN_TRAINER", "conpo")
     if trainer_kind not in ("conpo", "trl"):
         raise SystemExit(f"unknown RUN_TRAINER: {trainer_kind!r}, expected 'conpo' or 'trl'")
+    # RUN_GAP_DUMP (K9, devbox 2026-09-15): validated here so a typo fails
+    # before the model loads; conpo/trainer.py's ConPOTrainer.__init__ reads
+    # the same env var itself, directly (same pattern as the other
+    # trainer-owned knobs), and run_metadata below records it off the
+    # trainer instance. Unset or empty = off; anything else must parse as a
+    # finite, non-negative float bar in nats.
+    raw_gap_dump = config.env("RUN_GAP_DUMP", "")
+    if raw_gap_dump.strip():
+        try:
+            gap_dump_bar = float(raw_gap_dump)
+        except ValueError:
+            gap_dump_bar = math.nan
+        if not math.isfinite(gap_dump_bar) or gap_dump_bar < 0:
+            raise SystemExit(
+                f"RUN_GAP_DUMP must be a finite, non-negative float bar in nats (or unset), got {raw_gap_dump!r}"
+            )
     out_dir = Path(config.env("RUN_OUT_DIR", "runs/tmp"))
     run_resume = config.env("RUN_RESUME", "0") == "1"
     resume_checkpoint_dir, resumed_from_step = _resolve_resume(out_dir, run_resume)
@@ -745,6 +762,10 @@ def main() -> None:
         # the trainer instance" pattern as kl_clamp/token_logratio_clamp
         # above -- no config.py counterpart, no GRPOConfig field.
         "skip_step_on_gap": trainer._skip_step_on_gap_bar if conpo else None,
+        # RUN_GAP_DUMP (K9, devbox 2026-09-15): same pattern as
+        # skip_step_on_gap above (validated early in main, read off the
+        # trainer instance here).
+        "gap_dump": trainer._gap_dump_bar if conpo else None,
         # RUN_PAIR_OBJECTIVE / RUN_POS_ANCHOR_WEIGHT (K8, devbox 2026-09-14):
         # same "read back off the trainer instance" pattern as the four
         # knobs above.

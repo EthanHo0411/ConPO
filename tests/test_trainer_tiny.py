@@ -22,6 +22,7 @@ from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM, TrainerCa
 from trl import GRPOConfig, GRPOTrainer
 
 import conpo.operators  # noqa: F401  registers all 53 corruption operators
+import conpo.trainer as conpo_trainer_module
 from conpo import config
 from conpo.arms import ArmSpec, Overrides, resolve_arm
 from conpo.data import PoolRow, TokenMeter
@@ -1489,7 +1490,7 @@ def test_flush_pending_veto_flushes_deferred_sleep_at_its_own_top(
 _KL_TEST_VOCAB_SIZE = 151936  # matches _tiny_model_and_tokenizer's Qwen3Config
 
 
-def _kl_clamp_trainer(tmp_path: Path) -> ConPOTrainer:
+def _kl_clamp_trainer(tmp_path: Path, out_dir: Path | None = None) -> ConPOTrainer:
     model, tokenizer = _tiny_model_and_tokenizer()
     rows = [ROW_A]
     rows_by_key = {r.key: r for r in rows}
@@ -1531,6 +1532,7 @@ def _kl_clamp_trainer(tmp_path: Path) -> ConPOTrainer:
         seed=0,
         overrides=overrides,
         peft_config=_lora_config(),
+        out_dir=out_dir,
     )
     # _compute_loss reads current_gradient_accumulation_steps, normally set
     # per-batch by transformers.Trainer._inner_training_loop; these tests
@@ -1605,6 +1607,175 @@ def test_kl_clamp_and_loss_type_defaults(tmp_path: Path) -> None:
     assert config.KL_CLAMP == 40.0
     trainer = _kl_clamp_trainer(tmp_path)
     assert trainer._kl_clamp == config.KL_CLAMP == 40.0
+
+
+# ---------------------------------------------------------------------------
+# K9 RUN_GAP_DUMP + cleaner KL logging (devbox 2026-09-15): the single-step
+# "kl" spikes are one token whose training-path policy log-prob sits 16-33
+# nats under the sampler's and the reference's. _compute_loss now (always)
+# logs kl_median/kl_clean/kl_spike_tokens next to "kl" and (RUN_GAP_DUMP
+# only) dumps the offending tokens with an eval-mode re-score. Same
+# hand-built micro-batch as the K4 tests above; TRL's own un-subclassed
+# _compute_loss on the identical trainer is the "without this code path"
+# baseline for the loss and every pre-existing metric.
+# ---------------------------------------------------------------------------
+
+_GAP_DUMP_FIELDS = {
+    "step",
+    "sample",
+    "pos",
+    "token_id",
+    "token",
+    "prev_ids",
+    "prev_tokens",
+    "next_ids",
+    "next_tokens",
+    "gap_source",
+    "sampler_logp",
+    "policy_logp",
+    "policy_logp_old",
+    "policy_logp_eval",
+    "ref_logp",
+    "completion_len",
+    "is_first",
+    "is_last",
+    "is_special",
+    "model_training",
+}
+
+
+def _read_gap_dump(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_compute_loss_gap_dump_unset_adds_only_kl_spread_metrics_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_GAP_DUMP unset (and RUN_KL_CLAMP=none so the clamp is a no-op
+    too): the loss is byte-identical to TRL's own _compute_loss on the same
+    trainer/model/inputs, every metric TRL records is recorded with the
+    same value, the only additions are kl_median/kl_clean/kl_spike_tokens,
+    and no gap_dump.jsonl appears even though out_dir is set."""
+    monkeypatch.setenv("RUN_KL_CLAMP", "none")
+    monkeypatch.delenv("RUN_GAP_DUMP", raising=False)
+    trainer = _kl_clamp_trainer(tmp_path, out_dir=tmp_path)
+    assert trainer._gap_dump_bar is None
+    inputs = _kl_clamp_inputs()
+
+    loss_ours = trainer._compute_loss(trainer.model, inputs)
+    metrics_ours = {name: list(values) for name, values in trainer._metrics["train"].items()}
+    trainer._metrics["train"].clear()
+    loss_trl = GRPOTrainer._compute_loss(trainer, trainer.model, inputs)
+    metrics_trl = {name: list(values) for name, values in trainer._metrics["train"].items()}
+
+    assert torch.equal(loss_ours, loss_trl)
+    assert set(metrics_ours) - set(metrics_trl) == {"kl_median", "kl_clean", "kl_spike_tokens"}
+    for name, values in metrics_trl.items():
+        assert metrics_ours[name] == values, name
+    assert "kl" in metrics_trl
+    assert metrics_ours["kl_spike_tokens"] == [6.0]  # ref=-50 puts every one of the 2x3 tokens far over 5 nats
+    assert metrics_ours["kl_clean"] == [0.0]
+    assert metrics_ours["kl_median"][0] > 0.0
+    assert not (tmp_path / "gap_dump.jsonl").exists()
+
+
+def test_compute_loss_gap_dump_writes_offending_tokens_with_eval_rescoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RUN_GAP_DUMP=1: without sampler log-probs (no vLLM here) the
+    criterion is |ref - policy|, and ref=-50 puts all 6 completion tokens
+    over a 1-nat bar -> 6 lines with every required field; the loss stays
+    byte-identical to TRL's and the model's mode is restored. With
+    GAP_DUMP_MAX_RESCORE patched to 1, only sample 0 carries
+    policy_logp_eval (equal to policy_logp: the tiny model has no dropout),
+    sample 1 gets null, and the budget resets on the next step. With
+    crafted sampling_per_token_logps present, the sampler criterion takes
+    over and exactly the one token pushed 20 nats away is dumped."""
+    monkeypatch.setenv("RUN_KL_CLAMP", "none")
+    monkeypatch.setenv("RUN_GAP_DUMP", "1")
+    monkeypatch.setattr(conpo_trainer_module, "GAP_DUMP_MAX_RESCORE", 1)
+    trainer = _kl_clamp_trainer(tmp_path, out_dir=tmp_path)
+    assert trainer._gap_dump_bar == 1.0
+    inputs = _kl_clamp_inputs()
+    dump_path = tmp_path / "gap_dump.jsonl"
+    was_training = trainer.model.training
+
+    loss_ours = trainer._compute_loss(trainer.model, inputs)
+    loss_trl = GRPOTrainer._compute_loss(trainer, trainer.model, inputs)
+
+    assert torch.equal(loss_ours, loss_trl)
+    assert trainer.model.training == was_training
+    lines = _read_gap_dump(dump_path)
+    assert len(lines) == 6
+    assert {(line["sample"], line["pos"]) for line in lines} == {(b, p) for b in range(2) for p in range(3)}
+    for line in lines:
+        assert _GAP_DUMP_FIELDS <= set(line), sorted(_GAP_DUMP_FIELDS - set(line))
+        assert line["step"] == 0
+        assert line["gap_source"] == "ref"
+        assert line["ref_logp"] == -50.0
+        assert line["sampler_logp"] is None
+        assert line["policy_logp_old"] is None
+        assert isinstance(line["policy_logp"], float)
+        assert line["model_training"] is was_training
+        assert line["completion_len"] == 3
+        assert line["is_first"] is (line["pos"] == 0)
+        assert line["is_last"] is (line["pos"] == 2)
+        assert line["is_special"] is False
+        assert line["token_id"] == inputs["completion_ids"][line["sample"], line["pos"]].item()
+        assert isinstance(line["token"], str)
+        # 4 prompt tokens precede the completion: 5 previous tokens from pos 1 on, 3 next capped at the end
+        assert len(line["prev_ids"]) == len(line["prev_tokens"]) == min(5, 4 + line["pos"])
+        assert len(line["next_ids"]) == len(line["next_tokens"]) == 2 - line["pos"]
+        if line["sample"] == 0:
+            assert line["policy_logp_eval"] == pytest.approx(line["policy_logp"], abs=1e-5)
+        else:
+            assert line["policy_logp_eval"] is None
+
+    # Same step, budget spent: a second micro-batch re-scores nothing.
+    trainer._compute_loss(trainer.model, inputs)
+    assert all(line["policy_logp_eval"] is None for line in _read_gap_dump(dump_path)[6:])
+
+    # Next step, sampler criterion: only the one token pushed 20 nats away crosses the bar.
+    dump_path.unlink()
+    trainer.state.global_step = 1
+    with torch.no_grad():
+        policy, _, _ = trainer._get_per_token_logps_and_entropies(
+            trainer.model,
+            torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1),
+            torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1),
+            inputs["completion_ids"].size(1),
+        )
+    sampler = policy.clone()
+    sampler[1, 2] += 20.0
+    trainer._compute_loss(trainer.model, {**inputs, "sampling_per_token_logps": sampler})
+
+    (line,) = _read_gap_dump(dump_path)
+    assert (line["step"], line["sample"], line["pos"], line["gap_source"]) == (1, 1, 2, "sampler")
+    assert line["sampler_logp"] == pytest.approx(policy[1, 2].item() + 20.0)
+    assert line["policy_logp"] == pytest.approx(policy[1, 2].item())
+    assert line["policy_logp_eval"] == pytest.approx(policy[1, 2].item(), abs=1e-5)  # budget reset with the step
+    assert line["is_last"] is True
+
+
+def test_log_kl_spread_on_crafted_tensors(tmp_path: Path) -> None:
+    """kl_median is the median per-token KL over masked tokens ({1, 2, 100,
+    3, 5} -> 3.0), kl_clean the masked mean over tokens with |diff| <= 5
+    nats (exactly 5.0 is clean; the 20-nat token is out; the masked-out
+    9-nat token never counts) and kl_spike_tokens the masked count above 5
+    nats. No masked tokens at all -> zeros, like global_masked_mean's kl."""
+    trainer = _kl_clamp_trainer(tmp_path)
+    per_token_kl = torch.tensor([[1.0, 2.0, 100.0], [3.0, 5.0, 7.0]])
+    diff = torch.tensor([[0.1, -0.2, 20.0], [1.0, 5.0, -9.0]])
+    mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+
+    trainer._log_kl_spread("train", per_token_kl, diff, mask)
+    metrics = trainer._metrics["train"]
+    assert metrics["kl_median"] == [3.0]
+    assert metrics["kl_clean"][-1] == pytest.approx((1.0 + 2.0 + 3.0 + 5.0) / 4)
+    assert metrics["kl_spike_tokens"] == [1.0]
+
+    trainer._log_kl_spread("train", per_token_kl, diff, torch.zeros_like(mask))
+    assert (metrics["kl_median"][-1], metrics["kl_clean"][-1], metrics["kl_spike_tokens"][-1]) == (0.0, 0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------

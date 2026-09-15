@@ -70,6 +70,16 @@ _SAMPLED_MECHANISM_FIELDS = (
     "prompt_clamp_frac",
 )
 
+# Cleaner KL logging (devbox 2026-09-15): a completion token whose KL diff
+# (ref_per_token_logps - per_token_logps, after RUN_KL_CLAMP) has |diff|
+# above this many nats counts as a spike -- kl_spike_tokens counts them,
+# kl_clean averages per_token_kl over the rest. Logging only; the loss and
+# the existing "kl" metric are untouched (_log_kl_spread).
+KL_SPIKE_NATS = 5.0
+# RUN_GAP_DUMP: eval-mode re-scoring budget per optimiser step
+# (_dump_gap_tokens); the token lines themselves are never capped.
+GAP_DUMP_MAX_RESCORE = 8
+
 
 def _pair_edit_distance(pair: PendingPair) -> float:
     """token_distance(y_plus, y_minus) for one pending pair, at flush time
@@ -520,6 +530,20 @@ class ConPOTrainer(GRPOTrainer):
         # the same value since nothing changes it again until the next step.
         self._step_skip_on_gap = False
         self._step_sampling_gap_max: float | None = None
+        # RUN_GAP_DUMP (K9, devbox 2026-09-15): a float bar in nats. When
+        # set, _dump_gap_tokens (called at the end of _compute_loss below)
+        # appends one JSON line per completion token whose |sampler - policy|
+        # log-prob gap (or |ref - policy| when this path carries no sampler
+        # log-probs) exceeds the bar to <out_dir>/gap_dump.jsonl, and
+        # re-scores the offending sequences once more in eval mode under
+        # no_grad (policy_logp_eval), at most GAP_DUMP_MAX_RESCORE sequences
+        # per optimiser step. Unset (default "") disables the whole
+        # mechanism, same convention as _skip_step_on_gap_bar above;
+        # scripts/train.py rejects an unparsable value before model load.
+        raw_gap_dump = config.env("RUN_GAP_DUMP", "")
+        self._gap_dump_bar: float | None = float(raw_gap_dump) if raw_gap_dump.strip() else None
+        self._gap_dump_rescore_step = -1
+        self._gap_dump_rescore_left = 0
 
         # Wall-clock accumulation across RUN_RESUME processes (scripts/train.py):
         # the node-local disk is wiped roughly every 48 hours, so one logical
@@ -2723,6 +2747,7 @@ class ConPOTrainer(GRPOTrainer):
 
         if self.beta != 0.0:
             self._metrics[mode]["kl"].append(global_masked_mean(per_token_kl))
+            self._log_kl_spread(mode, per_token_kl, diff, mask)
 
         self._metrics[mode]["entropy"].append(global_masked_mean(entropies))
 
@@ -2744,4 +2769,135 @@ class ConPOTrainer(GRPOTrainer):
         elif self.loss_type == "vespo":
             self._metrics[mode]["vespo/phi_seq_mean"].append(global_masked_mean(phi_seq))
 
+        # RUN_GAP_DUMP (K9): logging only, after every loss line above.
+        if self._gap_dump_bar is not None:
+            self._dump_gap_tokens(model, inputs, input_ids, attention_mask, per_token_logps, mask)
+
         return loss
+
+    def _log_kl_spread(self, mode: str, per_token_kl: torch.Tensor, diff: torch.Tensor, mask: torch.Tensor) -> None:
+        """Cleaner KL logging (devbox 2026-09-15), additive next to "kl":
+        kl_median (torch.median of per-token KL over this step's completion
+        tokens, gathered across ranks; the lower median on even counts),
+        kl_clean (masked mean of per-token KL over tokens with
+        |diff| <= KL_SPIKE_NATS) and kl_spike_tokens (count of completion
+        tokens with |diff| > KL_SPIKE_NATS). Same mask and same (clamped)
+        diff tensor "kl" uses; reads detached copies only, so the loss is
+        untouched. No completion tokens at all logs 0.0 for every value,
+        as global_masked_mean does for "kl"."""
+        kl = per_token_kl.detach()
+        token_mask = mask.bool()
+        spike = token_mask & (diff.detach().abs() > KL_SPIKE_NATS)
+        clean = token_mask & ~spike
+        kl_tokens = self.accelerator.gather(
+            self.accelerator.pad_across_processes(kl[token_mask], dim=0, pad_index=float("nan"))
+        )
+        kl_tokens = kl_tokens[~torch.isnan(kl_tokens)]
+        totals = self.accelerator.reduce(
+            torch.stack([kl[clean].sum(), clean.sum().float(), spike.sum().float()]), reduction="sum"
+        )
+        self._metrics[mode]["kl_median"].append(kl_tokens.median().item() if kl_tokens.numel() > 0 else 0.0)
+        self._metrics[mode]["kl_clean"].append((totals[0] / totals[1].clamp(min=1.0)).item())
+        self._metrics[mode]["kl_spike_tokens"].append(totals[2].item())
+
+    def _dump_gap_tokens(
+        self,
+        model: torch.nn.Module,
+        inputs: dict[str, object],
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        per_token_logps: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
+        """RUN_GAP_DUMP (K9, devbox 2026-09-15): append one JSON line per
+        completion token whose |sampler - policy| log-prob gap exceeds
+        self._gap_dump_bar to <out_dir>/gap_dump.jsonl. `sampler` is TRL's
+        sampling_per_token_logps (vLLM's own log-probs, in `inputs` only
+        under use_vllm with vllm_importance_sampling_correction -- the same
+        tensor TRL's sampling/sampling_logp_difference/max compares against
+        old_per_token_logps); without it, |ref - policy| is the criterion
+        (gap_source says which). `policy` is per_token_logps as computed on
+        the training path directly above (model_training records the mode). The
+        offending sequences, at most GAP_DUMP_MAX_RESCORE per optimiser step
+        across micro-batches, are re-scored once more in eval mode (dropout
+        off) under no_grad as policy_logp_eval (null past the budget).
+        Logging only: detached tensors, model mode restored, no loss term.
+        No-op without an out_dir (tests that never pass one)."""
+        if self.out_dir is None:
+            return
+        policy = per_token_logps.detach()
+        sampler = inputs.get("sampling_per_token_logps")
+        ref = inputs.get("ref_per_token_logps")
+        old = inputs.get("old_per_token_logps")
+        if sampler is not None:
+            gap_source, other = "sampler", sampler
+        elif ref is not None:
+            gap_source, other = "ref", ref
+        else:
+            return
+        token_mask = mask.bool()
+        offending = token_mask & ((other - policy).abs() > self._gap_dump_bar)
+        if not offending.any():
+            return
+        model_training = model.training
+        step = self.state.global_step
+        rows = offending.any(dim=1).nonzero(as_tuple=True)[0].tolist()
+        if step != self._gap_dump_rescore_step:
+            self._gap_dump_rescore_step = step
+            self._gap_dump_rescore_left = GAP_DUMP_MAX_RESCORE
+        rescore_rows = rows[: self._gap_dump_rescore_left]
+        self._gap_dump_rescore_left -= len(rescore_rows)
+        eval_logps: dict[int, torch.Tensor] = {}
+        if rescore_rows:
+            model.eval()
+            try:
+                with torch.no_grad():
+                    scored, _, _ = self._get_per_token_logps_and_entropies(
+                        model, input_ids[rescore_rows], attention_mask[rescore_rows], mask.size(1)
+                    )
+            finally:
+                model.train(model_training)
+            eval_logps = dict(zip(rescore_rows, scored))
+        tokenizer = self.processing_class
+        special_ids = set(tokenizer.all_special_ids)
+        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        lines: list[str] = []
+        for b in rows:
+            completion_len = int(completion_mask[b].sum().item())
+            prompt_valid = prompt_ids[b][prompt_mask[b].bool()]
+            seq = torch.cat([prompt_valid, completion_ids[b][:completion_len]]).tolist()
+            offset = prompt_valid.numel()
+            for pos in offending[b].nonzero(as_tuple=True)[0].tolist():
+                idx = offset + pos
+                prev_ids = seq[max(0, idx - 5) : idx]
+                next_ids = seq[idx + 1 : idx + 4]
+                token_id = seq[idx]
+                lines.append(
+                    json.dumps(
+                        {
+                            "step": step,
+                            "sample": b,
+                            "pos": pos,
+                            "token_id": token_id,
+                            "token": tokenizer.decode([token_id]),
+                            "prev_ids": prev_ids,
+                            "prev_tokens": [tokenizer.decode([t]) for t in prev_ids],
+                            "next_ids": next_ids,
+                            "next_tokens": [tokenizer.decode([t]) for t in next_ids],
+                            "gap_source": gap_source,
+                            "sampler_logp": None if sampler is None else sampler[b, pos].item(),
+                            "policy_logp": policy[b, pos].item(),
+                            "policy_logp_old": None if old is None else old[b, pos].item(),
+                            "policy_logp_eval": eval_logps[b][pos].item() if b in eval_logps else None,
+                            "ref_logp": None if ref is None else ref[b, pos].item(),
+                            "completion_len": completion_len,
+                            "is_first": pos == 0,
+                            "is_last": pos == completion_len - 1,
+                            "is_special": token_id in special_ids,
+                            "model_training": model_training,
+                        }
+                    )
+                )
+        with (self.out_dir / "gap_dump.jsonl").open("a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
