@@ -22,6 +22,10 @@
 #   EVAL_BACKEND  "vllm" (default here) or "hf"
 #   EVAL_OUT_DIR  results directory (default ${CONPO_RUNS_DIR}/eval_<adapter-or-base>_<jobid>)
 #   EVAL_LIMIT    cap rows per dataset/split, for a smoke run (unset = full)
+#   EVAL_VLLM_GPU_MEMORY_UTILIZATION  float in (0, 1], passed as vllm.LLM's
+#                 gpu_memory_utilization= so the eval engine can share a GPU
+#                 with a training job (unset = vLLM's own default); passed
+#                 through untouched, this launcher does not read it itself
 
 set -euo pipefail
 source "$(dirname "$(readlink -f "$0")")/env.sh"

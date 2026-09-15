@@ -14,6 +14,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -211,6 +212,76 @@ def test_build_vllm_engine_memoises_per_model_adapter(
     assert first is second
     assert first is not third
     assert calls == [("model-a", False, 64), ("model-a", True, 64)]
+
+
+@pytest.mark.parametrize("module", [eval_external, eval_internal])
+def test_build_vllm_engine_gpu_memory_utilization_unset_omits_kwarg(
+    module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EVAL_VLLM_GPU_MEMORY_UTILIZATION unset: vllm.LLM(...) sees no
+    gpu_memory_utilization argument, byte-identical to before the knob
+    existed."""
+    monkeypatch.delenv("EVAL_VLLM_GPU_MEMORY_UTILIZATION", raising=False)
+    module._build_vllm_engine.cache_clear()
+    captured: list[dict[str, Any]] = []
+
+    class FakeLLM:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.append(kwargs)
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = FakeLLM  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+
+    module._build_vllm_engine("model-a", None)
+
+    assert captured == [{"model": "model-a", "enable_lora": False, "max_lora_rank": 64}]
+
+
+@pytest.mark.parametrize("module", [eval_external, eval_internal])
+def test_build_vllm_engine_gpu_memory_utilization_set_reaches_llm(
+    module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EVAL_VLLM_GPU_MEMORY_UTILIZATION="0.35": vllm.LLM(...) receives
+    gpu_memory_utilization=0.35."""
+    monkeypatch.setenv("EVAL_VLLM_GPU_MEMORY_UTILIZATION", "0.35")
+    module._build_vllm_engine.cache_clear()
+    captured: list[dict[str, Any]] = []
+
+    class FakeLLM:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.append(kwargs)
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = FakeLLM  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+
+    module._build_vllm_engine("model-a", None)
+
+    assert captured == [
+        {"model": "model-a", "enable_lora": False, "max_lora_rank": 64, "gpu_memory_utilization": 0.35}
+    ]
+
+
+@pytest.mark.parametrize("module", [eval_external, eval_internal])
+@pytest.mark.parametrize("raw", ["0", "1.5", "abc"])
+def test_build_vllm_engine_gpu_memory_utilization_invalid_raises_before_builder(
+    module: types.ModuleType, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """An invalid EVAL_VLLM_GPU_MEMORY_UTILIZATION raises SystemExit before
+    vllm.LLM(...) is ever constructed."""
+    monkeypatch.setenv("EVAL_VLLM_GPU_MEMORY_UTILIZATION", raw)
+    module._build_vllm_engine.cache_clear()
+
+    def _unreachable(**kwargs: Any) -> Any:
+        raise AssertionError("vllm.LLM must not be constructed for an invalid EVAL_VLLM_GPU_MEMORY_UTILIZATION")
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = _unreachable  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+
+    with pytest.raises(SystemExit, match="EVAL_VLLM_GPU_MEMORY_UTILIZATION"):
+        module._build_vllm_engine("model-a", None)
 
 
 def test_eval_external_score_only_ifeval_hand_written_records(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -5,7 +5,9 @@ tests/test_eval_scripts.py's approach for importing a scripts/ CLI as a module."
 import dataclasses
 import json
 import sys
+import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -827,3 +829,65 @@ def test_eval_retention_lenient_env_recorded_in_retention_settings(
     eval_retention.main()
     result = json.loads(out_path.read_text(encoding="utf-8"))
     assert result["retention_settings"]["lenient"] is True
+
+
+# --- EVAL_VLLM_GPU_MEMORY_UTILIZATION (retention's vllm backend generates via
+# eval_external._generate_vllm -> _build_vllm_engine, local/retention.sh's
+# header; same builder, tested directly here through eval_retention's own
+# import of eval_external) --------------------------------------------------
+
+
+def test_retention_vllm_engine_gpu_memory_utilization_unset_omits_kwarg(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("EVAL_VLLM_GPU_MEMORY_UTILIZATION", raising=False)
+    eval_retention.eval_external._build_vllm_engine.cache_clear()
+    captured: list[dict[str, Any]] = []
+
+    class FakeLLM:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.append(kwargs)
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = FakeLLM  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+
+    eval_retention.eval_external._build_vllm_engine("model-a", None)
+
+    assert captured == [{"model": "model-a", "enable_lora": False, "max_lora_rank": 64}]
+
+
+def test_retention_vllm_engine_gpu_memory_utilization_set_reaches_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EVAL_VLLM_GPU_MEMORY_UTILIZATION", "0.35")
+    eval_retention.eval_external._build_vllm_engine.cache_clear()
+    captured: list[dict[str, Any]] = []
+
+    class FakeLLM:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.append(kwargs)
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = FakeLLM  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+
+    eval_retention.eval_external._build_vllm_engine("model-a", None)
+
+    assert captured == [
+        {"model": "model-a", "enable_lora": False, "max_lora_rank": 64, "gpu_memory_utilization": 0.35}
+    ]
+
+
+@pytest.mark.parametrize("raw", ["0", "1.5", "abc"])
+def test_retention_vllm_engine_gpu_memory_utilization_invalid_raises_before_builder(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("EVAL_VLLM_GPU_MEMORY_UTILIZATION", raw)
+    eval_retention.eval_external._build_vllm_engine.cache_clear()
+
+    def _unreachable(**kwargs: Any) -> Any:
+        raise AssertionError("vllm.LLM must not be constructed for an invalid EVAL_VLLM_GPU_MEMORY_UTILIZATION")
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = _unreachable  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+
+    with pytest.raises(SystemExit, match="EVAL_VLLM_GPU_MEMORY_UTILIZATION"):
+        eval_retention.eval_external._build_vllm_engine("model-a", None)

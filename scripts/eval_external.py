@@ -90,6 +90,26 @@ def _load_hf_engine(model_name: str, adapter: str | None) -> Any:
     return HFEngine(model, tokenizer, device=device)
 
 
+def _eval_vllm_gpu_memory_utilization() -> float | None:
+    """EVAL_VLLM_GPU_MEMORY_UTILIZATION: unset or empty (default) leaves
+    vllm.LLM's own gpu_memory_utilization default untouched (None, no
+    argument passed to LLM(...), byte-identical to today); a float in
+    (0, 1] overrides it, so an offline eval engine can be told to take a
+    smaller share of the card and co-run beside a training job that
+    already holds part of it. Any other value raises SystemExit before any
+    engine is built, mirroring conpo/retention.py's retention_lenient()."""
+    raw = config.env("EVAL_VLLM_GPU_MEMORY_UTILIZATION", "")
+    if raw == "":
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SystemExit(f"EVAL_VLLM_GPU_MEMORY_UTILIZATION must be a float in (0, 1], got {raw!r}") from None
+    if not (0 < value <= 1):
+        raise SystemExit(f"EVAL_VLLM_GPU_MEMORY_UTILIZATION must be a float in (0, 1], got {raw!r}")
+    return value
+
+
 @functools.lru_cache(maxsize=None)
 def _build_vllm_engine(model_name: str, adapter: str | None) -> Any:
     """UNTESTED: no vllm / GPU available in this environment. Memoised per
@@ -97,12 +117,17 @@ def _build_vllm_engine(model_name: str, adapter: str | None) -> Any:
     construction, so a process scoring both IFEval and IFBench (two
     _generate_vllm calls, same model) must reuse one engine instead of
     building it twice."""
+    gpu_memory_utilization = _eval_vllm_gpu_memory_utilization()
+
     from vllm import LLM
 
     # max_lora_rank: vLLM's default is 16 and refuses a rank-64 adapter at load
     # time ("LoRA rank 64 is greater than max_lora_rank 16", pipeline probe
     # 2026-09-11); the trained adapters are config.LORA_R.
-    return LLM(model=model_name, enable_lora=adapter is not None, max_lora_rank=config.LORA_R)
+    kwargs: dict[str, Any] = {}
+    if gpu_memory_utilization is not None:
+        kwargs["gpu_memory_utilization"] = gpu_memory_utilization
+    return LLM(model=model_name, enable_lora=adapter is not None, max_lora_rank=config.LORA_R, **kwargs)
 
 
 def _generate_vllm(model_name: str, adapter: str | None, prompts: Sequence[str], max_tokens: int) -> list[str]:
