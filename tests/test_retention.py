@@ -1,6 +1,6 @@
 """Tests for conpo.retention (scorers, row builders) and scripts/eval_retention.py
-(--score-only path, --limit, --benchmarks). Mirrors tests/test_eval_scripts.py's
-approach for importing a scripts/ CLI as a module."""
+(--score-only path, --limit, --benchmarks, the RETENTION_* env knobs). Mirrors
+tests/test_eval_scripts.py's approach for importing a scripts/ CLI as a module."""
 
 import dataclasses
 import json
@@ -9,8 +9,10 @@ from pathlib import Path
 
 import pytest
 
+from conpo import config
 from conpo.retention import (
     RetentionRow,
+    apply_bbh_suffix,
     extract_bbh_prediction,
     extract_gsm8k_prediction,
     extract_mmlu_prediction,
@@ -28,6 +30,17 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import eval_retention  # noqa: E402
+
+RETENTION_ENV = ("RETENTION_SUFFIX", "RETENTION_MAX_TOKENS", "RETENTION_BBH_TASKS", "RETENTION_BENCHMARKS")
+
+
+@pytest.fixture(autouse=True)
+def _clear_retention_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default-path assertions below must not depend on RETENTION_*
+    values leaking in from the shell."""
+    for name in RETENTION_ENV:
+        monkeypatch.delenv(name, raising=False)
+
 
 # --- score_gsm8k -------------------------------------------------------------
 
@@ -517,3 +530,194 @@ def test_eval_retention_benchmarks_subset_omits_others(tmp_path: Path, monkeypat
     assert "mmlu" not in result["correct"]
     assert "mmlu" not in result["by_group"]
     assert set(result["n"]) == {"gsm8k", "bbh"}
+
+
+# --- RETENTION_* env knobs -----------------------------------------------------
+# RETENTION_SUFFIX / RETENTION_MAX_TOKENS / RETENTION_BBH_TASKS / RETENTION_BENCHMARKS;
+# every default must stay byte-identical to the pre-knob behaviour.
+
+DEFAULT_BBH_SUFFIX = "Give only the final answer on the last line."
+CUSTOM_SUFFIX = "Think step by step, then write the final answer on the last line."
+BBH_INPUT = "not ( True ) and ( True ) is"
+
+
+def test_rows_from_bbh_default_prompt_exact_string() -> None:
+    rows = rows_from_bbh("boolean_expressions", [{"input": BBH_INPUT, "target": "False"}])
+    assert rows[0].prompt == "not ( True ) and ( True ) is\n\nGive only the final answer on the last line."
+
+
+def test_rows_from_bbh_env_suffix_replaces_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RETENTION_SUFFIX", CUSTOM_SUFFIX)
+    rows = rows_from_bbh("boolean_expressions", [{"input": BBH_INPUT, "target": "False"}])
+    assert rows[0].prompt == f"{BBH_INPUT}\n\n{CUSTOM_SUFFIX}"
+
+
+def test_apply_bbh_suffix_identity_by_default_and_env_swaps_trailing_suffix(monkeypatch: pytest.MonkeyPatch) -> None:
+    prompt = f"{BBH_INPUT}\n\n{DEFAULT_BBH_SUFFIX}"
+    assert apply_bbh_suffix(prompt) == prompt
+    monkeypatch.setenv("RETENTION_SUFFIX", CUSTOM_SUFFIX)
+    assert apply_bbh_suffix(prompt) == f"{BBH_INPUT}\n\n{CUSTOM_SUFFIX}"
+    # A prompt written under some other suffix is left alone.
+    assert apply_bbh_suffix(f"{BBH_INPUT}\n\nother") == f"{BBH_INPUT}\n\nother"
+
+
+def test_load_retention_rows_env_suffix_rewrites_on_disk_bbh_prompts_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bbh_prompt = f"{BBH_INPUT}\n\n{DEFAULT_BBH_SUFFIX}"
+    bbh_rows = [RetentionRow(key="bbh:web_of_lies:0", benchmark="bbh", prompt=bbh_prompt, target="Yes", group="web_of_lies")]
+    # A non-BBH row whose prompt happens to end with the BBH suffix must not be rewritten.
+    gsm8k_rows = [RetentionRow(key="gsm8k:0", benchmark="gsm8k", prompt=bbh_prompt, target="1", group="")]
+    _write_rows_jsonl(tmp_path / "retention_bbh.jsonl", bbh_rows)
+    _write_rows_jsonl(tmp_path / "retention_gsm8k.jsonl", gsm8k_rows)
+    assert eval_retention.load_retention_rows(tmp_path, "bbh")[0].prompt == bbh_prompt
+    monkeypatch.setenv("RETENTION_SUFFIX", CUSTOM_SUFFIX)
+    assert eval_retention.load_retention_rows(tmp_path, "bbh")[0].prompt == f"{BBH_INPUT}\n\n{CUSTOM_SUFFIX}"
+    assert eval_retention.load_retention_rows(tmp_path, "gsm8k")[0].prompt == bbh_prompt
+
+
+def test_retention_max_tokens_env_overrides_config_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert eval_retention.retention_max_tokens() == config.RETENTION_MAX_TOKENS == 512
+    monkeypatch.setenv("RETENTION_MAX_TOKENS", "2048")
+    assert eval_retention.retention_max_tokens() == 2048
+
+
+@pytest.mark.parametrize("raw", ["0", "-5", "abc", "1.5"])
+def test_retention_max_tokens_env_rejects_non_positive_integers(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    monkeypatch.setenv("RETENTION_MAX_TOKENS", raw)
+    with pytest.raises(SystemExit, match="RETENTION_MAX_TOKENS"):
+        eval_retention.retention_max_tokens()
+
+
+def test_eval_retention_max_tokens_env_reaches_generation_and_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = _fixture_rows(tmp_path)
+    out_path = tmp_path / "out.json"
+    seen: list[int] = []
+
+    def fake_generate(engine: object, prompts: list[str], max_tokens: int) -> list[str]:
+        seen.append(max_tokens)
+        return ["x"] * len(prompts)
+
+    monkeypatch.setattr(eval_retention.eval_external, "_load_hf_engine", lambda model, adapter: object())
+    monkeypatch.setattr(eval_retention.eval_external, "generate_greedy", fake_generate)
+    monkeypatch.setenv("RETENTION_MAX_TOKENS", "2048")
+    monkeypatch.setattr(
+        sys, "argv", ["eval_retention.py", "--data-dir", str(data_dir), "--benchmarks", "bbh", "--out", str(out_path)]
+    )
+    eval_retention.main()
+    assert seen == [2048]
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert result["max_tokens"] == 2048
+    assert result["retention_settings"]["max_tokens"] == 2048
+
+
+def _fixture_bbh_tasks(tmp_path: Path) -> tuple[Path, Path]:
+    """BBH rows under two real config.BBH_TASKS names plus canned responses
+    for all of them; returns (data_dir, canned_path)."""
+    rows = [
+        RetentionRow(key="bbh:boolean_expressions:0", benchmark="bbh", prompt="p", target="True", group="boolean_expressions"),
+        RetentionRow(key="bbh:boolean_expressions:1", benchmark="bbh", prompt="p", target="False", group="boolean_expressions"),
+        RetentionRow(key="bbh:web_of_lies:0", benchmark="bbh", prompt="p", target="Yes", group="web_of_lies"),
+    ]
+    _write_rows_jsonl(tmp_path / "retention_bbh.jsonl", rows)
+    canned_path = tmp_path / "canned_bbh.jsonl"
+    with canned_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps({"key": row.key, "response": row.target}) + "\n")
+    return tmp_path, canned_path
+
+
+def test_retention_bbh_tasks_env_filters_rows_on_load(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data_dir, canned_path = _fixture_bbh_tasks(tmp_path)
+    out_path = tmp_path / "out.json"
+    monkeypatch.setenv("RETENTION_BBH_TASKS", "web_of_lies")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_retention.py",
+            "--data-dir",
+            str(data_dir),
+            "--benchmarks",
+            "bbh",
+            "--score-only",
+            str(canned_path),
+            "--out",
+            str(out_path),
+        ],
+    )
+    eval_retention.main()
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert result["n"] == {"bbh": 1}
+    assert result["by_group"]["bbh"] == {"web_of_lies": 1.0}
+    assert result["retention_settings"]["bbh_tasks"] == ["web_of_lies"]
+
+
+def test_retention_bbh_tasks_filter_applies_before_limit(tmp_path: Path) -> None:
+    data_dir, _ = _fixture_bbh_tasks(tmp_path)
+    rows = eval_retention.load_retention_rows(data_dir, "bbh", limit=1, groups=["web_of_lies"])
+    assert [r.key for r in rows] == ["bbh:web_of_lies:0"]
+
+
+def test_retention_bbh_tasks_env_unknown_name_exits_before_model_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir, _ = _fixture_bbh_tasks(tmp_path)
+
+    def _no_load(model: str, adapter: str | None) -> object:
+        raise AssertionError("model load reached")
+
+    monkeypatch.setattr(eval_retention.eval_external, "_load_hf_engine", _no_load)
+    monkeypatch.setenv("RETENTION_BBH_TASKS", "web_of_lies,nope")
+    monkeypatch.setattr(
+        sys, "argv", ["eval_retention.py", "--data-dir", str(data_dir), "--benchmarks", "bbh", "--out", str(tmp_path / "o.json")]
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        eval_retention.main()
+    message = str(excinfo.value)
+    assert "nope" in message
+    assert all(task in message for task in config.BBH_TASKS)
+
+
+def test_retention_benchmarks_env_selects_subset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data_dir = _fixture_rows(tmp_path)
+    canned_path = _fixture_canned(tmp_path)
+    out_path = tmp_path / "out.json"
+    monkeypatch.setenv("RETENTION_BENCHMARKS", "bbh")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["eval_retention.py", "--data-dir", str(data_dir), "--score-only", str(canned_path), "--out", str(out_path)],
+    )
+    eval_retention.main()
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert set(result["n"]) == {"bbh"}
+    assert "gsm8k" not in result and "mmlu" not in result
+    assert result["retention_settings"]["benchmarks"] == ["bbh"]
+
+
+def test_eval_retention_default_summary_is_unchanged_plus_retention_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = _fixture_rows(tmp_path)
+    canned_path = _fixture_canned(tmp_path)
+    out_path = tmp_path / "out.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["eval_retention.py", "--data-dir", str(data_dir), "--score-only", str(canned_path), "--out", str(out_path)],
+    )
+    eval_retention.main()
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert set(result) == {
+        "gsm8k", "mmlu", "bbh", "n", "correct", "by_group", "model", "adapter", "max_tokens", "limit", "retention_settings",
+    }
+    assert result["max_tokens"] == 512
+    assert result["retention_settings"] == {
+        "suffix": DEFAULT_BBH_SUFFIX,
+        "max_tokens": 512,
+        "bbh_tasks": None,
+        "benchmarks": ["gsm8k", "mmlu", "bbh"],
+    }

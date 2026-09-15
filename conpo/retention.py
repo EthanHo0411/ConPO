@@ -11,10 +11,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from conpo import config
+
 _NUMBER_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 _LETTER_RE = re.compile(r"\b([A-D])\b")
 _WS_RE = re.compile(r"\s+")
 _PAREN_LETTER_RE = re.compile(r"^\([A-Za-z]\)$")
+BBH_SUFFIX = "Give only the final answer on the last line."
 
 
 @dataclass(frozen=True)
@@ -62,12 +65,31 @@ def rows_from_mmlu(hf_rows: Sequence[Mapping[str, Any]]) -> list[RetentionRow]:
     return rows
 
 
+def bbh_suffix() -> str:
+    """The instruction that closes every BBH prompt: RETENTION_SUFFIX when
+    set to a non-empty string, else BBH_SUFFIX."""
+    return config.env("RETENTION_SUFFIX", "") or BBH_SUFFIX
+
+
+def apply_bbh_suffix(prompt: str) -> str:
+    """`prompt` with a trailing BBH_SUFFIX swapped for `bbh_suffix()`; the
+    "\\n\\n" separator and everything before it stay. Unchanged when the
+    prompt does not end with BBH_SUFFIX (rows written under a custom
+    suffix). Lets scripts/eval_retention.py honour RETENTION_SUFFIX on
+    rows scripts/fetch_data.py wrote with the default."""
+    if not prompt.endswith(BBH_SUFFIX):
+        return prompt
+    return prompt[: -len(BBH_SUFFIX)] + bbh_suffix()
+
+
 def rows_from_bbh(task: str, hf_rows: Sequence[Mapping[str, Any]]) -> list[RetentionRow]:
     """BBH test rows (fields "input", "target") for one task config to
-    RetentionRows. group is the BBH task name."""
+    RetentionRows. group is the BBH task name. The prompt ends with
+    `bbh_suffix()` after a "\\n\\n" separator."""
     rows = []
+    suffix = bbh_suffix()
     for index, row in enumerate(hf_rows):
-        prompt = f"{row['input']}\n\nGive only the final answer on the last line."
+        prompt = f"{row['input']}\n\n{suffix}"
         rows.append(
             RetentionRow(
                 key=f"bbh:{task}:{index}", benchmark="bbh", prompt=prompt, target=row["target"], group=task
