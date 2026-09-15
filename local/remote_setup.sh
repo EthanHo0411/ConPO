@@ -30,6 +30,19 @@ else
   echo "nvidia-smi not found; continuing without a driver check"
 fi
 
+echo "== conda"
+if ! command -v conda > /dev/null; then
+  if [ -x "$HOME/miniconda3/bin/conda" ]; then
+    export PATH="$HOME/miniconda3/bin:$PATH"
+  else
+    echo "conda not found; installing Miniconda into $HOME/miniconda3"
+    curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o "$HOME/miniconda-installer.sh"
+    bash "$HOME/miniconda-installer.sh" -b -p "$HOME/miniconda3"
+    rm -f "$HOME/miniconda-installer.sh"
+    export PATH="$HOME/miniconda3/bin:$PATH"
+  fi
+fi
+conda --version
 echo "== conda env $ENV_NAME"
 if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
   echo "env $ENV_NAME exists, skipping create"
